@@ -1,0 +1,1227 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sleeping Neural Brain — Czat + Nauka z Sieci (GPU)</title>
+  <style>
+    :root {
+      --bg: #070b14;
+      --panel: #0f172a;
+      --panel-2: #15223d;
+      --border: #1e2d4d;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --cyan: #38bdf8;
+      --green: #34d399;
+      --amber: #fbbf24;
+      --red: #f87171;
+      --purple: #c084fc;
+      --indigo: #818cf8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at top right, #111d3a, var(--bg) 55%);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 12px 18px;
+      background: rgba(15, 23, 42, 0.94);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      backdrop-filter: blur(8px);
+    }
+    .brand { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .brand h1 { margin: 0; font-size: 17px; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11.5px;
+      font-weight: 700;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+    }
+    .state-AWAKE { color: var(--green); border-color: rgba(52,211,153,.45); background: rgba(52,211,153,.12); }
+    .state-DROWSY { color: var(--amber); border-color: rgba(251,191,36,.45); background: rgba(251,191,36,.12); }
+    .state-STUDYING { color: var(--cyan); border-color: rgba(56,189,248,.6); background: rgba(56,189,248,.16); }
+    .state-NREM_LIGHT, .state-NREM_DEEP { color: var(--indigo); border-color: rgba(129,140,248,.5); background: rgba(129,140,248,.16); }
+    .state-REM_DREAMING { color: var(--purple); border-color: rgba(192,132,252,.6); background: rgba(192,132,252,.2); }
+
+    .controls { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
+    button, select {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 7px 12px;
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    button:hover:not(:disabled), select:hover:not(:disabled) { border-color: var(--cyan); background: #1c2d52; }
+    button:disabled, select:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.primary { background: linear-gradient(135deg, #4f46e5, #7c3aed); border-color: #8b5cf6; }
+    button.study-btn { background: linear-gradient(135deg, #0891b2, #0284c7); border-color: #38bdf8; }
+    button.send-btn { background: linear-gradient(135deg, #0284c7, #2563eb); border-color: #38bdf8; }
+    button.danger { border-color: rgba(248,113,113,.45); color: #fca5a5; }
+    button.active { border-color: var(--cyan); color: var(--cyan); background: rgba(56,189,248,.12); }
+
+    .top-stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 10px;
+      padding: 12px 18px 0;
+    }
+    .stat-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 9px 13px;
+    }
+    .stat-label { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }
+    .stat-val { font-size: 16.5px; font-weight: 700; margin-top: 2px; }
+    .sub { font-size: 11.5px; color: var(--muted); }
+    .bar-bg { width: 100%; height: 7px; background: #1e293b; border-radius: 99px; overflow: hidden; margin-top: 6px; }
+    .bar-fill { height: 100%; transition: width 0.25s ease, background 0.3s ease; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 1.35fr 1fr;
+      gap: 14px;
+      padding: 14px 18px 24px;
+    }
+    @media (max-width: 1060px) { .layout { grid-template-columns: 1fr; } }
+
+    .col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .panel h2 {
+      margin: 0;
+      font-size: 14px;
+      color: var(--cyan);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    /* Web Study Box */
+    .study-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .study-row input { flex: 1; min-width: 220px; }
+    .study-progress {
+      background: rgba(8, 145, 178, 0.12);
+      border: 1px solid rgba(56, 189, 248, 0.45);
+      border-radius: 10px;
+      padding: 10px 12px;
+      display: none;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 12.5px;
+    }
+    .study-progress.visible { display: flex; }
+
+    /* Chat */
+    .llm-banner {
+      padding: 8px 11px;
+      border-radius: 8px;
+      font-size: 12px;
+      background: rgba(56, 189, 248, 0.1);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      color: #bae6fd;
+    }
+    .llm-banner.ready {
+      background: rgba(52, 211, 153, 0.09);
+      border-color: rgba(52, 211, 153, 0.35);
+      color: #a7f3d0;
+    }
+    .llm-banner.error {
+      background: rgba(248, 113, 113, 0.12);
+      border-color: rgba(248, 113, 113, 0.45);
+      color: #fecaca;
+    }
+    .chat-box {
+      background: #070d1a;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 13px;
+      height: 520px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .msg {
+      max-width: 88%;
+      padding: 10px 13px;
+      border-radius: 12px;
+      font-size: 13.5px;
+      line-height: 1.52;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    .msg h3.md-h3, .msg h4.md-h4 {
+      margin: 6px 0 4px;
+      color: var(--cyan);
+      font-size: 14px;
+    }
+    .msg a.md-link {
+      color: #7dd3fc;
+      text-decoration: underline;
+      word-break: break-all;
+    }
+    .msg-user {
+      align-self: flex-end;
+      background: linear-gradient(135deg, #1d4ed8, #2563eb);
+      color: #f8fafc;
+      border-bottom-right-radius: 3px;
+    }
+    .msg-assistant {
+      align-self: flex-start;
+      background: #131f38;
+      border: 1px solid #24365c;
+      color: #e2e8f0;
+      border-bottom-left-radius: 3px;
+    }
+    .msg-morning {
+      border-color: rgba(192, 132, 252, 0.55);
+      background: linear-gradient(135deg, rgba(88, 28, 135, 0.35), rgba(30, 41, 59, 0.85));
+    }
+    .msg-study {
+      border-color: rgba(56, 189, 248, 0.55);
+      background: linear-gradient(135deg, rgba(8, 145, 178, 0.25), rgba(15, 23, 42, 0.9));
+    }
+    .code-wrap {
+      margin: 8px 0;
+      background: #050a14;
+      border: 1px solid #24385e;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .code-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 4px 10px;
+      background: #0d172c;
+      border-bottom: 1px solid #1e2d4d;
+      font-size: 11px;
+      color: var(--cyan);
+      font-family: Consolas, monospace;
+    }
+    .code-head button { padding: 2px 8px; font-size: 11px; border-radius: 5px; }
+    .code-wrap pre {
+      margin: 0;
+      padding: 10px 12px;
+      overflow-x: auto;
+      font-family: Consolas, 'Cascadia Code', monospace;
+      font-size: 12.5px;
+      line-height: 1.48;
+      color: #e2e8f0;
+      white-space: pre;
+    }
+    .msg code.inline-code {
+      background: rgba(56, 189, 248, 0.14);
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-family: Consolas, monospace;
+      font-size: 12.5px;
+      color: #bae6fd;
+    }
+    .msg-meta {
+      margin-top: 6px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      font-size: 11px;
+    }
+    .pill {
+      padding: 2px 8px;
+      border-radius: 99px;
+      border: 1px solid;
+      cursor: pointer;
+      user-select: none;
+    }
+    .pill:hover { filter: brightness(1.15); }
+    .pill-hippo { color: #fde68a; border-color: rgba(251,191,36,.45); background: rgba(251,191,36,.12); }
+    .pill-sem { color: #7dd3fc; border-color: rgba(56,189,248,.4); background: rgba(56,189,248,.1); }
+    .pill-rem { color: #e9d5ff; border-color: rgba(192,132,252,.5); background: rgba(192,132,252,.15); }
+    .pill-graph { color: #6ee7b7; border-color: rgba(52,211,153,.45); background: rgba(52,211,153,.12); }
+
+    .recall-details {
+      margin-top: 7px;
+      padding: 8px 10px;
+      background: rgba(7, 13, 26, 0.85);
+      border: 1px solid #24365c;
+      border-radius: 8px;
+      font-size: 11.5px;
+      line-height: 1.45;
+      color: #cbd5e1;
+      white-space: normal;
+    }
+    .recall-details ul { margin: 4px 0 6px 16px; padding: 0; }
+    .recall-details li { margin-bottom: 2px; }
+
+    .chat-input-row { display: flex; gap: 8px; align-items: flex-end; }
+    input[type="text"], textarea {
+      width: 100%;
+      background: #070d1a;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 10px 12px;
+      font-size: 13.5px;
+      font-family: inherit;
+    }
+    textarea#chatInput {
+      resize: none;
+      min-height: 40px;
+      max-height: 130px;
+      overflow-y: auto;
+      line-height: 1.4;
+    }
+    input[type="text"]:focus, textarea:focus { outline: none; border-color: var(--cyan); }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip {
+      font-size: 11.5px;
+      padding: 4px 9px;
+      border-radius: 99px;
+      background: #14213d;
+      border: 1px solid var(--border);
+      color: #cbd5e1;
+      cursor: pointer;
+    }
+    .chip:hover { border-color: var(--cyan); color: white; }
+
+    /* Memory tabs & CRUD */
+    .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+    .tab-btn { padding: 5px 10px; font-size: 12px; }
+    .teach-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+    .teach-row input { flex: 1; min-width: 160px; padding: 6px 10px; font-size: 12px; }
+    .teach-row select, .teach-row button { padding: 6px 9px; font-size: 12px; }
+    .mem-list {
+      max-height: 270px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .mem-item {
+      background: #080f1f;
+      border: 1px solid #1b2b4a;
+      border-radius: 8px;
+      padding: 7px 10px;
+      font-size: 12.5px;
+      line-height: 1.42;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .mem-item-body { flex: 1; min-width: 0; }
+    .mem-item.hippo { border-left: 3px solid var(--amber); }
+    .mem-item.sem { border-left: 3px solid var(--cyan); }
+    .mem-item.rem { border-left: 3px solid var(--purple); }
+    .mem-item.topic { border-left: 3px solid var(--green); }
+    .mem-item.core { border-left: 3px solid var(--indigo); white-space: pre-wrap; }
+    .del-btn {
+      padding: 2px 6px;
+      font-size: 11px;
+      border-radius: 5px;
+      background: transparent;
+      border-color: rgba(248,113,113,.3);
+      color: #fca5a5;
+      flex-shrink: 0;
+    }
+    .del-btn:hover { background: rgba(248,113,113,.15); border-color: var(--red); }
+
+    .graph-wrap { position: relative; }
+    canvas {
+      width: 100%;
+      height: 280px;
+      background: #060a12;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      display: block;
+      cursor: crosshair;
+    }
+    .graph-tooltip {
+      position: absolute;
+      display: none;
+      pointer-events: none;
+      background: rgba(10, 17, 34, 0.95);
+      border: 1px solid var(--cyan);
+      border-radius: 8px;
+      padding: 7px 10px;
+      font-size: 11.5px;
+      color: var(--text);
+      max-width: 280px;
+      z-index: 10;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+    }
+
+    .sleep-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+    .sleep-table th, .sleep-table td { text-align: left; padding: 5px 6px; border-bottom: 1px solid #1a2640; }
+    .sleep-table th { color: var(--muted); }
+
+    .log-box {
+      background: #070d1a;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 11.5px;
+      height: 140px;
+      overflow-y: auto;
+      font-family: Consolas, monospace;
+      line-height: 1.45;
+    }
+    .tag-SLEEP { color: var(--indigo); font-weight: 700; }
+    .tag-REM { color: var(--purple); font-weight: 700; }
+    .tag-TEACH { color: var(--amber); font-weight: 700; }
+    .tag-STUDY { color: var(--cyan); font-weight: 700; }
+    .tag-WAKE { color: var(--green); font-weight: 700; }
+    .tag-INIT { color: #cbd5e1; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>🧠 Sleeping Neural Brain</h1>
+      <span id="stateBadge" class="badge state-AWAKE">CZUWANIE</span>
+      <span id="gpuBadge" class="badge">GPU...</span>
+      <span id="nnBadge" class="badge">🧬 Sieć PyTorch...</span>
+    </div>
+    <div class="controls">
+      <button id="sleepBtn" class="primary" onclick="triggerSleep()">🌙 Uśpij teraz (NREM + EWC + REM)</button>
+      <button id="autoSleepBtn" class="active" onclick="toggleAutoSleep()">Auto-sen: WŁ</button>
+      <button onclick="saveBrain()">💾 Zapisz</button>
+      <button onclick="exportBrain()" title="Pobierz bazę wiedzy jako JSON">📥 Eksport</button>
+      <button class="danger" onclick="resetBrain()">↺ Reset</button>
+    </div>
+  </header>
+
+  <section class="top-stats">
+    <div class="stat-card">
+      <div class="stat-label">Energia / Zmęczenie</div>
+      <div class="stat-val"><span id="energyVal">100%</span> <span class="sub" id="pressureVal">(senność 0%)</span></div>
+      <div class="bar-bg"><div id="energyBar" class="bar-fill" style="width:100%;background:var(--green)"></div></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Życie Mózgu & Konsolidacja NREM</div>
+      <div class="stat-val">Dzień <span id="dayVal">1</span> · <span id="sleepsVal">0</span> nocy</div>
+      <div class="sub">Konsolidacje rdzenia NREM: <strong id="loraUpdatesVal">0</strong> · Kontekst: <span id="winLimVal">24</span> tur</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Hipokamp (Krótkotrwała)</div>
+      <div class="stat-val"><span id="stMemVal">0</span> <span class="sub">/ <span id="stLimVal">5000</span></span></div>
+      <div class="sub">Pojęcia przed snem: <span id="stFactVal">0</span></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Kora (Trwała pamięć po śnie)</div>
+      <div class="stat-val"><span id="semMemVal">0</span> <span class="sub">/ <span id="semLimVal">50000</span></span></div>
+      <div class="sub" style="color:var(--purple)">✨ REM: <strong id="remReflVal">0</strong> refleksji · <strong id="remGraphVal">0</strong> połączeń</div>
+    </div>
+  </section>
+
+  <main class="layout">
+    <!-- LEFT: WEB STUDY + STREAMING POLISH CHAT -->
+    <div class="col">
+      <section class="panel">
+        <h2>
+          <span>🌐 Autonomiczna Nauka z Sieci (Temat lub bezpośredni link URL)</span>
+          <span class="sub">Wikipedia + DuckDuckGo + URL → GPU → NREM/REM</span>
+        </h2>
+        <div class="study-row">
+          <input id="studyInput" type="text" placeholder="Temat lub adres https://..., np. czarne dziury, Rust, https://pl.wikipedia.org/..." onkeydown="if(event.key==='Enter') startStudy()" />
+          <select id="studyRounds" title="Maksymalna liczba rund pogłębiania wiedzy">
+            <option value="2">2 rundy (szybko)</option>
+            <option value="4" selected>4 rundy (dokładnie)</option>
+            <option value="6">6 rund (głębokie studium)</option>
+          </select>
+          <button id="studyBtn" class="study-btn" onclick="startStudy()">🌐 Ucz się z sieci</button>
+          <button id="stopStudyBtn" class="danger" onclick="stopStudy()" style="display:none">⏹ Stop</button>
+        </div>
+        <div id="studyProgress" class="study-progress">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <strong id="studyTitle">Badam temat...</strong>
+            <span id="studyStats" class="sub">Runda 0/4 · Opanowanie 0%</span>
+          </div>
+          <div class="bar-bg"><div id="studyBar" class="bar-fill" style="width:0%;background:var(--cyan)"></div></div>
+          <div id="studyAction" class="sub">Inicjalizacja...</div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>
+          <span>💬 Rozmowa z Mózgiem (Strumieniowanie na żywo)</span>
+          <span class="sub">Enter = wyślij · Shift+Enter = nowa linia · /ucz · /sen</span>
+        </h2>
+        <div id="llmBanner" class="llm-banner">⏳ Ładowanie Kory Językowej na GPU...</div>
+        <div id="chatBox" class="chat-box"></div>
+        <div class="chat-input-row">
+          <textarea id="chatInput" rows="1" placeholder="Napisz wiadomość po polsku, naucz go czegoś albo wpisz '/ucz <temat>' lub '/sen'..." oninput="autoResizeChatInput(this)" onkeydown="handleChatKey(event)"></textarea>
+          <button id="sendBtn" class="send-btn" onclick="sendChat()">Wyślij</button>
+        </div>
+        <div class="chips">
+          <span class="chip" onclick="fillChat('Cześć! Mam na imię Kuba, mieszkam w Gliwicach i interesuję się programowaniem AI w Pythonie.')">👤 Przedstaw się</span>
+          <span class="chip" onclick="fillChat('/ucz jak działają komputery kwantowe')">🌐 /ucz komputery kwantowe</span>
+          <span class="chip" onclick="fillChat('Co już pamiętasz i jakich tematów ostatnio się nauczyłeś?')">🧠 Sprawdź pamięć</span>
+          <span class="chip" onclick="fillChat('/sen')">🌙 /sen (Konsoliduj)</span>
+        </div>
+      </section>
+    </div>
+
+    <!-- RIGHT: EXPANDED MEMORY INSPECTOR + INTERACTIVE GRAPH + SLEEP HISTORY -->
+    <div class="col">
+      <section class="panel">
+        <h2><span>🧠 Inspektor Pamięci Mózgu</span></h2>
+        <div class="tabs">
+          <button id="tab-hippo" class="tab-btn active" onclick="setMemTab('hippo')">🟡 Hipokamp (<span id="tc-hippo">0</span>)</button>
+          <button id="tab-sem" class="tab-btn" onclick="setMemTab('sem')">🔵 Pamięć trwała (<span id="tc-sem">0</span>)</button>
+          <button id="tab-rem" class="tab-btn" onclick="setMemTab('rem')">✨ REM (<span id="tc-rem">0</span>)</button>
+          <button id="tab-topics" class="tab-btn" onclick="setMemTab('topics')">📚 Tematy (<span id="tc-topics">0</span>)</button>
+          <button id="tab-core" class="tab-btn" onclick="setMemTab('core')">🧬 Rdzeń Wiedzy</button>
+        </div>
+        <div class="teach-row">
+          <input id="manualMemInput" type="text" placeholder="➕ Dodaj ręcznie fakt lub zasadę do hipokampu..." onkeydown="if(event.key==='Enter') addManualMemory()" />
+          <select id="manualMemCat" title="Kategoria wspomnienia">
+            <option value="wiedza">wiedza</option>
+            <option value="użytkownik">użytkownik</option>
+            <option value="zasada">zasada</option>
+          </select>
+          <button onclick="addManualMemory()">Dodaj</button>
+        </div>
+        <input id="memFilter" type="text" placeholder="Filtruj wspomnienia..." oninput="if(latestState) renderMemoryTab(latestState)" style="padding:7px 10px;font-size:12px" />
+        <div id="memListBox" class="mem-list"></div>
+      </section>
+
+      <section class="panel">
+        <h2>
+          <span>🕸️ Graf Synaptyczny Kory (PCA 2D z GPU)</span>
+          <span class="sub">Najedź lub kliknij węzeł · Żółte = hipokamp · Niebieskie = kora · Fioletowe = REM</span>
+        </h2>
+        <div class="graph-wrap">
+          <canvas id="graphCanvas" width="520" height="280"></canvas>
+          <div id="graphTooltip" class="graph-tooltip"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2><span>📊 Historia Nocy (Trening Sieci PyTorch na GPU)</span></h2>
+        <div style="overflow-x:auto">
+          <table class="sleep-table">
+            <thead>
+              <tr><th>Noc</th><th>Czas</th><th>Wspomn.</th><th>EWC Graf Loss</th><th>Kora Językowa Loss</th><th>REM</th></tr>
+            </thead>
+            <tbody id="sleepTableBody">
+              <tr><td colspan="6" class="sub">Brak przespanych nocy.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h2 style="margin-top:4px"><span>📜 Dziennik Mózgu</span></h2>
+        <div id="logBox" class="log-box"></div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    let latestState = null;
+    let chatBusy = false;
+    let lastChatHash = "";
+    let activeMemTab = "hippo";
+    const openRecallBoxes = new Set();
+
+    let streamState = {
+      active: false,
+      userMsg: "",
+      meta: null,
+      replyText: ""
+    };
+
+    let graphScreenNodes = [];
+    let hoveredNodeId = null;
+    let selectedNodeId = null;
+
+    const STATE_LABELS = {
+      AWAKE: "☀️ CZUWANIE",
+      DROWSY: "🥱 SENNY",
+      STUDYING: "🌐 NAUKA Z SIECI (GPU)",
+      NREM_LIGHT: "🌙 SEN NREM PŁYTKI",
+      NREM_DEEP: "💤 SEN NREM GŁĘBOKI (EWC GPU)",
+      REM_DREAMING: "✨ SEN REM (MARZENIA)"
+    };
+
+    function escapeHtml(str) {
+      return String(str).replace(/[&<>"']/g, m => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]));
+    }
+
+    function formatProseSegment(rawProse) {
+      let txt = escapeHtml(rawProse || "");
+      // Inline code first via temporary tokens so markdown inside code isn't touched
+      const codeTokens = [];
+      txt = txt.replace(/`([^`\n]+)`/g, (_, inner) => {
+        const idx = codeTokens.length;
+        codeTokens.push(`<code class="inline-code">${inner}</code>`);
+        return `@@CODE${idx}@@`;
+      });
+
+      // URLs via temporary tokens
+      const urlTokens = [];
+      txt = txt.replace(/(https?:\/\/[^\s<>"')]+)/g, (url) => {
+        const idx = urlTokens.length;
+        urlTokens.push(`<a class="md-link" href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`);
+        return `@@URL${idx}@@`;
+      });
+
+      // Headings & lists line by line
+      const lines = txt.split("\n").map(line => {
+        if (/^###\s+/.test(line)) return `<h4 class="md-h4">${line.replace(/^###\s+/, "")}</h4>`;
+        if (/^##\s+/.test(line)) return `<h3 class="md-h3">${line.replace(/^##\s+/, "")}</h3>`;
+        if (/^\s*[-*]\s+/.test(line)) return line.replace(/^\s*[-*]\s+/, "• ");
+        return line;
+      });
+      txt = lines.join("\n");
+
+      // Bold & italic
+      txt = txt.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+      txt = txt.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s.,!?:;)]|$)/g, "$1<em>$2</em>");
+
+      txt = txt.replace(/@@URL(\d+)@@/g, (_, i) => urlTokens[Number(i)] || "");
+      txt = txt.replace(/@@CODE(\d+)@@/g, (_, i) => codeTokens[Number(i)] || "");
+      return txt;
+    }
+
+    function formatMessage(raw) {
+      const text = String(raw || "");
+      const parts = text.split(/```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g);
+      let out = "";
+      for (let i = 0; i < parts.length; i += 3) {
+        out += formatProseSegment(parts[i] || "");
+        if (i + 2 < parts.length) {
+          const lang = escapeHtml(parts[i + 1] || "code");
+          const codeRaw = (parts[i + 2] || "").replace(/\n$/, "");
+          const encoded = encodeURIComponent(codeRaw);
+          out += `<div class="code-wrap"><div class="code-head"><span>${lang}</span><button onclick="copyCode('${encoded}', this)">📋 Kopiuj</button></div><pre><code>${escapeHtml(codeRaw)}</code></pre></div>`;
+        }
+      }
+      return out;
+    }
+
+    function copyCode(encoded, btn) {
+      navigator.clipboard.writeText(decodeURIComponent(encoded)).then(() => {
+        const old = btn.textContent;
+        btn.textContent = "✅ Skopiowano";
+        setTimeout(() => { btn.textContent = old; }, 1200);
+      });
+    }
+
+    async function api(path, body = null) {
+      const opts = body !== null
+        ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+        : {};
+      const r = await fetch(path, opts);
+      return await r.json();
+    }
+
+    async function poll() {
+      try {
+        const s = await api("/api/state");
+        latestState = s;
+        renderUI(s);
+      } catch (e) {}
+    }
+
+    function setMemTab(tab) {
+      activeMemTab = tab;
+      for (const t of ["hippo", "sem", "rem", "topics", "core"]) {
+        document.getElementById("tab-" + t).className = "tab-btn" + (t === tab ? " active" : "");
+      }
+      if (latestState) renderMemoryTab(latestState);
+    }
+
+    async function addManualMemory() {
+      const inp = document.getElementById("manualMemInput");
+      const cat = document.getElementById("manualMemCat").value || "wiedza";
+      const text = inp.value.trim();
+      if (!text) return;
+      const res = await api("/api/memory/add", { text, category: cat, importance: 4 });
+      if (!res.ok) {
+        alert(res.error || "Nie udało się dodać wspomnienia.");
+        return;
+      }
+      inp.value = "";
+      await poll();
+    }
+
+    async function deleteMemoryItem(id) {
+      const res = await api("/api/memory/delete", { id });
+      if (!res.ok) alert(res.error || "Nie udało się usunąć wspomnienia.");
+      await poll();
+    }
+
+    async function deleteTopicItem(topic) {
+      const res = await api("/api/memory/delete", { topic });
+      if (!res.ok) alert(res.error || "Nie udało się usunąć tematu.");
+      await poll();
+    }
+
+    function renderMemoryTab(s) {
+      const q = (document.getElementById("memFilter").value || "").trim().toLowerCase();
+      const box = document.getElementById("memListBox");
+      if (activeMemTab === "hippo") {
+        const arr = s.memory.short_term_memories.slice().reverse().filter(m => !q || m.text.toLowerCase().includes(q) || (m.topic || "").toLowerCase().includes(q));
+        box.innerHTML = arr.length ? arr.map(m => {
+          const urlPart = m.source_url ? ` · <a class="md-link" href="${escapeHtml(m.source_url)}" target="_blank" rel="noopener noreferrer">źródło</a>` : "";
+          return `<div class="mem-item hippo"><div class="mem-item-body"><strong>[${escapeHtml(m.category)}]</strong> ${escapeHtml(m.text)} <span class="sub">(ważność ${m.importance}/5${m.topic ? " · temat: " + escapeHtml(m.topic) : ""}${urlPart})</span></div><button class="del-btn" title="Usuń" onclick="deleteMemoryItem('${escapeHtml(m.id)}')">✕</button></div>`;
+        }).join("") : `<div class="sub">Brak świeżych wspomnień w hipokampie — wszystko utrwalone lub jeszcze nie rozmawialiście.</div>`;
+      } else if (activeMemTab === "sem") {
+        const arr = s.memory.semantic_memories.filter(m => !q || m.text.toLowerCase().includes(q) || (m.topic || "").toLowerCase().includes(q));
+        box.innerHTML = arr.length ? arr.map(m => {
+          const urlPart = m.source_url ? ` · <a class="md-link" href="${escapeHtml(m.source_url)}" target="_blank" rel="noopener noreferrer">źródło</a>` : "";
+          return `<div class="mem-item sem"><div class="mem-item-body"><strong>[${escapeHtml(m.category)}]</strong> ${escapeHtml(m.text)} <span class="sub">(siła ${m.strength} · przypomnień ${m.recall_count} · D${m.day_created}${urlPart})</span></div><button class="del-btn" title="Usuń" onclick="deleteMemoryItem('${escapeHtml(m.id)}')">✕</button></div>`;
+        }).join("") : `<div class="sub">Brak trwałych wspomnień (wyślij mózg spać po rozmowie lub nauce).</div>`;
+      } else if (activeMemTab === "rem") {
+        const arr = s.memory.rem_reflections.slice().reverse().filter(r => !q || r.text.toLowerCase().includes(q));
+        box.innerHTML = arr.length ? arr.map(r =>
+          `<div class="mem-item rem"><div class="mem-item-body">✨ ${escapeHtml(r.text)} <span class="sub">(Noc D${r.day_created})</span></div><button class="del-btn" title="Usuń" onclick="deleteMemoryItem('${escapeHtml(r.id)}')">✕</button></div>`
+        ).join("") : `<div class="sub">Refleksje REM pojawią się po przespanej nocy.</div>`;
+      } else if (activeMemTab === "topics") {
+        const arr = (s.studied_topics || []).slice().reverse().filter(t => !q || t.topic.toLowerCase().includes(q));
+        box.innerHTML = arr.length ? arr.map(t => {
+          const srcLinks = (t.sources || []).slice(0, 3).map(src =>
+            `<a class="md-link" href="${escapeHtml(src.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(src.title)}</a>`
+          ).join(" · ");
+          return `<div class="mem-item topic"><div class="mem-item-body"><strong>🌐 ${escapeHtml(t.topic)}</strong> — opanowanie <strong>${Number(t.mastery || 0).toFixed(0)}%</strong> (${t.facts_learned} faktów, ${t.pages_read} źródeł)<div class="sub" style="margin-top:3px">${escapeHtml(t.summary || "")}</div>${srcLinks ? `<div class="sub" style="margin-top:3px">Źródła: ${srcLinks}</div>` : ""}</div><button class="del-btn" title="Usuń temat" onclick="deleteTopicItem('${escapeHtml(t.topic).replace(/'/g, "\\'")}')">✕</button></div>`;
+        }).join("") : `<div class="sub">Jeszcze nie badano żadnego tematu w sieci. Użyj paska powyżej!</div>`;
+      } else {
+        const core = (s.language_cortex && s.language_cortex.core_knowledge_summary) || "";
+        box.innerHTML = core
+          ? `<div class="mem-item core"><div class="mem-item-body">${formatMessage(core)}</div></div>`
+          : `<div class="sub">Skondensowany rdzeń wiedzy NREM powstaje automatycznie podczas snu po zapisaniu nowych wspomnień.</div>`;
+      }
+    }
+
+    function toggleRecallBox(key) {
+      if (openRecallBoxes.has(key)) openRecallBoxes.delete(key);
+      else openRecallBoxes.add(key);
+      lastChatHash = "";
+      if (latestState) renderChat(latestState);
+    }
+
+    function buildPillsAndDetails(meta, msgKey) {
+      if (!meta) return "";
+      const p = [];
+      if (meta.learned && meta.learned.length) {
+        p.push(`<span class="pill pill-hippo" onclick="toggleRecallBox('${msgKey}')">🟡 Hipokamp +${meta.learned.length}: ${escapeHtml(meta.learned[0].slice(0, 48))}</span>`);
+      }
+      if (meta.recalled_semantic && meta.recalled_semantic.length) {
+        p.push(`<span class="pill pill-sem" onclick="toggleRecallBox('${msgKey}')">🔵 Pamięć trwała (${meta.recalled_semantic.length})</span>`);
+      }
+      if (meta.recalled_hippocampus && meta.recalled_hippocampus.length) {
+        p.push(`<span class="pill pill-hippo" onclick="toggleRecallBox('${msgKey}')">🟡 Hipokamp (${meta.recalled_hippocampus.length})</span>`);
+      }
+      if (meta.recalled_rem && meta.recalled_rem.length) {
+        p.push(`<span class="pill pill-rem" onclick="toggleRecallBox('${msgKey}')">✨ REM (${meta.recalled_rem.length})</span>`);
+      }
+      if (meta.concept_hints && meta.concept_hints.length) {
+        p.push(`<span class="pill pill-graph" onclick="toggleRecallBox('${msgKey}')">🕸️ Skojarzenia (${meta.concept_hints.length})</span>`);
+      }
+      if (meta.lora_trained) {
+        p.push(`<span class="pill pill-rem">⚡ Rdzeń NREM skonsolidowany</span>`);
+      }
+      if (!p.length) return "";
+      let details = "";
+      if (openRecallBoxes.has(msgKey)) {
+        const blocks = [];
+        if (meta.learned && meta.learned.length) {
+          blocks.push(`<div><strong>Zapamiętano teraz:</strong><ul>${meta.learned.map(x => `<li>${escapeHtml(x)}</li>`).join("")}</ul></div>`);
+        }
+        if (meta.recalled_semantic && meta.recalled_semantic.length) {
+          blocks.push(`<div><strong>Przywołano z Pamięci Trwałej:</strong><ul>${meta.recalled_semantic.map(x => `<li>${escapeHtml(x)}</li>`).join("")}</ul></div>`);
+        }
+        if (meta.recalled_hippocampus && meta.recalled_hippocampus.length) {
+          blocks.push(`<div><strong>Przywołano z Hipokampu:</strong><ul>${meta.recalled_hippocampus.map(x => `<li>${escapeHtml(x)}</li>`).join("")}</ul></div>`);
+        }
+        if (meta.recalled_rem && meta.recalled_rem.length) {
+          blocks.push(`<div><strong>Refleksje REM:</strong><ul>${meta.recalled_rem.map(x => `<li>${escapeHtml(x)}</li>`).join("")}</ul></div>`);
+        }
+        if (meta.concept_hints && meta.concept_hints.length) {
+          blocks.push(`<div><strong>Skojarzenia grafu EWC:</strong><ul>${meta.concept_hints.map(x => `<li>${escapeHtml(x)}</li>`).join("")}</ul></div>`);
+        }
+        if (blocks.length) {
+          details = `<div class="recall-details">${blocks.join("")}</div>`;
+        }
+      }
+      return `<div class="msg-meta">${p.join("")}</div>${details}`;
+    }
+
+    function renderChat(s) {
+      const box = document.getElementById("chatBox");
+      const nearBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 90;
+      const hashPayload = JSON.stringify(s.chat_log) + (streamState.active ? "|stream|" + streamState.replyText.length : (chatBusy ? "|busy" : ""));
+      if (hashPayload === lastChatHash) return;
+      lastChatHash = hashPayload;
+
+      let html = s.chat_log.map((m, idx) => {
+        const isUser = m.role === "user";
+        const kind = m.meta && m.meta.kind;
+        let cls = isUser ? "msg msg-user" : "msg msg-assistant";
+        if (kind === "morning_wakeup") cls += " msg-morning";
+        if (kind === "study_start" || kind === "study_done") cls += " msg-study";
+        const pills = !isUser ? buildPillsAndDetails(m.meta, `m_${idx}`) : "";
+        return `<div class="${cls}">${formatMessage(m.content)}${pills}</div>`;
+      }).join("");
+
+      if (streamState.active) {
+        html += `<div class="msg msg-user">${formatMessage(streamState.userMsg)}</div>`;
+        const metaObj = streamState.meta ? {
+          recalled_semantic: (streamState.meta.recalled_memories && streamState.meta.recalled_memories.semantic || []).slice(0, 8),
+          recalled_hippocampus: (streamState.meta.recalled_memories && streamState.meta.recalled_memories.hippocampus || []).slice(0, 8),
+          recalled_rem: (streamState.meta.recalled_memories && streamState.meta.recalled_memories.rem || []).slice(0, 6),
+          concept_hints: streamState.meta.concept_hints || [],
+          learned: (streamState.meta.learned_memories || []).map(x => x.text)
+        } : null;
+        const bodyHtml = streamState.replyText
+          ? formatMessage(streamState.replyText)
+          : `<span style="opacity:0.75">💭 Myślę na GPU i przeszukuję pamięć...</span>`;
+        html += `<div class="msg msg-assistant" id="streamingBubble">${bodyHtml}${buildPillsAndDetails(metaObj, "stream_live")}</div>`;
+      } else if (chatBusy) {
+        html += `<div class="msg msg-assistant" style="opacity:0.75">💭 Myślę na GPU...</div>`;
+      }
+
+      box.innerHTML = html;
+      if (nearBottom || streamState.active) {
+        box.scrollTop = box.scrollHeight;
+      }
+    }
+
+    function renderUI(s) {
+      const badge = document.getElementById("stateBadge");
+      badge.className = "badge state-" + s.state_mode;
+      badge.textContent = STATE_LABELS[s.state_mode] || s.state_mode;
+
+      const gpu = s.gpu;
+      document.getElementById("gpuBadge").textContent = gpu.cuda_available
+        ? `⚡ ${gpu.device_name} (${gpu.vram_allocated_mb} MB VRAM)`
+        : "CPU";
+
+      const lc = s.language_cortex;
+      document.getElementById("nnBadge").textContent =
+        `🧬 ${(Number(lc.total_params || 0) / 1e6).toFixed(2)}M param · słownik ${lc.vocab_used || 0}/${lc.vocab_size || 16384}`;
+
+      const banner = document.getElementById("llmBanner");
+      if (lc.error) {
+        banner.className = "llm-banner error";
+        banner.textContent = `❌ ${lc.status}`;
+      } else if (lc.ready) {
+        banner.className = "llm-banner ready";
+        banner.textContent = `✅ ${lc.status} · ${lc.lora_updates} cykli treningu NREM`;
+      } else {
+        banner.className = "llm-banner";
+        banner.textContent = `⏳ ${lc.status}`;
+      }
+
+      const studying = s.study && s.study.active;
+      document.getElementById("sendBtn").disabled = chatBusy || !lc.ready || studying;
+      document.getElementById("studyBtn").disabled = !lc.ready || studying;
+      document.getElementById("stopStudyBtn").style.display = studying ? "inline-block" : "none";
+
+      // Study live progress
+      const sp = document.getElementById("studyProgress");
+      if (studying) {
+        sp.className = "study-progress visible";
+        document.getElementById("studyTitle").textContent = `🌐 Uczę się z sieci: „${s.study.topic}”`;
+        document.getElementById("studyStats").textContent =
+          `Runda ${s.study.round}/${s.study.max_rounds} · Stron: ${s.study.pages_read} · Faktów: ${s.study.facts_learned} · Opanowanie: ${s.study.mastery.toFixed(0)}%`;
+        document.getElementById("studyBar").style.width = Math.min(100, Math.max(8, s.study.mastery)) + "%";
+        document.getElementById("studyAction").textContent = s.study.current_action || "Analizuję...";
+      } else {
+        sp.className = "study-progress";
+      }
+
+      const pct = Math.max(0, Math.min(100, (s.energy / s.max_energy) * 100));
+      document.getElementById("energyVal").textContent = `${s.energy.toFixed(0)}%`;
+      document.getElementById("pressureVal").textContent = `(senność ${s.sleep_pressure.toFixed(0)}%)`;
+      const bar = document.getElementById("energyBar");
+      bar.style.width = pct + "%";
+      bar.style.background = s.state_mode.includes("REM") || s.state_mode.includes("NREM")
+        ? "var(--purple)" : (studying ? "var(--cyan)" : (pct < 20 ? "var(--amber)" : "var(--green)"));
+
+      document.getElementById("dayVal").textContent = s.day;
+      document.getElementById("sleepsVal").textContent = s.total_sleeps;
+      document.getElementById("loraUpdatesVal").textContent = lc.lora_updates;
+      document.getElementById("winLimVal").textContent = s.limits.working_chat_window;
+      document.getElementById("stMemVal").textContent = s.memory.short_term_memory_count;
+      document.getElementById("stLimVal").textContent = s.limits.short_term_memories;
+      document.getElementById("stFactVal").textContent = s.memory.short_term_fact_count;
+      document.getElementById("semMemVal").textContent = s.memory.semantic_memory_count;
+      document.getElementById("semLimVal").textContent = s.limits.semantic_memories;
+      document.getElementById("remReflVal").textContent = s.memory.rem_reflection_count;
+      document.getElementById("remGraphVal").textContent = s.memory.rem_dream_count;
+
+      document.getElementById("tc-hippo").textContent = s.memory.short_term_memory_count;
+      document.getElementById("tc-sem").textContent = s.memory.semantic_memory_count;
+      document.getElementById("tc-rem").textContent = s.memory.rem_reflection_count;
+      document.getElementById("tc-topics").textContent = (s.studied_topics || []).length;
+
+      const asBtn = document.getElementById("autoSleepBtn");
+      asBtn.textContent = s.auto_sleep ? "Auto-sen: WŁ" : "Auto-sen: WYŁ";
+      asBtn.className = s.auto_sleep ? "active" : "";
+
+      renderChat(s);
+      renderMemoryTab(s);
+
+      // Sleep table (EWC Graph Loss + Language Cortex Transformer Loss on GPU)
+      const tbody = document.getElementById("sleepTableBody");
+      if (s.sleep_history.length > 0) {
+        tbody.innerHTML = s.sleep_history.slice().reverse().slice(0, 6).map(r => {
+          const ewcText = (r.concept_loss_start || r.concept_loss_end)
+            ? `${Number(r.concept_loss_start).toFixed(2)}→<strong>${Number(r.concept_loss_end).toFixed(2)}</strong>`
+            : "—";
+          const lmText = r.lora_trained
+            ? `${Number(r.lora_loss_start).toFixed(2)}→<strong>${Number(r.lora_loss_end).toFixed(2)}</strong>`
+            : "—";
+          return `
+          <tr>
+            <td>#${r.night_number}</td>
+            <td>${(r.duration_ms / 1000).toFixed(1)}s</td>
+            <td>+${r.new_memories}</td>
+            <td>${ewcText}</td>
+            <td>${lmText}</td>
+            <td style="color:var(--purple)">+${(r.rem_reflections || []).length} / +${(r.rem_new_links || []).length}</td>
+          </tr>`;
+        }).join("");
+      } else {
+        tbody.innerHTML = `<tr><td colspan="6" class="sub">Brak przespanych nocy.</td></tr>`;
+      }
+
+      // Event log
+      document.getElementById("logBox").innerHTML = s.event_log.slice().reverse().map(e =>
+        `<div><span style="color:#64748b">[${e.t} D${e.day}]</span> <span class="tag-${e.kind}">[${e.kind}]</span> ${escapeHtml(e.msg)}</div>`
+      ).join("");
+
+      drawGraph(s);
+    }
+
+    function drawArrowHead(ctx, x1, y1, x2, y2, color) {
+      const angle = Math.atan2(y2 - y1, x2 - x1);
+      const dist = Math.hypot(x2 - x1, y2 - y1);
+      if (dist < 18) return;
+      const tipX = x2 - Math.cos(angle) * 9;
+      const tipY = y2 - Math.sin(angle) * 9;
+      ctx.save();
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(tipX, tipY);
+      ctx.lineTo(tipX - 6 * Math.cos(angle - Math.PI / 7), tipY - 6 * Math.sin(angle - Math.PI / 7));
+      ctx.lineTo(tipX - 6 * Math.cos(angle + Math.PI / 7), tipY - 6 * Math.sin(angle + Math.PI / 7));
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function drawGraph(s) {
+      const canvas = document.getElementById("graphCanvas");
+      const dpr = window.devicePixelRatio || 1;
+      const cssW = Math.max(320, canvas.clientWidth || 520);
+      const cssH = 280;
+      if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+        canvas.width = Math.round(cssW * dpr);
+        canvas.height = Math.round(cssH * dpr);
+      }
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const w = cssW, h = cssH, pad = 36;
+      ctx.fillStyle = "#060a12";
+      ctx.fillRect(0, 0, w, h);
+
+      const nodes = s.graph.nodes || [], edges = s.graph.edges || [], posMap = {};
+      graphScreenNodes = [];
+      if (!nodes.length) {
+        ctx.fillStyle = "#64748b"; ctx.font = "12px Segoe UI"; ctx.textAlign = "center";
+        ctx.fillText("Graf pojęć zapełni się automatycznie podczas rozmów i nauki z sieci.", w / 2, h / 2);
+        return;
+      }
+
+      for (const n of nodes) {
+        const px = pad + ((n.x + 1) / 2) * (w - pad * 2);
+        const py = pad + ((n.y + 1) / 2) * (h - pad * 2);
+        posMap[n.id] = { x: px, y: py, node: n };
+        graphScreenNodes.push({ id: n.id, x: px, y: py, node: n });
+      }
+
+      const focusId = selectedNodeId || hoveredNodeId;
+      const neighborSet = new Set();
+      if (focusId) {
+        neighborSet.add(focusId);
+        for (const e of edges) {
+          if (e.src === focusId) neighborSet.add(e.dst);
+          if (e.dst === focusId) neighborSet.add(e.src);
+        }
+      }
+
+      for (const e of edges) {
+        const p1 = posMap[e.src], p2 = posMap[e.dst];
+        if (!p1 || !p2) continue;
+        const isFocusEdge = focusId && (e.src === focusId || e.dst === focusId);
+        const dim = focusId && !isFocusEdge;
+        ctx.save();
+        ctx.globalAlpha = dim ? 0.14 : 1.0;
+        ctx.beginPath();
+        let strokeCol = "rgba(56,189,248,0.55)";
+        let midX = (p1.x + p2.x) / 2;
+        let midY = (p1.y + p2.y) / 2;
+        if (e.source === "REM_DREAM") {
+          strokeCol = "rgba(192,132,252,0.88)";
+          ctx.strokeStyle = strokeCol; ctx.lineWidth = isFocusEdge ? 2.5 : 1.9;
+          midX = (p1.x + p2.x) / 2 + (p1.y - p2.y) * 0.14;
+          midY = (p1.y + p2.y) / 2 + (p2.x - p1.x) * 0.14;
+          ctx.moveTo(p1.x, p1.y); ctx.quadraticCurveTo(midX, midY, p2.x, p2.y);
+        } else if (e.source === "HIPPOCAMPUS") {
+          strokeCol = "rgba(251,191,36,0.75)";
+          ctx.strokeStyle = strokeCol; ctx.setLineDash([4, 4]); ctx.lineWidth = isFocusEdge ? 2.1 : 1.4;
+          ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
+        } else {
+          ctx.strokeStyle = strokeCol; ctx.lineWidth = isFocusEdge ? 2.2 : 1.4;
+          ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
+        }
+        ctx.stroke();
+        drawArrowHead(ctx, p1.x, p1.y, p2.x, p2.y, strokeCol);
+
+        if (selectedNodeId && isFocusEdge && e.rel) {
+          ctx.fillStyle = "#e2e8f0";
+          ctx.font = "10px Segoe UI";
+          ctx.textAlign = "center";
+          ctx.fillText(e.rel, midX, midY - 4);
+        }
+        ctx.restore();
+      }
+
+      for (const n of nodes) {
+        const p = posMap[n.id];
+        const isSelected = n.id === selectedNodeId;
+        const isHovered = n.id === hoveredNodeId;
+        const dim = focusId && !neighborSet.has(n.id);
+        const baseR = Math.min(9, (n.consolidated ? 6.0 : 5.0) + Math.min(3, (n.degree || 0) * 0.4));
+        ctx.save();
+        ctx.globalAlpha = dim ? 0.22 : 1.0;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, isSelected || isHovered ? baseR + 2 : baseR, 0, Math.PI * 2);
+        ctx.fillStyle = isSelected ? "#f43f5e" : (n.consolidated ? "#0ea5e9" : "#f59e0b");
+        ctx.fill();
+        if (isSelected || isHovered) {
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = "#ffffff";
+          ctx.stroke();
+        }
+        ctx.fillStyle = "#f1f5f9";
+        ctx.font = (isSelected || isHovered) ? "bold 11px Segoe UI" : "10.5px Segoe UI";
+        ctx.textAlign = "center";
+        ctx.fillText(n.id, p.x, p.y + baseR + 11);
+        ctx.restore();
+      }
+    }
+
+    // Interactive graph hover & click
+    (function setupGraphEvents() {
+      const canvas = document.getElementById("graphCanvas");
+      const tip = document.getElementById("graphTooltip");
+
+      function hitTest(ev) {
+        const rect = canvas.getBoundingClientRect();
+        const mx = ev.clientX - rect.left;
+        const my = ev.clientY - rect.top;
+        let hit = null, bestD = 16;
+        for (const item of graphScreenNodes) {
+          const d = Math.hypot(item.x - mx, item.y - my);
+          if (d < bestD) { bestD = d; hit = item; }
+        }
+        return { hit, mx, my };
+      }
+
+      canvas.addEventListener("mousemove", (ev) => {
+        if (!latestState) return;
+        const { hit, mx, my } = hitTest(ev);
+        const nextHover = hit ? hit.id : null;
+        if (nextHover !== hoveredNodeId) {
+          hoveredNodeId = nextHover;
+          drawGraph(latestState);
+        }
+        if (hit) {
+          const edges = (latestState.graph && latestState.graph.edges) || [];
+          const rels = edges.filter(e => e.src === hit.id || e.dst === hit.id).slice(0, 6)
+            .map(e => `<div>• ${escapeHtml(e.src)} —[<strong>${escapeHtml(e.rel)}</strong>]→ ${escapeHtml(e.dst)}</div>`).join("");
+          tip.innerHTML = `<strong>${escapeHtml(hit.id)}</strong> <span class="sub">(${hit.node.consolidated ? "kora" : "hipokamp"} · stopień ${hit.node.degree || 0})</span>${rels ? `<div style="margin-top:4px">${rels}</div>` : ""}`;
+          tip.style.display = "block";
+          tip.style.left = Math.min(canvas.clientWidth - 240, Math.max(8, mx + 12)) + "px";
+          tip.style.top = Math.max(8, my - 10) + "px";
+        } else {
+          tip.style.display = "none";
+        }
+      });
+
+      canvas.addEventListener("mouseleave", () => {
+        tip.style.display = "none";
+        if (hoveredNodeId !== null) {
+          hoveredNodeId = null;
+          if (latestState) drawGraph(latestState);
+        }
+      });
+
+      canvas.addEventListener("click", (ev) => {
+        if (!latestState) return;
+        const { hit } = hitTest(ev);
+        selectedNodeId = hit ? (selectedNodeId === hit.id ? null : hit.id) : null;
+        drawGraph(latestState);
+      });
+    })();
+
+    function autoResizeChatInput(el) {
+      el.style.height = "auto";
+      el.style.height = Math.min(130, Math.max(40, el.scrollHeight)) + "px";
+    }
+
+    function handleChatKey(ev) {
+      if (ev.key === "Enter" && !ev.shiftKey) {
+        ev.preventDefault();
+        sendChat();
+      }
+    }
+
+    function fillChat(txt) {
+      const inp = document.getElementById("chatInput");
+      inp.value = txt;
+      autoResizeChatInput(inp);
+      inp.focus();
+    }
+
+    async function startStudy() {
+      const inp = document.getElementById("studyInput");
+      const topic = inp.value.trim();
+      if (!topic) return;
+      const rounds = Number(document.getElementById("studyRounds").value || 4);
+      const res = await api("/api/study", { topic, max_rounds: rounds, consolidate_after: true });
+      if (!res.ok) alert(res.error || "Nie udało się rozpocząć nauki.");
+      else inp.value = "";
+      poll();
+    }
+
+    async function stopStudy() {
+      await api("/api/study/stop", {});
+      poll();
+    }
+
+    async function sendChat() {
+      const inp = document.getElementById("chatInput");
+      const msg = inp.value.trim();
+      if (!msg || chatBusy) return;
+      inp.value = "";
+      autoResizeChatInput(inp);
+      chatBusy = true;
+      streamState = { active: true, userMsg: msg, meta: null, replyText: "" };
+      lastChatHash = "";
+      if (latestState) renderUI(latestState);
+
+      try {
+        const resp = await fetch("/api/chat/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: msg })
+        });
+        if (!resp.ok || !resp.body) {
+          throw new Error("Błąd strumienia odpowiedzi serwera.");
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() || "";
+          for (const frame of frames) {
+            for (const line of frame.split("\n")) {
+              if (!line.startsWith("data:")) continue;
+              const rawJson = line.slice(5).trim();
+              if (!rawJson) continue;
+              let ev;
+              try { ev = JSON.parse(rawJson); } catch { continue; }
+              if (ev.type === "meta") {
+                streamState.meta = ev;
+                if (latestState) renderChat(latestState);
+              } else if (ev.type === "token") {
+                streamState.replyText += (ev.delta || "");
+                if (latestState) renderChat(latestState);
+              } else if (ev.type === "error") {
+                alert(ev.error || "Błąd rozmowy");
+              } else if (ev.type === "done") {
+                streamState.active = false;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        alert(e.message || "Błąd połączenia z serwerem mózgu.");
+      } finally {
+        streamState = { active: false, userMsg: "", meta: null, replyText: "" };
+        chatBusy = false;
+        lastChatHash = "";
+        await poll();
+      }
+    }
+
+    async function triggerSleep() {
+      const btn = document.getElementById("sleepBtn");
+      btn.disabled = true;
+      btn.textContent = "💤 Śpi i konsoliduje na GPU...";
+      try {
+        const res = await api("/api/sleep", {});
+        if (!res.ok) alert(res.error || "Nie można teraz uśpić mózgu.");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "🌙 Uśpij teraz (NREM + EWC + REM)";
+        await poll();
+      }
+    }
+
+    async function toggleAutoSleep() {
+      if (!latestState) return;
+      await api("/api/control", { auto_sleep: !latestState.auto_sleep });
+      poll();
+    }
+    async function saveBrain() { await api("/api/save", {}); poll(); }
+    function exportBrain() { window.location.href = "/api/export"; }
+    async function resetBrain() {
+      if (!confirm("Zresetować całą pamięć, czat i zbadane tematy?")) return;
+      await api("/api/reset", {});
+      poll();
+    }
+
+    setInterval(poll, 700);
+    poll();
+  </script>
+</body>
+</html>

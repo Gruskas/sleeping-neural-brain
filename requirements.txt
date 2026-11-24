@@ -1,0 +1,4 @@
+# PyTorch with CUDA 12.8 for RTX 5080 (Blackwell):
+# pip install torch numpy --index-url https://download.pytorch.org/whl/cu128
+torch>=2.7.0
+numpy>=2.0.0
