@@ -414,6 +414,7 @@
     </div>
     <div class="controls">
       <button id="sleepBtn" class="primary" onclick="triggerSleep()">🌙 Uśpij teraz (NREM + EWC + REM)</button>
+      <button id="autoWebBtn" class="active" onclick="toggleAutoWeb()" title="Gdy nie znam odpowiedzi, automatycznie sprawdzę ją w internecie">🌐 Auto-sieć: WŁ</button>
       <button id="autoSleepBtn" class="active" onclick="toggleAutoSleep()">Auto-sen: WŁ</button>
       <button onclick="saveBrain()">💾 Zapisz</button>
       <button onclick="exportBrain()" title="Pobierz bazę wiedzy jako JSON">📥 Eksport</button>
@@ -462,6 +463,10 @@
           <button id="studyBtn" class="study-btn" onclick="startStudy()">🌐 Ucz się z sieci</button>
           <button id="stopStudyBtn" class="danger" onclick="stopStudy()" style="display:none">⏹ Stop</button>
         </div>
+        <div class="chips" style="margin-top:2px">
+          <button id="schoolBtn" class="primary" onclick="installSchoolFoundation()" style="padding:5px 10px;font-size:12px">🎓 Szkoła Podstawowa (Wgraj podstawy + GPU)</button>
+          <button id="schoolWebBtn" onclick="startSchoolWebCourse()" style="padding:5px 10px;font-size:12px">📚 Kurs szkolny z Wikipedii</button>
+        </div>
         <div id="studyProgress" class="study-progress">
           <div style="display:flex;justify-content:space-between;align-items:center">
             <strong id="studyTitle">Badam temat...</strong>
@@ -484,6 +489,8 @@
           <button id="sendBtn" class="send-btn" onclick="sendChat()">Wyślij</button>
         </div>
         <div class="chips">
+          <span class="chip" onclick="fillChat('/szkola')">🎓 /szkola (Podstawy szkolne)</span>
+          <span class="chip" onclick="fillChat('Ile to 12 * 15?')">🧮 Ile to 12 * 15?</span>
           <span class="chip" onclick="fillChat('Cześć! Mam na imię Kuba, mieszkam w Gliwicach i interesuję się programowaniem AI w Pythonie.')">👤 Przedstaw się</span>
           <span class="chip" onclick="fillChat('/ucz jak działają komputery kwantowe')">🌐 /ucz komputery kwantowe</span>
           <span class="chip" onclick="fillChat('Co już pamiętasz i jakich tematów ostatnio się nauczyłeś?')">🧠 Sprawdź pamięć</span>
@@ -845,6 +852,8 @@
       const studying = s.study && s.study.active;
       document.getElementById("sendBtn").disabled = chatBusy || !lc.ready || studying;
       document.getElementById("studyBtn").disabled = !lc.ready || studying;
+      document.getElementById("schoolBtn").disabled = !lc.ready || studying;
+      document.getElementById("schoolWebBtn").disabled = !lc.ready || studying;
       document.getElementById("stopStudyBtn").style.display = studying ? "inline-block" : "none";
 
       // Study live progress
@@ -888,6 +897,12 @@
       const asBtn = document.getElementById("autoSleepBtn");
       asBtn.textContent = s.auto_sleep ? "Auto-sen: WŁ" : "Auto-sen: WYŁ";
       asBtn.className = s.auto_sleep ? "active" : "";
+
+      const awBtn = document.getElementById("autoWebBtn");
+      if (awBtn) {
+        awBtn.textContent = s.auto_web ? "🌐 Auto-sieć: WŁ" : "🌐 Auto-sieć: WYŁ";
+        awBtn.className = s.auto_web ? "active" : "";
+      }
 
       renderChat(s);
       renderMemoryTab(s);
@@ -1133,6 +1148,26 @@
       poll();
     }
 
+    async function installSchoolFoundation() {
+      const btn = document.getElementById("schoolBtn");
+      btn.disabled = true;
+      const old = btn.textContent;
+      btn.textContent = "⏳ Wgrywam podstawy i trenuję na GPU...";
+      try {
+        const res = await api("/api/curriculum", { deep_web: false });
+        if (!res.ok) alert(res.error || "Nie udało się wgrać pakietu Szkoła Podstawowa.");
+      } finally {
+        btn.textContent = old;
+        await poll();
+      }
+    }
+
+    async function startSchoolWebCourse() {
+      const res = await api("/api/curriculum", { deep_web: true, max_topics: 12 });
+      if (!res.ok) alert(res.error || "Nie udało się uruchomić kursu szkolnego.");
+      await poll();
+    }
+
     async function sendChat() {
       const inp = document.getElementById("chatInput");
       const msg = inp.value.trim();
@@ -1210,6 +1245,11 @@
     async function toggleAutoSleep() {
       if (!latestState) return;
       await api("/api/control", { auto_sleep: !latestState.auto_sleep });
+      poll();
+    }
+    async function toggleAutoWeb() {
+      if (!latestState) return;
+      await api("/api/control", { auto_web: !latestState.auto_web });
       poll();
     }
     async function saveBrain() { await api("/api/save", {}); poll(); }

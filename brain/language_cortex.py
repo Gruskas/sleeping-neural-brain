@@ -794,6 +794,35 @@ class LanguageCortex:
         state_mode: str,
         user_profile: list[str] | None = None,
     ) -> str:
+        reply, _ = self._chat_reply_with_meta(
+            user_message=user_message,
+            recent_turns=recent_turns,
+            hippocampus_memories=hippocampus_memories,
+            semantic_memories=semantic_memories,
+            rem_reflections=rem_reflections,
+            concept_hints=concept_hints,
+            day=day,
+            sleeps=sleeps,
+            energy=energy,
+            state_mode=state_mode,
+            user_profile=user_profile,
+        )
+        return reply
+
+    def _chat_reply_with_meta(
+        self,
+        user_message: str,
+        recent_turns: list[dict[str, str]],
+        hippocampus_memories: list[str],
+        semantic_memories: list[str],
+        rem_reflections: list[str],
+        concept_hints: list[str],
+        day: int,
+        sleeps: int,
+        energy: float,
+        state_mode: str,
+        user_profile: list[str] | None = None,
+    ) -> tuple[str, str | None]:
         msg = user_message.strip()
         low = _strip_pl(msg.lower()).strip(" ?!.,;:")
 
@@ -802,7 +831,8 @@ class LanguageCortex:
             return (
                 "Rozumiem, dzięki za zwrócenie uwagi! Nie zapisałem tej reakcji jako faktu. "
                 "Napisz proszę poprawną informację zdaniem twierdzącym albo użyj `/ucz <temat>`, "
-                "abym sprawdził wiarygodne źródła i zaktualizował pamięć."
+                "abym sprawdził wiarygodne źródła i zaktualizował pamięć.",
+                None,
             )
 
         # Find user name if known
@@ -814,14 +844,72 @@ class LanguageCortex:
                 break
         name_part = f" {user_name}" if user_name else ""
 
-        # 2) Thanks / acknowledgement
-        if low in ("dzieki", "dziekuje", "super", "fajnie", "spoko", "okej", "ok", "rozumiem", "brawo", "jasne", "aha"):
-            return f"Nie ma za co{name_part}! Pytaj śmiało o kolejne zagadnienia, obliczenia albo użyj `/szkola`, jeśli chcesz utrwalić podstawy."
+        # 2) Thanks / acknowledgement / reactions
+        if low in ("dzieki", "dziekuje", "dzieki wielkie", "thx"):
+            return (f"Nie ma za co{name_part}! Pytaj śmiało o kolejne rzeczy albo po prostu porozmawiajmy.", None)
+
+        if low in ("wow", "lal", "mega", "cool", "extra", "ekstra", "super", "swietnie", "genialnie", "niesamowite", "niezle", "fajnie", "dobre", "brawo", "szacun"):
+            return (f"Dzięki{name_part}! Staram się jak mogę — im więcej rozmawiamy i uczymy się razem, tym lepiej działam. O czym chcesz teraz pogadać?", None)
+
+        if low in ("spoko", "okej", "ok", "rozumiem", "jasne", "aha", "dobrze", "git", "pewnie", "zgadza sie", "tak", "nie", "moze", "chyba", "nom", "taa", "no", "raczej"):
+            return (f"Jasne{name_part}! Jeśli chcesz o coś zapytać, coś policzyć albo czegoś mnie nauczyć — pisz śmiało.", None)
+
+        if low in ("haha", "hehe", "hihi", "xd", "lol", "lmao"):
+            return (f"Cieszę się, że humor dopisuje{name_part}! O czym pogadamy dalej?", None)
+
+        # 2b) Compliments & criticism (including common Polish typos like "moadry jestes")
+        is_compliment = any(
+            p in low
+            for p in (
+                "madry jestes", "moadry jestes", "jestes madry", "jestes moadry",
+                "jestes super", "super jestes", "fajny jestes", "jestes fajny",
+                "dobry jestes", "jestes dobry", "inteligentny", "sprytny",
+                "lubie cie", "najlepszy", "kozacki", "genialny jestes",
+            )
+        )
+        if is_compliment:
+            return (
+                f"Miło mi to słyszeć{name_part}! Uczę się na bieżąco z naszych rozmów i z internetu, "
+                f"a w nocy utrwalam wszystko w sieci neuronowej na GPU. Chcesz mnie o coś zapytać albo pogadać na jakiś temat?",
+                None,
+            )
+
+        is_criticism = any(
+            p in low
+            for p in ("glupi jestes", "jestes glupi", "slabo", "slaby jestes", "bez sensu", "nic nie umiesz", "nie dziala")
+        )
+        if is_criticism:
+            return (
+                f"Przepraszam, jeśli odpowiedź nie była trafna{name_part}. Dopiero się uczę — "
+                f"możesz poprawić mnie zdaniem twierdzącym albo włączyć `🌐 Auto-sieć`, żebym sam sprawdzał odpowiedzi w internecie!",
+                None,
+            )
+
+        # 2c) Small talk / mood / jokes
+        if any(p in low for p in ("jak sie masz", "co slychac", "co u ciebie", "wszystko ok", "jak leci", "co tam")):
+            return (
+                f"U mnie wszystko w porządku{name_part}! Energia na poziomie {energy:.0f}% "
+                f"(Dzień #{day}, przespanych nocy: {sleeps}). W czym mogę Ci pomóc albo o czym porozmawiamy?",
+                None,
+            )
+
+        if any(p in low for p in ("nudzi mi sie", "pogadajmy", "porozmawiajmy")):
+            return (
+                f"Chętnie porozmawiam{name_part}! Możesz zapytać mnie o dowolną ciekawostkę "
+                f"(z włączonym `🌐 Auto-sieć` od razu ją sprawdzę w internecie), możemy policzyć jakieś zadanie albo po prostu pogadać.",
+                None,
+            )
+
+        if any(p in low for p in ("zart", "kawal")):
+            return (
+                "Dlaczego sieć neuronowa poszła spać? Bo bez fazy REM w ogóle nie kojarzyła faktów! 😄",
+                None,
+            )
 
         # 3) Farewell
         if low in ("dobranoc", "do zobaczenia", "pa", "nara", "czesc na dzis"):
             sleep_note = " Masz w hipokampie świeże wspomnienia — możesz wpisać `/sen`, abym je utrwalił na GPU." if hippocampus_memories else ""
-            return f"Do zobaczenia{name_part}!{sleep_note}"
+            return (f"Do zobaczenia{name_part}!{sleep_note}", None)
 
         # 4) Conversational capability / "o czym mogę z tobą rozmawiać" (tolerant of Polish typos)
         is_capability_q = (
@@ -832,9 +920,10 @@ class LanguageCortex:
             return (
                 f"Możemy rozmawiać po polsku na wiele tematów{name_part}! Oto co potrafię jako samowystarczalny mózg PyTorch:\n"
                 "- **Rozmowa i pamięć**: zapamiętuję fakty o Tobie oraz informacje, których mnie uczysz zdaniami twierdzącymi.\n"
-                "- **Podstawy szkolne jednym kliknięciem**: kliknij **`🎓 Szkoła Podstawowa`** (albo wpisz `/szkola`), a wgram ~140 podstawowych pojęć z matematyki, przyrody, geografii, fizyki, chemii, historii, języka polskiego i informatyki oraz wytrenuję je na GPU.\n"
-                "- **Matematyka szkolna**: policzę działania, potęgi, procenty i pierwiastki (np. `ile to 12 * 15`, `25% z 200`, `pierwiastek z 144`).\n"
-                "- **Autonomiczna nauka z internetu**: wpisz `/ucz <temat>` (lub `/szkola siec`), abym sam poszukał wiedzy w sieci i utrwalił ją we śnie."
+                "- **Auto-sieć**: gdy nie znam odpowiedzi, sam sprawdzam ją w internecie i od razu odpowiadam.\n"
+                "- **Podstawy szkolne jednym kliknięciem**: kliknij **`🎓 Szkoła Podstawowa`** (albo wpisz `/szkola`), a wgram ~140 podstawowych pojęć z różnych przedmiotów.\n"
+                "- **Matematyka szkolna**: policzę działania, potęgi, procenty i pierwiastki (np. `ile to 12 * 15`, `25% z 200`, `pierwiastek z 144`).",
+                None,
             )
 
         # 5) Short conversational follow-ups / confusion ("ale co", "dlaczego", "nie rozumiem", "o co chodzi")
@@ -851,23 +940,26 @@ class LanguageCortex:
             if last_bot:
                 return (
                     "Chodziło mi o naszą ostatnią rozmowę. Napisz dokładniej, które pojęcie mam wyjaśnić albo policzyć "
-                    "(np. `co to jest fotosynteza`, `ile to 7 * 8` lub wpisz `/szkola`, abym nauczył się podstaw ze szkoły podstawowej)."
+                    "(np. `co to jest fotosynteza`, `ile to 7 * 8`).",
+                    None,
                 )
             return (
                 "Napisz proszę pełne pytanie lub konkretne pojęcie (np. `co to jest grawitacja`, `ile to 15% z 200`), "
-                "albo wpisz `/szkola`, abym od razu opanował pakiet wiedzy ze szkoły podstawowej."
+                "albo po prostu napisz, o czym chcesz porozmawiać!",
+                None,
             )
 
         # 6) Pure greeting / status question
         is_greeting = bool(
-            re.match(r"^(?:czesc|hej|hejka|siema|witaj|dzien dobry|dobry wieczor|jak sie czujesz|co tam)[!.\s?]*$", low)
+            re.match(r"^(?:czesc|hej|hejka|siema|siemanko|witaj|witam|elo|yo|dzien dobry|dobry wieczor|jak sie czujesz)[!.\s?]*$", low)
         )
         if is_greeting:
             sleep_hint = " Czuję się już lekko śpiący — przyda się `/sen`, aby skonsolidować pamięć na GPU." if energy <= self.cfg.drowsy_threshold else ""
             return (
                 f"Cześć{name_part}! Jestem w pełni samowystarczalnym mózgiem PyTorch na GPU "
                 f"(Dzień #{day}, energia {energy:.0f}%, przespanych nocy: {sleeps}). "
-                f"Możesz ze mną rozmawiać, uczyć mnie faktów, wgrać pakiet `/szkola` albo zlecić `/ucz <temat>`.{sleep_hint}"
+                f"Możesz ze mną normalnie porozmawiać, zapytać o dowolny temat albo czegoś mnie nauczyć.{sleep_hint}",
+                None,
             )
 
         # 7) Memory self-inspection questions ("co pamiętasz", "co o mnie wiesz", "czego się nauczyłeś")
@@ -883,7 +975,7 @@ class LanguageCortex:
                     seen.add(c.lower())
                     all_mems.append(c)
             if not all_mems and not self.core_knowledge_summary:
-                return "Na razie moja pamięć jest jeszcze pusta. Kliknij `🎓 Szkoła Podstawowa` (lub wpisz `/szkola`), naucz mnie czegoś w rozmowie albo wpisz `/ucz <temat>`!"
+                return ("Na razie moja pamięć jest jeszcze pusta. Kliknij `🎓 Szkoła Podstawowa` (lub wpisz `/szkola`), naucz mnie czegoś w rozmowie albo wpisz `/ucz <temat>`!", None)
             lines = ["Oto najważniejsze rzeczy, które pamiętam:"]
             for item in all_mems[:8]:
                 lines.append(f"- {item}")
@@ -891,12 +983,12 @@ class LanguageCortex:
                 lines.append("\nWnioski ze snu REM:")
                 for r in rem_reflections[:2]:
                     lines.append(f"- {_clean_fact_text(r)}")
-            return "\n".join(lines)
+            return ("\n".join(lines), None)
 
         # 8) Elementary school math solver
         math_ans = _try_solve_math(msg)
         if math_ans is not None:
-            return math_ans
+            return (math_ans, None)
 
         # 9) Did user just state/teach something declarative (no question)?
         is_question = msg.endswith("?") or any(
@@ -910,7 +1002,7 @@ class LanguageCortex:
         extracted_now = self.extract_memories_from_turn(msg)
         if extracted_now["memories"] and not is_question:
             learned_str = "; ".join(m["text"] for m in extracted_now["memories"][:3])
-            return f"Zapamiętałem w hipokampie: {learned_str}"
+            return (f"Zapamiętałem w hipokampie: {learned_str}", None)
 
         # 10) Knowledge / definition / explanation query grounded strictly in recalled memory
         subj = _extract_query_subject(msg)
@@ -935,11 +1027,13 @@ class LanguageCortex:
             if is_non_topic_phrase:
                 return (
                     "Nie jestem pewien, o co dokładnie pytasz. Podaj proszę konkretne zagadnienie "
-                    "(np. `co to jest fotosynteza`), obliczenie (np. `ile to 8 * 7`) albo kliknij `🎓 Szkoła Podstawowa` (`/szkola`)."
+                    "(np. `co to jest fotosynteza`), obliczenie (np. `ile to 8 * 7`) albo kliknij `🎓 Szkoła Podstawowa` (`/szkola`).",
+                    None,
                 )
             return (
                 f"Nie mam jeszcze w swojej pamięci informacji na temat „{subj}”. "
-                f"Wpisz `/ucz {subj}`, a sam znajdę wiarygodne źródła w sieci i się tego nauczę!"
+                f"Wpisz `/ucz {subj}`, a sam znajdę wiarygodne źródła w sieci i się tego nauczę!",
+                subj,
             )
 
         # Rank candidates jointly using GPU Semantic Encoder + Polish stem overlap + Transformer LM score
@@ -955,29 +1049,33 @@ class LanguageCortex:
             ov_subj = _stem_overlap(subj, cand)
             ov_msg = _stem_overlap(msg, cand)
             ov = max(ov_subj, ov_msg)
-            cos = max(_cosine_list(subj_vec, cvec), _cosine_list(msg_vec, cvec))
+            subj_cos = _cosine_list(subj_vec, cvec)
+            msg_cos = _cosine_list(msg_vec, cvec)
+            cos = 0.75 * subj_cos + 0.25 * msg_cos
             is_def = any(cue in cand.lower() for cue in ("znaczenie słowa", " to ", " jest ", " – ", " — ", "oznacza", "składa się"))
             def_bonus = 0.14 if is_def else 0.0
             lm_bonus = max(-0.05, min(0.08, (lms + 6.0) * 0.015))
             total = 0.48 * ov + 0.36 * cos + def_bonus + lm_bonus
-            ranked.append((total, ov, cos, cand, cvec))
+            ranked.append((total, ov, subj_cos, cand, cvec))
 
         ranked.sort(key=lambda x: x[0], reverse=True)
-        top_score, top_ov, top_cos, _, _ = ranked[0]
+        top_score, top_ov, top_subj_cos, _, _ = ranked[0]
 
         # Anti-hallucination gate: require genuine relevance to the asked subject
-        if top_ov < 0.25 and top_cos < 0.48:
+        if top_ov < 0.25 and top_subj_cos < 0.52:
             if is_non_topic_phrase:
                 return (
                     "Nie do końca rozumiem, o jaki temat pytasz. Zadaj proszę pytanie o konkretne pojęcie "
-                    "albo wpisz `/szkola`, abym wgrał podstawową wiedzę szkolną."
+                    "albo wpisz `/szkola`, abym wgrał podstawową wiedzę szkolną.",
+                    None,
                 )
             return (
                 f"Nie jestem pewien odpowiedzi na temat „{subj}” — nie znalazłem pasujących faktów w pamięci. "
-                f"Użyj `/ucz {subj}`, abym zbadał ten temat w internecie!"
+                f"Użyj `/ucz {subj}`, abym zbadał ten temat w internecie!",
+                subj,
             )
 
-        relevant = [item for item in ranked if item[1] >= 0.25 or item[2] >= max(0.45, top_cos - 0.08)]
+        relevant = [item for item in ranked if item[1] >= 0.25 or item[2] >= max(0.50, top_subj_cos - 0.06)]
         chosen_texts: list[str] = []
         chosen_vecs: list[list[float]] = []
         max_facts = 3 if any(w in low for w in ("krotko", "w skrocie")) else 5
@@ -1032,7 +1130,7 @@ class LanguageCortex:
         if state_mode == "DROWSY" or energy <= self.cfg.drowsy_threshold:
             parts.append("\n*(Energia niska — przyda się `/sen`, aby utrwalić świeżą wiedzę w sieci neuronowej na GPU.)*")
 
-        return "\n".join(parts).strip()
+        return ("\n".join(parts).strip(), None)
 
     def chat_reply_stream(
         self,

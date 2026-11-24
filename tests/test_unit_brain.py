@@ -124,6 +124,19 @@ class TestLanguageCortexStandalone(unittest.TestCase):
         unknown_reply = lc.chat_reply("Kto to był Tamerlan?", [], [], [], [], [], 1, 0, 100.0, "AWAKE")
         self.assertIn("/ucz", unknown_reply)
 
+        # Conversational capability with typos & short follow-ups must NOT suggest '/ucz ...'
+        cap_reply = lc.chat_reply("o czy moge z toba rozmiac", [], [], [], [], [], 1, 0, 100.0, "AWAKE")
+        self.assertNotIn("/ucz o czy", cap_reply.lower())
+        self.assertIn("/szkola", cap_reply.lower())
+
+        follow_reply = lc.chat_reply("ale co", [{"role": "assistant", "content": "Cześć!"}], [], [], [], [], 1, 0, 100.0, "AWAKE")
+        self.assertNotIn("/ucz ale co", follow_reply.lower())
+
+        # Elementary school math solver
+        self.assertIn("56", lc.chat_reply("ile to jest 7 * 8", [], [], [], [], [], 1, 0, 100.0, "AWAKE"))
+        self.assertIn("50", lc.chat_reply("ile to 25% z 200", [], [], [], [], [], 1, 0, 100.0, "AWAKE"))
+        self.assertIn("12", lc.chat_reply("pierwiastek z 144", [], [], [], [], [], 1, 0, 100.0, "AWAKE"))
+
         # Streaming reply grounded in memory
         chunks = list(
             lc.chat_reply_stream(
@@ -218,8 +231,17 @@ class TestSleepingBrainAndServer(unittest.TestCase):
                 shutil.copy2(real_state / "brain_weights.pt", dst_state / "brain_weights.pt")
                 b_real = SleepingBrain(base_dir=tmp_copy, load_language_mode="sync")
                 self.assertGreaterEqual(b_real.day, 1)
-                ans = b_real.chat("co to jest doktryna")
-                self.assertIn("system zasad", ans["reply"].lower())
+                snap_real = b_real.snapshot()
+                self.assertIn("nodes", snap_real["graph"])
+                # Anti-hallucination on unlearned topic when Auto-web is disabled
+                b_real.auto_web = False
+                unk_real = b_real.chat("co to jest kwark powabny")
+                self.assertIn("/ucz", unk_real["reply"])
+                # Conversational Polish small-talk & typo tolerance
+                wow_res = b_real.chat("wow")
+                self.assertNotIn("/ucz", wow_res["reply"])
+                compliment_res = b_real.chat("moadry jestes")
+                self.assertNotIn("/szkola", compliment_res["reply"])
 
         # 2) Direct URL study + sleep GPU loss + BrainServer SSE & CRUD
         web_srv = _start_test_web_server()
@@ -296,6 +318,46 @@ class TestSleepingBrainAndServer(unittest.TestCase):
                     self.assertIn("token", ev_types)
                     self.assertEqual(ev_types[-1], "done")
                     self.assertIn("cząstką", events[-1]["reply"].lower())
+
+                    # Screenshot regression: 'ale co' must have 0 unrelated semantic memory pills
+                    ale_co = brain.chat("ale co")
+                    self.assertEqual(ale_co["recalled_memories"]["semantic"], [])
+                    self.assertNotIn("/ucz ale co", ale_co["reply"].lower())
+
+                    cap_chat = brain.chat("o czy moge z toba rozmiac")
+                    self.assertNotIn("/ucz o czy", cap_chat["reply"].lower())
+
+                    # POST /api/curriculum (Elementary School pack + GPU training + idempotency)
+                    req_curr = urllib.request.Request(
+                        f"{srv_url}/api/curriculum",
+                        data=json.dumps({"deep_web": False}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    curr = json.loads(urllib.request.urlopen(req_curr, timeout=30).read().decode("utf-8"))
+                    self.assertTrue(curr["ok"])
+                    self.assertGreaterEqual(curr["added_facts"], 80)
+                    self.assertGreaterEqual(curr["added_triples"], 70)
+                    self.assertTrue(curr["sleep_report"]["lora_trained"])
+
+                    # Re-applying /api/curriculum is idempotent (0 duplicates)
+                    curr2 = json.loads(urllib.request.urlopen(
+                        urllib.request.Request(
+                            f"{srv_url}/api/curriculum",
+                            data=json.dumps({"deep_web": False}).encode("utf-8"),
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        ),
+                        timeout=15,
+                    ).read().decode("utf-8"))
+                    self.assertEqual(curr2["added_facts"], 0)
+
+                    # Elementary school Q&A after GPU consolidation
+                    self.assertIn("warszawa", brain.chat("jaka jest stolica Polski")["reply"].lower())
+                    foto = brain.chat("na czym polega fotosynteza")["reply"].lower()
+                    self.assertTrue("tlen" in foto or "glukoz" in foto)
+                    self.assertTrue(any(w in brain.chat("ile planet ma Układ Słoneczny")["reply"].lower() for w in ("ośmiu", "8", "merkury")))
+                    self.assertIn("966", brain.chat("kiedy był chrzest Polski")["reply"].lower())
                 finally:
                     httpd.shutdown()
                     httpd.server_close()

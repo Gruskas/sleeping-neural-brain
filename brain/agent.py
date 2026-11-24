@@ -12,6 +12,11 @@ from typing import Any, Iterator
 import torch
 
 from .config import BrainConfig
+from .curriculum import (
+    ELEMENTARY_FOUNDATION_PACK,
+    ELEMENTARY_FOUNDATION_TRIPLES,
+    ELEMENTARY_WEB_SYLLABUS,
+)
 from .hippocampus import Hippocampus
 from .language_cortex import LanguageCortex, _fallback_hash_embed, _strip_pl
 from .neural_cortex import AssociativeConceptCortex
@@ -70,6 +75,7 @@ class SleepingBrain:
         self.day: int = 1
         self.total_sleeps: int = 0
         self.auto_sleep: bool = True
+        self.auto_web: bool = True
         self._active_op: str | None = None  # "chat" | "sleep" | "study"
 
         # Active Web Study state (visible live in UI)
@@ -185,6 +191,247 @@ class SleepingBrain:
             "vram_allocated_mb": 0.0,
             "vram_reserved_mb": 0.0,
         }
+
+    # ── Elementary School Curriculum & Self-Contained Foundation Pack ─────────
+    def learn_elementary_foundation(self, consolidate: bool = True, _from_nested: bool = False) -> dict[str, Any]:
+        if not _from_nested:
+            self._acquire_op("study")
+        try:
+            with self.lock:
+                existing = {
+                    m.text.strip().lower()
+                    for m in (self.hippocampus.short_term_memories + self.hippocampus.semantic_memories)
+                    if not m.superseded
+                }
+            to_add = [
+                item for item in ELEMENTARY_FOUNDATION_PACK
+                if item["text"].strip().lower() not in existing
+            ]
+            embs = self.language_cortex.encode_texts([item["text"] for item in to_add]) if to_add else []
+
+            added_triples = 0
+            with self.lock:
+                for item, emb in zip(to_add, embs):
+                    self.hippocampus.record_memory(
+                        text=item["text"],
+                        category=item.get("category", "wiedza"),
+                        importance=int(item.get("importance", 4)),
+                        day=self.day,
+                        embedding=emb,
+                        topic=item.get("topic"),
+                    )
+                existing_fact_keys = set(self.hippocampus.consolidated_facts.keys()) | {
+                    f.key() for f in self.hippocampus.short_term_facts
+                }
+                for s, r, d in ELEMENTARY_FOUNDATION_TRIPLES:
+                    if (s, r, d) not in existing_fact_keys:
+                        self.hippocampus.record_fact(s, r, d, day=self.day, source="CURRICULUM")
+                        added_triples += 1
+
+                self.hippocampus.studied_topics["szkoła podstawowa — fundamenty"] = {
+                    "topic": "Szkoła podstawowa — fundamenty",
+                    "mastery": 95.0,
+                    "facts_learned": len(ELEMENTARY_FOUNDATION_PACK),
+                    "pages_read": 0,
+                    "day": self.day,
+                    "summary": "Podstawy 9 przedmiotów: matematyka, przyroda, geografia, fizyka, chemia, historia, język polski, informatyka, wiedza codzienna.",
+                    "sources": [],
+                }
+                if to_add:
+                    self._log("STUDY", f"🎓 Wgrano pakiet Szkoła Podstawowa: +{len(to_add)} faktów, +{added_triples} relacji grafu.")
+
+            sleep_rep = None
+            if consolidate and (to_add or self.hippocampus.short_term_memories):
+                sleep_rep = self.sleep_now(visual_pacing=False, _from_nested=True)
+
+            with self.lock:
+                total_sem = len([m for m in self.hippocampus.semantic_memories if not m.superseded])
+                if not _from_nested:
+                    msg = (
+                        f"🎓 Wgrałem pakiet **Szkoła Podstawowa** (+{len(to_add)} nowych faktów, +{added_triples} powiązań grafu) "
+                        f"i wytrenowałem sieci neuronowe podczas snu na GPU. Łączna pamięć trwała: {total_sem} faktów.\n"
+                        f"Możesz mnie teraz pytać o matematykę, przyrodę, geografię, fizykę, chemię, historię, polski lub informatykę!"
+                        if to_add
+                        else f"🎓 Pakiet **Szkoła Podstawowa** jest już w mojej pamięci ({total_sem} utrwalonych faktów). Pytaj śmiało!"
+                    )
+                    self._append_chat(
+                        "assistant",
+                        msg,
+                        meta={"kind": "study_done", "topic": "Szkoła Podstawowa", "facts": len(to_add)},
+                        add_to_working=False,
+                    )
+            self.save_state()
+            return {
+                "added_facts": len(to_add),
+                "added_triples": added_triples,
+                "total_semantic": total_sem,
+                "sleep_report": sleep_rep.to_dict() if sleep_rep else None,
+            }
+        finally:
+            if not _from_nested:
+                self._release_op("study")
+
+    def start_curriculum_async(self, deep_web: bool = False, max_topics: int = 12) -> dict[str, Any]:
+        if not deep_web:
+            return self.learn_elementary_foundation(consolidate=True)
+        topics_count = max(1, min(len(ELEMENTARY_WEB_SYLLABUS), int(max_topics)))
+        self._acquire_op("study")
+        with self.lock:
+            self._study_stop_event.clear()
+            self.state_mode = "STUDYING"
+            self.study_state = {
+                "active": True,
+                "topic": f"Kurs szkolny z sieci ({topics_count} tematów)",
+                "round": 0,
+                "max_rounds": topics_count,
+                "mastery": 0.0,
+                "pages_read": 0,
+                "facts_learned": 0,
+                "current_action": "Wgrywanie fundamentów i przygotowanie kursu szkolnego...",
+                "sources": [],
+                "summary": "",
+            }
+        try:
+            t = threading.Thread(
+                target=self.run_curriculum_online,
+                args=(topics_count, True),
+                daemon=True,
+            )
+            t.start()
+        except Exception:
+            with self.lock:
+                self.study_state["active"] = False
+                self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
+            self._release_op("study")
+            raise
+        return {"started": True, "topics": topics_count}
+
+    def run_curriculum_online(self, max_topics: int = 12, _op_acquired: bool = False) -> dict[str, Any]:
+        if not _op_acquired:
+            self._acquire_op("study")
+        try:
+            with self.lock:
+                self._study_stop_event.clear()
+                self.state_mode = "STUDYING"
+                self._append_chat(
+                    "assistant",
+                    f"📚 Rozpoczynam kurs szkolny z polskiej Wikipedii (do {max_topics} tematów) wraz z pakietem fundamentów!",
+                    meta={"kind": "study_start", "topic": "Kurs szkolny"},
+                    add_to_working=False,
+                )
+
+            foundation_res = self.learn_elementary_foundation(consolidate=True, _from_nested=True)
+            with self.lock:
+                self.state_mode = "STUDYING"
+                pending_topics = [
+                    t for t in ELEMENTARY_WEB_SYLLABUS
+                    if self.hippocampus.studied_topics.get(t.lower(), {}).get("mastery", 0.0) < 75.0
+                ][:max_topics]
+                self.study_state["max_rounds"] = max(1, len(pending_topics))
+
+            seen_urls: set[str] = set()
+            total_pages = 0
+            total_facts = int(foundation_res["added_facts"])
+            sources_list: list[dict[str, str]] = []
+
+            for idx, topic in enumerate(pending_topics, start=1):
+                if self._study_stop_event.is_set():
+                    break
+                self.study_state["round"] = idx
+                self.study_state["topic"] = f"Kurs szkolny: {topic}"
+                self.study_state["current_action"] = f"Temat {idx}/{len(pending_topics)}: badam „{topic}” w sieci..."
+                docs = gather_web_sources(
+                    query=topic,
+                    seen_urls=seen_urls,
+                    max_docs=2,
+                    timeout=self.cfg.study_http_timeout,
+                    max_workers=self.cfg.study_fetch_workers,
+                )
+                topic_facts: list[str] = []
+                for doc in docs:
+                    if self._study_stop_event.is_set():
+                        break
+                    total_pages += 1
+                    self.study_state["pages_read"] = total_pages
+                    sources_list.append({"title": doc.title, "url": doc.url, "source": doc.source})
+                    self.study_state["sources"] = sources_list[-12:]
+                    lead_def = extract_lead_definition(doc)
+                    if lead_def:
+                        emb_l = self.language_cortex.encode_text(lead_def)
+                        with self.lock:
+                            tr = self.hippocampus.record_memory(
+                                text=lead_def,
+                                category="nauka_z_sieci",
+                                importance=5,
+                                day=self.day,
+                                embedding=emb_l,
+                                source_url=doc.url,
+                                topic=topic,
+                            )
+                            topic_facts.append(tr.text)
+                            total_facts += 1
+                            self.study_state["facts_learned"] = total_facts
+                    for ch in chunk_text(doc.text, focus_query=topic, max_chars=2400, max_chunks=1):
+                        ext = self.language_cortex.study_document_chunk(topic, doc.title, ch)
+                        facts = ext.get("facts", [])
+                        embs = self.language_cortex.encode_texts([f["text"] for f in facts])
+                        with self.lock:
+                            for f_item, emb in zip(facts, embs):
+                                tr = self.hippocampus.record_memory(
+                                    text=f_item["text"],
+                                    category="nauka_z_sieci",
+                                    importance=f_item["importance"],
+                                    day=self.day,
+                                    embedding=emb,
+                                    source_url=doc.url,
+                                    topic=topic,
+                                )
+                                topic_facts.append(tr.text)
+                                total_facts += 1
+                                self.study_state["facts_learned"] = total_facts
+                            for s, r, d in ext.get("triples", []):
+                                self.hippocampus.record_fact(s, r, d, day=self.day, source="WEB_STUDY")
+                    with self.lock:
+                        self.energy = max(0.0, self.energy - self.cfg.study_page_energy_drain)
+                    if self.auto_sleep and self.energy <= self.cfg.sleep_threshold:
+                        self.sleep_now(visual_pacing=False, _from_nested=True)
+                        with self.lock:
+                            self.state_mode = "STUDYING"
+
+                if topic_facts:
+                    assess = self.language_cortex.assess_study_mastery(topic, topic_facts, round_num=1)
+                    with self.lock:
+                        self.hippocampus.studied_topics[topic.lower()] = {
+                            "topic": topic,
+                            "mastery": float(assess["mastery"]),
+                            "facts_learned": len(topic_facts),
+                            "pages_read": len(docs),
+                            "day": self.day,
+                            "summary": assess.get("summary", ""),
+                            "sources": sources_list[-4:],
+                        }
+                self.study_state["mastery"] = round((idx / max(1, len(pending_topics))) * 100.0, 1)
+
+            if self.hippocampus.short_term_memories and not self._study_stop_event.is_set():
+                self.study_state["current_action"] = "Końcowa konsolidacja wiedzy szkolnej na GPU..."
+                self.sleep_now(visual_pacing=False, _from_nested=True)
+
+            with self.lock:
+                self._append_chat(
+                    "assistant",
+                    f"✅ Ukończono kurs szkolny! Przeczytano {total_pages} stron i zapisano {total_facts} faktów w pamięci na GPU.",
+                    meta={"kind": "study_done", "topic": "Kurs szkolny", "facts": total_facts},
+                    add_to_working=False,
+                )
+            self.save_state()
+            return {"pages_read": total_pages, "facts_learned": total_facts}
+        finally:
+            with self.lock:
+                self.study_state["active"] = False
+                self.study_state["current_action"] = ""
+                if self.state_mode == "STUDYING":
+                    self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
+            self._release_op("study")
 
     # ── Detect natural Polish "study from the web" intent ─────────────────────
     @staticmethod
@@ -535,6 +782,7 @@ class SleepingBrain:
             hippo_texts = [m.text for m in recalled["hippocampus"]]
             sem_texts = [m.text for m in recalled["semantic"]]
             rem_texts = [m.text for m in recalled["rem"]]
+            user_profile_texts = [m.text for m in recalled.get("user_profile", [])]
 
             concept_hints: list[str] = []
             words = [w.strip(".,!?;:\"'()").lower() for w in msg.split() if len(w) >= 3]
@@ -570,6 +818,7 @@ class SleepingBrain:
                 "hippo_texts": hippo_texts,
                 "sem_texts": sem_texts,
                 "rem_texts": rem_texts,
+                "user_profile": user_profile_texts,
                 "concept_hints": concept_hints,
                 "learned_memories": learned_memories,
                 "learned_triples": learned_triples,
@@ -641,6 +890,127 @@ class SleepingBrain:
             "state_mode": self.state_mode,
         }
 
+    def _quick_web_lookup(self, topic: str, msg: str, prep: dict[str, Any]) -> list[str]:
+        """Lightweight online lookup used when Auto-web is enabled and memory lacks an answer."""
+        clean_topic = topic.strip() if is_http_url(topic.strip()) else clean_search_query(topic.strip())
+        if not clean_topic:
+            clean_topic = topic.strip()
+
+        normalized_qs = self.language_cortex.normalize_study_queries(clean_topic)
+        queries = [clean_topic] + [q for q in normalized_qs if q and q.lower() != clean_topic.lower()]
+
+        seen_urls: set[str] = set()
+        docs = []
+        for q in queries[:2]:
+            docs = gather_web_sources(
+                query=q,
+                seen_urls=seen_urls,
+                max_docs=2,
+                timeout=min(8, self.cfg.study_http_timeout),
+                max_workers=2,
+            )
+            if docs:
+                break
+
+        if not docs:
+            return []
+
+        source_titles: list[str] = []
+        new_texts: list[str] = []
+        for doc in docs:
+            source_titles.append(doc.title)
+            lead_def = extract_lead_definition(doc)
+            if lead_def:
+                emb_lead = self.language_cortex.encode_text(lead_def)
+                with self.lock:
+                    trace = self.hippocampus.record_memory(
+                        text=lead_def,
+                        category="nauka_z_sieci",
+                        importance=5,
+                        day=self.day,
+                        embedding=emb_lead,
+                        source_url=doc.url,
+                    )
+                    prep["learned_memories"].append(trace.to_public_dict())
+                    new_texts.append(trace.text)
+
+            chunk = doc.text[:2200]
+            extracted = self.language_cortex.study_document_chunk(clean_topic, doc.title, chunk)
+            facts = extracted.get("facts", [])[:5]
+            if facts:
+                embs = self.language_cortex.encode_texts([item["text"] for item in facts])
+                with self.lock:
+                    for item, emb in zip(facts, embs):
+                        trace = self.hippocampus.record_memory(
+                            text=item["text"],
+                            category="nauka_z_sieci",
+                            importance=item.get("importance", 4),
+                            day=self.day,
+                            embedding=emb,
+                            source_url=doc.url,
+                            topic=clean_topic,
+                        )
+                        prep["learned_memories"].append(trace.to_public_dict())
+                        new_texts.append(trace.text)
+                    for s, r, d in extracted.get("triples", [])[:6]:
+                        f = self.hippocampus.record_fact(s, r, d, day=self.day)
+                        prep["learned_triples"].append(f.to_dict())
+
+        q_vec = self.language_cortex.encode_text(msg)
+        with self.lock:
+            recalled = self.hippocampus.search_memories(
+                query_vec=q_vec,
+                query_text=msg,
+                current_day=self.day,
+                top_hippo=self.cfg.recall_top_hippo,
+                top_semantic=self.cfg.recall_top_semantic,
+                top_rem=self.cfg.recall_top_rem,
+            )
+            prep["hippo_texts"] = [m.text for m in recalled["hippocampus"]]
+            for t in reversed(new_texts):
+                if t not in prep["hippo_texts"]:
+                    prep["hippo_texts"].insert(0, t)
+            prep["sem_texts"] = [m.text for m in recalled["semantic"]]
+            prep["rem_texts"] = [m.text for m in recalled["rem"]]
+            self._log("WEB", f"Auto-sieć sprawdziła '{clean_topic}' ({len(source_titles)} źródła, +{len(new_texts)} faktów).")
+
+        return source_titles
+
+    def _compute_chat_reply(self, msg: str, prep: dict[str, Any]) -> str:
+        reply, missing_topic = self.language_cortex._chat_reply_with_meta(
+            user_message=msg,
+            recent_turns=prep["recent_turns"],
+            hippocampus_memories=prep["hippo_texts"][: self.cfg.recall_top_hippo],
+            semantic_memories=prep["sem_texts"][: self.cfg.recall_top_semantic],
+            rem_reflections=prep["rem_texts"][: self.cfg.recall_top_rem],
+            concept_hints=prep["concept_hints"][:6],
+            day=prep["day"],
+            sleeps=prep["sleeps"],
+            energy=prep["energy"],
+            state_mode=prep["state_mode"],
+            user_profile=prep.get("user_profile", []),
+        )
+        if self.auto_web and missing_topic:
+            sources = self._quick_web_lookup(missing_topic, msg, prep)
+            if sources:
+                reply2, still_missing = self.language_cortex._chat_reply_with_meta(
+                    user_message=msg,
+                    recent_turns=prep["recent_turns"],
+                    hippocampus_memories=prep["hippo_texts"][: self.cfg.recall_top_hippo],
+                    semantic_memories=prep["sem_texts"][: self.cfg.recall_top_semantic],
+                    rem_reflections=prep["rem_texts"][: self.cfg.recall_top_rem],
+                    concept_hints=prep["concept_hints"][:6],
+                    day=prep["day"],
+                    sleeps=prep["sleeps"],
+                    energy=prep["energy"],
+                    state_mode=prep["state_mode"],
+                    user_profile=prep.get("user_profile", []),
+                )
+                if not still_missing:
+                    src_note = ", ".join(sources[:2])
+                    return f"{reply2}\n\n*Sprawdzone w sieci:* {src_note}"
+        return reply
+
     # ── Natural Polish Chat + Automatic Human-like Memory Encoding ────────────
     def chat(self, user_message: str) -> dict[str, Any]:
         msg = user_message.strip()
@@ -657,6 +1027,32 @@ class SleepingBrain:
                 "reply": last_msg["content"],
                 "slept": True,
                 "sleep_report": rep.to_dict(),
+                "learned_memories": [],
+                "recalled_memories": {},
+            }
+
+        if msg.lower() in ("/szkola", "/szkoła", "/podstawy"):
+            with self.lock:
+                self._append_chat("user", msg, add_to_working=False)
+            res = self.learn_elementary_foundation(consolidate=True)
+            with self.lock:
+                last_msg = self.chat_log[-1] if self.chat_log else {"content": "Wgrano pakiet Szkoła Podstawowa."}
+            return {
+                "reply": last_msg["content"],
+                "slept": bool(res.get("sleep_report")),
+                "sleep_report": res.get("sleep_report"),
+                "learned_memories": [],
+                "recalled_memories": {},
+            }
+
+        if msg.lower() in ("/szkola siec", "/szkoła sieć", "/szkola web"):
+            with self.lock:
+                self._append_chat("user", msg, add_to_working=False)
+            info = self.start_curriculum_async(deep_web=True, max_topics=12)
+            return {
+                "reply": f"📚 Rozpoczynam autonomiczny kurs szkolny z Wikipedii ({info['topics']} tematów + fundamenty). Obserwuj pasek postępu u góry!",
+                "study_started": True,
+                "slept": False,
                 "learned_memories": [],
                 "recalled_memories": {},
             }
@@ -683,18 +1079,7 @@ class SleepingBrain:
         self._acquire_op("chat")
         try:
             prep = self._prepare_chat_turn(msg)
-            reply = self.language_cortex.chat_reply(
-                user_message=msg,
-                recent_turns=prep["recent_turns"],
-                hippocampus_memories=prep["hippo_texts"][: self.cfg.recall_top_hippo],
-                semantic_memories=prep["sem_texts"][: self.cfg.recall_top_semantic],
-                rem_reflections=prep["rem_texts"][: self.cfg.recall_top_rem],
-                concept_hints=prep["concept_hints"][:6],
-                day=prep["day"],
-                sleeps=prep["sleeps"],
-                energy=prep["energy"],
-                state_mode=prep["state_mode"],
-            )
+            reply = self._compute_chat_reply(msg, prep)
             return self._finalize_chat_turn(msg, reply, prep)
         finally:
             self._release_op("chat")
@@ -704,7 +1089,7 @@ class SleepingBrain:
         if not msg:
             raise ValueError("Wiadomość nie może być pusta.")
 
-        if msg.lower() in ("/sen", "/sleep", "idź spać", "idz spac"):
+        if msg.lower() in ("/sen", "/sleep", "idź spać", "idz spac", "/szkola", "/szkoła", "/podstawy", "/szkola siec", "/szkoła sieć", "/szkola web"):
             res = self.chat(msg)
             yield {"type": "done", **res}
             return
@@ -723,6 +1108,7 @@ class SleepingBrain:
         self._acquire_op("chat")
         try:
             prep = self._prepare_chat_turn(msg)
+            reply = self._compute_chat_reply(msg, prep)
             yield {
                 "type": "meta",
                 "learned_memories": prep["learned_memories"],
@@ -735,23 +1121,14 @@ class SleepingBrain:
                 "concept_hints": prep["concept_hints"][:6],
             }
 
-            chunks: list[str] = []
-            for delta in self.language_cortex.chat_reply_stream(
-                user_message=msg,
-                recent_turns=prep["recent_turns"],
-                hippocampus_memories=prep["hippo_texts"][: self.cfg.recall_top_hippo],
-                semantic_memories=prep["sem_texts"][: self.cfg.recall_top_semantic],
-                rem_reflections=prep["rem_texts"][: self.cfg.recall_top_rem],
-                concept_hints=prep["concept_hints"][:6],
-                day=prep["day"],
-                sleeps=prep["sleeps"],
-                energy=prep["energy"],
-                state_mode=prep["state_mode"],
-            ):
-                chunks.append(delta)
-                yield {"type": "token", "delta": delta}
+            import time
+            tokens = re.findall(r"\S+\s*", reply)
+            if not tokens and reply:
+                tokens = [reply]
+            for tok in tokens:
+                yield {"type": "token", "delta": tok}
+                time.sleep(0.012)
 
-            reply = "".join(chunks).strip()
             final_res = self._finalize_chat_turn(msg, reply, prep)
             yield {"type": "done", **final_res}
         finally:
@@ -919,6 +1296,8 @@ class SleepingBrain:
                 "day": self.day,
                 "energy": self.energy,
                 "total_sleeps": self.total_sleeps,
+                "auto_sleep": self.auto_sleep,
+                "auto_web": self.auto_web,
                 "lora_updates_count": self.language_cortex.lora_updates_count,
                 "core_knowledge_summary": self.language_cortex.core_knowledge_summary,
                 "hippocampus": self.hippocampus.to_dict(),
@@ -945,6 +1324,8 @@ class SleepingBrain:
             self.day = int(meta.get("day", 1))
             self.energy = float(meta.get("energy", self.cfg.max_energy))
             self.total_sleeps = int(meta.get("total_sleeps", 0))
+            self.auto_sleep = bool(meta.get("auto_sleep", True))
+            self.auto_web = bool(meta.get("auto_web", True))
             self.language_cortex.lora_updates_count = int(meta.get("lora_updates_count", 0))
             self.language_cortex.core_knowledge_summary = str(meta.get("core_knowledge_summary", ""))
             self.hippocampus.load_dict(meta.get("hippocampus", {}))
@@ -1063,6 +1444,7 @@ class SleepingBrain:
                 "day": self.day,
                 "total_sleeps": self.total_sleeps,
                 "auto_sleep": self.auto_sleep,
+                "auto_web": self.auto_web,
                 "gpu": self.gpu_info(),
                 "study": dict(self.study_state),
                 "studied_topics": list(self.hippocampus.studied_topics.values()),

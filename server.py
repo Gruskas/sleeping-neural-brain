@@ -131,6 +131,13 @@ class BrainServer:
                         self._send_json({"ok": True})
                         return
 
+                    if parsed.path == "/api/curriculum":
+                        deep_web = bool(body.get("deep_web", False))
+                        max_topics = int(body.get("max_topics", 12))
+                        res = brain.start_curriculum_async(deep_web=deep_web, max_topics=max_topics)
+                        self._send_json({"ok": True, **res})
+                        return
+
                     if parsed.path == "/api/sleep":
                         report = brain.sleep_now(visual_pacing=True)
                         self._send_json({"ok": True, "report": report.to_dict()})
@@ -158,7 +165,9 @@ class BrainServer:
                     if parsed.path == "/api/control":
                         if "auto_sleep" in body:
                             brain.auto_sleep = bool(body["auto_sleep"])
-                        self._send_json({"ok": True, "auto_sleep": brain.auto_sleep})
+                        if "auto_web" in body:
+                            brain.auto_web = bool(body["auto_web"])
+                        self._send_json({"ok": True, "auto_sleep": brain.auto_sleep, "auto_web": brain.auto_web})
                         return
 
                     if parsed.path == "/api/save":
