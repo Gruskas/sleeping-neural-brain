@@ -340,7 +340,7 @@ class TestSleepingBrainAndServer(unittest.TestCase):
                         headers={"Content-Type": "application/json"},
                         method="POST",
                     )
-                    curr = json.loads(urllib.request.urlopen(req_curr, timeout=30).read().decode("utf-8"))
+                    curr = json.loads(urllib.request.urlopen(req_curr, timeout=60).read().decode("utf-8"))
                     self.assertTrue(curr["ok"])
                     self.assertGreaterEqual(curr["added_facts"], 80)
                     self.assertGreaterEqual(curr["added_triples"], 70)

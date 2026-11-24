@@ -1125,11 +1125,19 @@ class LanguageCortex:
         msg = user_message.strip()
         low = _strip_pl(msg.lower()).strip(" ?!.,;:")
 
-        # 1) Correction / disagreement reaction
-        if any(p in low for p in ("ale to nie prawda", "to nie prawda", "nieprawda", "bzdura", "mylisz sie")):
+        # 1) Correction / disagreement / opinion reaction
+        if any(
+            p in low
+            for p in (
+                "ale to nie prawda", "to nie prawda", "nieprawda", "bzdura", "bzdury",
+                "glupoty", "mylisz sie", "nie uwazam", "nie zgadzam", "zmien zdanie",
+                "zmien swoje zdanie", "zmien swje zdanie", "nie masz racji",
+                "zle mowisz", "zle piszesz", "co ty gadasz", "co ty piszesz",
+            )
+        ):
             return (
-                "Rozumiem, dzięki za zwrócenie uwagi! Nie zapisywałem tego jako faktu. "
-                "Napisz proszę jak jest poprawnie, albo wpisz `/ucz <temat>`, żebym sprawdził to w wiarygodnych źródłach.",
+                "Rozumiem, że masz inne zdanie — dzięki za poprawkę! Nie będę upierać się przy tamtym wpisie. "
+                "Napisz proszę, jak Ty to widzisz zdaniem twierdzącym, albo podaj temat do `/ucz <temat>`, żebym sprawdził inne źródła.",
                 None,
             )
 
@@ -1427,8 +1435,10 @@ class LanguageCortex:
         ranked.sort(key=lambda x: x[0], reverse=True)
         top_score, top_ov, top_subj_cos, top_matched_words, _, _ = ranked[0]
 
-        multi_word_mismatch = len(eff_words) >= 2 and top_matched_words < 2 and top_subj_cos < 0.68
-        if (top_ov < 0.25 and top_subj_cos < 0.52) or multi_word_mismatch:
+        # Never return a random unrelated memory when there is zero lexical overlap
+        no_lexical_grounding = top_ov < 0.12
+        multi_word_mismatch = len(eff_words) >= 2 and top_matched_words < 2 and top_ov < 0.45
+        if no_lexical_grounding or (top_ov < 0.25 and top_subj_cos < 0.55) or multi_word_mismatch:
             if is_non_topic_phrase:
                 return (
                     "Nie jestem pewien, o jaki dokładnie temat pytasz. Napisz proszę nazwę pojęcia "
