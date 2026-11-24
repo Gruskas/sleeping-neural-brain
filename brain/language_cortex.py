@@ -13,6 +13,11 @@ from typing import Any, Iterator
 import torch
 
 from .config import BrainConfig
+from .language_trainer import (
+    BASE_HUMAN_DIALOGUES,
+    build_training_dialogues,
+    clean_human_fact,
+)
 from .neural_language import (
     CorticalSemanticEncoder,
     CorticalTransformerLM,
@@ -107,6 +112,9 @@ def _stem_overlap(query: str, candidate: str) -> float:
 
 
 def _clean_fact_text(txt: str) -> str:
+    cleaned = clean_human_fact(txt)
+    if cleaned:
+        return cleaned
     s = re.sub(r"==+[^=]+==+", " ", txt)
     s = re.sub(r"\[\d+\]|\[[a-z]\]", "", s)
     s = re.sub(r"\(\d+\.\d+\)", "", s)
@@ -267,7 +275,7 @@ class LanguageCortex:
         self.semantic_encoder = CorticalSemanticEncoder(
             vocab_size=cfg.vocab_size,
             ngram_buckets=cfg.ngram_buckets,
-            d_model=cfg.cortex_dim,
+            d_model=cfg.embed_dim,
         ).to(device)
         self.transformer_lm = CorticalTransformerLM(
             vocab_size=cfg.vocab_size,
@@ -283,6 +291,7 @@ class LanguageCortex:
         self.load_error: str | None = None
         self.lora_updates_count: int = 0
         self.core_knowledge_summary: str = ""
+        self.online_dialogues: list[str] = []
         self.available_models: list[str] = [cfg.language_model_id]
         self.status_message: str = ""
         self._refresh_status()
@@ -295,14 +304,25 @@ class LanguageCortex:
     def _refresh_status(self) -> None:
         dev_label = torch.cuda.get_device_name(0) if self.device.type == "cuda" else "CPU"
         m_params = self.total_parameters() / 1_000_000.0
+        fluency = self.transformer_lm.fluency_score
         self.status_message = (
-            f"Gotowa: {self.cfg.language_model_id} ({dev_label} · {m_params:.2f}M param. · 100% lokalna)"
+            f"Gotowa: {self.cfg.language_model_id} ({dev_label} · {m_params:.2f}M param. · płynność {fluency:.0f}%)"
         )
 
     def load_sync(self) -> bool:
         with self._op_lock:
             self.semantic_encoder.to(self.device)
             self.transformer_lm.to(self.device)
+            if self.transformer_lm.trained_steps == 0:
+                boot_seqs = build_training_dialogues([], [], [], [], max_total=64)
+                self.tokenizer.learn_texts(boot_seqs)
+                self.transformer_lm.train_sleep_replay(
+                    sequences=boot_seqs,
+                    tokenizer=self.tokenizer,
+                    epochs=self.cfg.language_bootstrap_epochs,
+                    lr=self.cfg.cortex_lr,
+                    batch_size=32,
+                )
             self.ready = True
             self.loading = False
             self.load_error = None
@@ -324,7 +344,7 @@ class LanguageCortex:
             self.semantic_encoder = CorticalSemanticEncoder(
                 vocab_size=self.cfg.vocab_size,
                 ngram_buckets=self.cfg.ngram_buckets,
-                d_model=self.cfg.cortex_dim,
+                d_model=self.cfg.embed_dim,
             ).to(self.device)
             self.transformer_lm = CorticalTransformerLM(
                 vocab_size=self.cfg.vocab_size,
@@ -336,6 +356,7 @@ class LanguageCortex:
             ).to(self.device)
             self.lora_updates_count = 0
             self.core_knowledge_summary = ""
+            self.online_dialogues = []
             self._refresh_status()
 
     def export_state(self) -> dict[str, Any]:
@@ -344,6 +365,7 @@ class LanguageCortex:
                 "tokenizer": self.tokenizer.export_state(),
                 "semantic_encoder": self.semantic_encoder.export_state(),
                 "transformer_lm": self.transformer_lm.export_state(),
+                "online_dialogues": list(self.online_dialogues[-200:]),
             }
 
     def import_state(self, state: dict[str, Any]) -> None:
@@ -354,6 +376,8 @@ class LanguageCortex:
                 self.semantic_encoder.import_state(state["semantic_encoder"])
             if "transformer_lm" in state:
                 self.transformer_lm.import_state(state["transformer_lm"])
+            if "online_dialogues" in state:
+                self.online_dialogues = list(state.get("online_dialogues", []))[-200:]
             self._refresh_status()
 
     def encode_texts(self, texts: list[str]) -> list[list[float]]:
@@ -441,10 +465,17 @@ class LanguageCortex:
             " przechowuje ", " służy ", " umożliwia ", " polega na ", " nazywa się ",
             " definiuje ", " wskazuje ", " zawiera ",
         )
-        noise_cues = ("zobacz też", "przypisy", "bibliografia", "linki zewnętrzne", "kategoria:", "isbn")
+        noise_cues = (
+            "zobacz też", "przypisy", "bibliografia", "linki zewnętrzne", "kategoria:", "isbn",
+            "dopuszczalne w grach", "słownik ortograficzny", "rejestr wyraz", "odmienność tak",
+            "x/twitter", "koalar", "aktualizacja 20",
+        )
 
         scored: list[tuple[float, str, list[float], bool]] = []
-        for sent, vec in zip(sentences, sent_vecs):
+        for raw_sent, vec in zip(sentences, sent_vecs):
+            sent = clean_human_fact(raw_sent)
+            if len(sent) < 20:
+                continue
             low = sent.lower()
             if any(nc in low for nc in noise_cues):
                 continue
@@ -528,6 +559,18 @@ class LanguageCortex:
                 continue
 
             matched = False
+            brain_name_m = re.search(
+                r"(?:twoje imi[eę] to|nazywasz si[eę]|masz na imi[eę]|b[eę]d[eę] ci[eę] nazywa[cć])\s+([A-ZŁŚŻŹĆŃa-ząćęłńóśźż-]{2,30})",
+                s,
+                flags=re.I,
+            )
+            if brain_name_m:
+                bval = brain_name_m.group(1).strip(" .!?,;").capitalize()
+                if bval:
+                    memories.append({"text": f"Mózg ma nadane przez użytkownika imię {bval}.", "importance": 5, "category": "użytkownik"})
+                    triples.append(("mózg", "ma_imię", bval.lower()))
+                    matched = True
+
             user_patterns = [
                 (r"(?:mam na imi[eę]|nazywam si[eę])\s+([A-ZŁŚŻŹĆŃa-ząćęłńóśźż-]{2,30})", "Użytkownik ma na imię {val}.", "ma_na_imię", 5),
                 (r"(?:mieszkam w|mieszkam na)\s+([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9\s-]{2,40})", "Użytkownik mieszka w {val}.", "mieszka_w", 5),
@@ -540,6 +583,8 @@ class LanguageCortex:
                 (r"pracuj[eę]\s+(?:jako|w)\s+([^.,;!?]{3,60})", "Użytkownik pracuje jako/w {val}.", "pracuje", 5),
                 (r"mam\s+(\d{1,3})\s+lat", "Użytkownik ma {val} lat.", "ma_lat", 4),
                 (r"(?:używam|uzywam|korzystam z|programuj[eę] w|pisz[eę] w)\s+([^.,;!?]{2,60})", "Użytkownik używa {val}.", "używa", 4),
+                (r"(?:studiuj[eę]|ucz[eę] si[eę])\s+([^.,;!?]{3,60})", "Użytkownik studiuje lub uczy się {val}.", "uczy_się", 4),
+                (r"(?:tworz[eę]|buduj[eę]|robi[eę]\s+projekt)\s+([^.,;!?]{3,70})", "Użytkownik pracuje nad projektem: {val}.", "tworzy", 4),
             ]
             for pat, tmpl, rel, imp in user_patterns:
                 for m in re.finditer(pat, s, flags=re.I):
@@ -550,6 +595,10 @@ class LanguageCortex:
                         matched = True
 
             if matched:
+                continue
+
+            if re.match(r"^(?:wczoraj|dzisiaj|dziś|ostatnio|kupi[lł]em|kupi[lł]am|zrobi[lł]em|zrobi[lł]am)\b", low_raw):
+                memories.append({"text": f"Wydarzenie z życia użytkownika: {s.rstrip('.')}.", "importance": 4, "category": "wydarzenie"})
                 continue
 
             # Explicit coding rules / preferences
@@ -674,6 +723,7 @@ class LanguageCortex:
         new_low = _strip_pl(new_fact.lower())
         singleton_prefixes = (
             "uzytkownik ma na imie ",
+            "mozg ma nadane przez uzytkownika imie ",
             "uzytkownik mieszka w ",
             "uzytkownik pochodzi z ",
             "uzytkownik pracuje ",
@@ -710,9 +760,8 @@ class LanguageCortex:
         sample_limit = max(self.cfg.lora_max_replay_samples, min(200, len(new_memories) + 20))
         all_items = (new_memories[:160] + replay_memories[:40])[:sample_limit]
 
-        # Build contrastive (anchor_prompt, memory) pairs
+        # Build contrastive pairs & natural conversational dialogues for self-training on GPU
         pairs: list[tuple[str, str]] = []
-        sequences: list[str] = []
         for item in all_items:
             clean = _clean_fact_text(item)
             if len(clean) < 8:
@@ -720,14 +769,23 @@ class LanguageCortex:
             words = re.findall(r"[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ0-9+#]{3,}", clean)
             hint = " ".join(words[:3]) if words else clean[:24]
             pairs.append((hint, clean))
-            sequences.append(f"<Q> {hint} <A> {clean}")
+
+        sequences = build_training_dialogues(
+            memories=all_items,
+            episodic_memories=[x for x in all_items if "w rozmowie" in x.lower() or "wydarzenie" in x.lower()],
+            chat_turns=[],
+            user_profile=[x for x in all_items if x.lower().startswith("użytkownik ") or "imię" in x.lower()],
+            max_total=320,
+        )
         for refl in rem_reflections[:6]:
             clean_r = _clean_fact_text(refl)
             if len(clean_r) >= 10:
-                sequences.append(f"<Q> refleksja <A> {clean_r}")
+                sequences.append(f"<MEM> {clean_r} <CTX> sen REM <USER> czego nowego się domyśliłeś? <BOT> {clean_r}")
+        if self.online_dialogues:
+            sequences.extend(self.online_dialogues[-60:])
 
         with self._op_lock:
-            self.tokenizer.learn_texts(all_items + rem_reflections)
+            self.tokenizer.learn_texts(all_items + rem_reflections + sequences)
             enc_s, enc_e = self.semantic_encoder.train_contrastive(
                 pairs=pairs[:80],
                 tokenizer=self.tokenizer,
@@ -739,7 +797,7 @@ class LanguageCortex:
                 tokenizer=self.tokenizer,
                 epochs=self.cfg.cortex_sleep_epochs,
                 lr=self.cfg.cortex_lr,
-                batch_size=32 if len(sequences) > 40 else 16,
+                batch_size=48 if len(sequences) > 64 else 24,
             )
 
             # Distill structured Core Knowledge Summary deterministically from highest-signal facts
@@ -757,7 +815,7 @@ class LanguageCortex:
                     seen_k.add(k)
                     combined_pool.append(c)
 
-            user_pts = [x for x in combined_pool if x.lower().startswith("użytkownik ") or "zasada" in x.lower()][:5]
+            user_pts = [x for x in combined_pool if x.lower().startswith("użytkownik ") or "zasada" in x.lower() or "imię" in x.lower()][:5]
             know_pts = [x for x in combined_pool if x not in user_pts][:7]
             sections: list[str] = []
             if user_pts:
@@ -766,6 +824,7 @@ class LanguageCortex:
                 sections.append("2) Kluczowa utrwalona wiedza:\n" + "\n".join(f"- {k[:180]}" for k in know_pts))
             self.core_knowledge_summary = "\n".join(sections)[:2400]
             self.lora_updates_count += 1
+            self._refresh_status()
 
         dur_ms = round((time.perf_counter() - t0) * 1000.0, 1)
         loss_start = lm_s if lm_s > 0 else enc_s
@@ -777,8 +836,201 @@ class LanguageCortex:
             "loss_end": loss_end,
             "encoder_loss_start": enc_s,
             "encoder_loss_end": enc_e,
+            "fluency": self.transformer_lm.fluency_score,
             "duration_ms": dur_ms,
         }
+
+    def train_language_cortex(
+        self,
+        all_memories: list[str],
+        episodic_memories: list[str],
+        chat_turns: list[dict[str, str]],
+        user_profile: list[str],
+        epochs: int | None = None,
+    ) -> dict[str, Any]:
+        """Self-train the GPU Transformer LM & Semantic Encoder on human Polish dialogues."""
+        t0 = time.perf_counter()
+        ep = max(2, int(epochs or self.cfg.language_train_epochs))
+        seqs = build_training_dialogues(
+            memories=all_memories,
+            episodic_memories=episodic_memories,
+            chat_turns=chat_turns,
+            user_profile=user_profile,
+            max_total=450,
+        )
+        if self.online_dialogues:
+            seqs.extend(self.online_dialogues[-100:])
+
+        pairs: list[tuple[str, str]] = []
+        for m in all_memories[:80]:
+            cm = _clean_fact_text(m)
+            if len(cm) >= 12:
+                words = re.findall(r"[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ0-9+#]{3,}", cm)
+                pairs.append((" ".join(words[:3]) if words else cm[:20], cm))
+
+        with self._op_lock:
+            self.tokenizer.learn_texts(seqs + all_memories[:120])
+            if len(pairs) >= 2:
+                self.semantic_encoder.train_contrastive(
+                    pairs=pairs[:80],
+                    tokenizer=self.tokenizer,
+                    epochs=max(4, ep // 3),
+                    lr=self.cfg.cortex_lr,
+                )
+            lm_s, lm_e = self.transformer_lm.train_sleep_replay(
+                sequences=seqs,
+                tokenizer=self.tokenizer,
+                epochs=ep,
+                lr=self.cfg.cortex_lr,
+                batch_size=48,
+            )
+            self.lora_updates_count += 1
+            self._refresh_status()
+
+        dur_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+        return {
+            "trained": True,
+            "dialogues": len(seqs),
+            "loss_start": lm_s,
+            "loss_end": lm_e,
+            "fluency": self.transformer_lm.fluency_score,
+            "trained_steps": self.transformer_lm.trained_steps,
+            "duration_ms": dur_ms,
+        }
+
+    def resolve_conversational_context(
+        self,
+        user_message: str,
+        recent_turns: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        """Resolve pronouns and short follow-ups against recent chat messages."""
+        msg = user_message.strip()
+        low = _strip_pl(msg.lower()).strip(" ?!.,;:")
+
+        active_subject = ""
+        ignored_subjects = {
+            "czesc", "hej", "witaj", "dzien dobry", "dobranoc", "dzieki", "dziekuje",
+            "super", "ale co", "co", "dlaczego", "czemu", "jak to", "nie rozumiem",
+            "o czy moge z toba rozmiac", "co potrafisz", "co umiesz", "co pamietasz",
+            "co wczesniej pisalismy", "o czym rozmawialismy",
+        }
+        for turn in reversed(recent_turns[-8:]):
+            txt = turn.get("content", "").strip()
+            if not txt:
+                continue
+            if turn.get("role") == "user":
+                cand = _extract_query_subject(txt)
+                cand_low = _strip_pl(cand.lower())
+                if (
+                    cand
+                    and len(cand) >= 3
+                    and cand_low not in ignored_subjects
+                    and not any(w in cand_low for w in ("pisalismy", "pisalimi", "rozmawialismy", "moge", "toba"))
+                ):
+                    active_subject = cand
+                    break
+            elif turn.get("role") == "assistant" and not active_subject:
+                m_bold = re.search(r"\*\*([^*]{3,40})\*\*", txt)
+                if m_bold:
+                    active_subject = m_bold.group(1).strip()
+                    break
+
+        pronouns = {
+            "on", "ona", "ono", "oni", "one", "niego", "niej", "nim", "nia", "nich",
+            "jego", "jej", "ich", "tego", "tym", "tej", "to", "tam", "wtedy", "stamtad",
+        }
+        followup_starts = (
+            "a ", "i ", "a kiedy", "kiedy zyl", "kiedy powstal", "kiedy byla", "ile ma",
+            "ile mial", "powiedz wiecej", "powiedz cos wiecej", "cos wiecej", "wiecej o",
+            "rozwin", "a z czym", "a dlaczego", "a czemu", "jak to dziala", "podaj przyklad",
+        )
+        words = re.findall(r"[a-z0-9+#]{2,}", low)
+        has_pronoun = any(w in pronouns for w in words)
+        has_followup_prefix = any(low.startswith(p) for p in followup_starts)
+        is_short_followup = len(words) <= 5 and (has_pronoun or has_followup_prefix)
+
+        if active_subject and (has_pronoun or is_short_followup):
+            return {
+                "is_followup": True,
+                "active_subject": active_subject,
+                "search_query": f"{active_subject} {msg}",
+            }
+        return {
+            "is_followup": False,
+            "active_subject": active_subject,
+            "search_query": msg,
+        }
+
+    def _format_human_learn_ack(self, mems: list[dict[str, Any]]) -> str:
+        phrases: list[str] = []
+        brain_named = ""
+        user_named = ""
+        for m in mems[:4]:
+            t = m["text"]
+            bm = re.search(r"Mózg ma nadane przez użytkownika imię\s+([^\s.,!?;]+)", t, flags=re.I)
+            if bm:
+                brain_named = bm.group(1)
+                continue
+            um = re.search(r"Użytkownik ma na imię\s+([^\s.,!?;]+)", t, flags=re.I)
+            if um:
+                user_named = um.group(1)
+                continue
+            conv = t.rstrip(".")
+            conv = re.sub(r"^Użytkownik mieszka w\s+", "mieszkasz w ", conv, flags=re.I)
+            conv = re.sub(r"^Użytkownik pochodzi z\s+", "pochodzisz z ", conv, flags=re.I)
+            conv = re.sub(r"^Użytkownik interesuje się\s+", "interesujesz się ", conv, flags=re.I)
+            conv = re.sub(r"^Użytkownik lubi\s+", "lubisz ", conv, flags=re.I)
+            conv = re.sub(r"^Użytkownik uwielbia\s+", "uwielbiasz ", conv, flags=re.I)
+            conv = re.sub(r"^Użytkownik woli\s+", "wolisz ", conv, flags=re.I)
+            conv = re.sub(r"^Użytkownik nie lubi\s+", "nie lubisz ", conv, flags=re.I)
+            conv = re.sub(r"^Użytkownik pracuje jako/w\s+", "pracujesz jako ", conv, flags=re.I)
+            conv = re.sub(r"^Użytkownik ma\s+(\d+)\s+lat", r"masz \1 lat", conv, flags=re.I)
+            conv = re.sub(r"^Użytkownik używa\s+", "używasz ", conv, flags=re.I)
+            conv = re.sub(r"^Użytkownik studiuje lub uczy się\s+", "uczysz się ", conv, flags=re.I)
+            conv = re.sub(r"^Użytkownik pracuje nad projektem:\s+", "pracujesz nad projektem ", conv, flags=re.I)
+            conv = re.sub(r"^Wydarzenie z życia użytkownika:\s+", "", conv, flags=re.I)
+            phrases.append(conv[0].lower() + conv[1:] if conv else conv)
+
+        parts: list[str] = []
+        if brain_named:
+            parts.append(f"Super, od teraz mam na imię {brain_named} — już to sobie zapisałem!")
+        if user_named:
+            parts.append(f"Miło Cię poznać, {user_named}!")
+        if phrases:
+            joined = ", ".join(phrases)
+            if parts:
+                parts.append(f"Zapamiętam też, że {joined}.")
+            else:
+                parts.append(f"Jasne, zapamiętam sobie, że {joined}.")
+        return " ".join(parts) if parts else "Jasne, już to sobie zapisałem!"
+
+    def _try_transformer_reply(
+        self,
+        mem_hint: str,
+        ctx_hint: str,
+        user_msg: str,
+        reference_texts: list[str],
+    ) -> str | None:
+        if self.transformer_lm.fluency_score < 70.0 or not reference_texts:
+            return None
+        prompt = (
+            f"<MEM> {mem_hint[:220] if mem_hint else 'brak'} "
+            f"<CTX> {ctx_hint[:140] if ctx_hint else 'początek rozmowy'} "
+            f"<USER> {user_msg[:120]} <BOT>"
+        )
+        with self._op_lock:
+            gen = self.transformer_lm.generate_reply(prompt, self.tokenizer, max_new_tokens=75, temperature=0.20)
+        cand = gen["text"].strip()
+        if len(cand) < 18 or gen["mean_prob"] < 0.68:
+            return None
+        ref_blob = " ".join(reference_texts)
+        ref_nums = set(re.findall(r"\d+", ref_blob))
+        gen_nums = set(re.findall(r"\d+", cand))
+        if gen_nums and not gen_nums.issubset(ref_nums):
+            return None
+        if _stem_overlap(cand, ref_blob) < 0.30:
+            return None
+        return cand
 
     def chat_reply(
         self,
@@ -793,6 +1045,8 @@ class LanguageCortex:
         energy: float,
         state_mode: str,
         user_profile: list[str] | None = None,
+        episodic_memories: list[str] | None = None,
+        active_subject: str = "",
     ) -> str:
         reply, _ = self._chat_reply_with_meta(
             user_message=user_message,
@@ -806,6 +1060,8 @@ class LanguageCortex:
             energy=energy,
             state_mode=state_mode,
             user_profile=user_profile,
+            episodic_memories=episodic_memories,
+            active_subject=active_subject,
         )
         return reply
 
@@ -822,6 +1078,8 @@ class LanguageCortex:
         energy: float,
         state_mode: str,
         user_profile: list[str] | None = None,
+        episodic_memories: list[str] | None = None,
+        active_subject: str = "",
     ) -> tuple[str, str | None]:
         msg = user_message.strip()
         low = _strip_pl(msg.lower()).strip(" ?!.,;:")
@@ -829,20 +1087,62 @@ class LanguageCortex:
         # 1) Correction / disagreement reaction
         if any(p in low for p in ("ale to nie prawda", "to nie prawda", "nieprawda", "bzdura", "mylisz sie")):
             return (
-                "Rozumiem, dzięki za zwrócenie uwagi! Nie zapisałem tej reakcji jako faktu. "
-                "Napisz proszę poprawną informację zdaniem twierdzącym albo użyj `/ucz <temat>`, "
-                "abym sprawdził wiarygodne źródła i zaktualizował pamięć.",
+                "Rozumiem, dzięki za zwrócenie uwagi! Nie zapisywałem tego jako faktu. "
+                "Napisz proszę jak jest poprawnie, albo wpisz `/ucz <temat>`, żebym sprawdził to w wiarygodnych źródłach.",
                 None,
             )
 
-        # Find user name if known
+        # Find user name & brain name if known
         user_name = ""
+        brain_name = ""
         for mem in (user_profile or []) + hippocampus_memories + semantic_memories:
-            m_name = re.search(r"Użytkownik ma na imię\s+([^\s.,!?;]+)", mem, flags=re.I)
-            if m_name:
-                user_name = m_name.group(1)
-                break
+            if not user_name:
+                m_name = re.search(r"Użytkownik ma na imię\s+([^\s.,!?;]+)", mem, flags=re.I)
+                if m_name:
+                    user_name = m_name.group(1)
+            if not brain_name:
+                b_name = re.search(
+                    r"(?:Mózg ma nadane przez użytkownika imię|Twoje imi[eę] to)\s+([^\s.,!?;]+)",
+                    mem,
+                    flags=re.I,
+                )
+                if b_name:
+                    brain_name = b_name.group(1).capitalize()
         name_part = f" {user_name}" if user_name else ""
+
+        # 1b) Brain name question
+        if any(p in low for p in ("jak masz na imie", "jak sie nazywasz", "jak ci na imie")):
+            if brain_name:
+                return (f"Mam na imię {brain_name} — tak mnie nazwałeś i trzymam się tego imienia! W czym mogę Ci pomóc{name_part}?", None)
+            return (f"Nie nadałeś mi jeszcze imienia{name_part}. Możesz napisać np. „Twoje imię to Krzysztof”, a od razu je zapamiętam!", None)
+
+        # 1c) Episodic recall: questions about previous messages / shared memories ("co wcześniej pisaliśmy")
+        is_episodic_q = (
+            any(k in low for k in ("wczesniej", "wczenij", "poprzedni", "przed chwila", "ostatnio", "naszej rozmow"))
+            and any(v in low for v in ("pisal", "mowil", "rozmawi", "gadal", "wiadomosc", "waidomosc", "pamietasz"))
+        ) or any(p in low for p in ("co pisalem", "o czym rozmawialismy", "co wczesniej pisalismy", "co wczenij pisalimi"))
+        if is_episodic_q:
+            prev_user_msgs = [
+                t.get("content", "").strip()
+                for t in (recent_turns or [])
+                if t.get("role") == "user" and t.get("content", "").strip()
+            ]
+            prev_clean = [
+                m for m in prev_user_msgs[-6:]
+                if not any(kw in _strip_pl(m.lower()) for kw in ("pisalimi", "pisalismy", "poprzednie waidomosci"))
+            ]
+            ep_list = [clean_human_fact(e) for e in (episodic_memories or []) if clean_human_fact(e)]
+            if prev_clean or ep_list:
+                lines = [f"Jasne{name_part}, pamiętam co wcześniej pisaliśmy:"]
+                for pm in prev_clean[-3:]:
+                    lines.append(f"- pisałeś: „{pm}”")
+                for ep in ep_list[:4]:
+                    if not any(pm.lower()[:25] in ep.lower() for pm in prev_clean):
+                        lines.append(f"- {ep}")
+                if active_subject:
+                    lines.append(f"Ostatnio rozmawialiśmy głównie o temacie: {active_subject}.")
+                return ("\n".join(lines), None)
+            return (f"Dopiero zaczęliśmy tę rozmowę{name_part} — napisz mi o czymś, a na pewno to zapamiętam na przyszłość!", None)
 
         # 2) Thanks / acknowledgement / reactions
         if low in ("dzieki", "dziekuje", "dzieki wielkie", "thx"):
@@ -926,26 +1226,21 @@ class LanguageCortex:
                 None,
             )
 
-        # 5) Short conversational follow-ups / confusion ("ale co", "dlaczego", "nie rozumiem", "o co chodzi")
+        # 5) Short conversational follow-ups / confusion without a specific subject
         follow_up_phrases = (
             "ale co", "co", "no i", "i co", "o co chodzi", "dlaczego", "czemu",
-            "jak to", "nie rozumiem", "rozwin", "powiedz wiecej", "wiecej", "serio",
+            "jak to", "nie rozumiem", "serio",
         )
-        if low in follow_up_phrases or (len(low.split()) <= 2 and any(low == fp for fp in follow_up_phrases)):
-            last_bot = ""
-            for t in reversed(recent_turns or []):
-                if t.get("role") == "assistant":
-                    last_bot = t.get("content", "").strip()
-                    break
-            if last_bot:
+        if low in follow_up_phrases:
+            if active_subject:
                 return (
-                    "Chodziło mi o naszą ostatnią rozmowę. Napisz dokładniej, które pojęcie mam wyjaśnić albo policzyć "
-                    "(np. `co to jest fotosynteza`, `ile to 7 * 8`).",
+                    f"Chodziło mi o temat „{active_subject}”, o którym przed chwilą rozmawialiśmy. "
+                    f"Napisz dokładniej, co chciałbyś w nim rozwinąć albo zapytać!",
                     None,
                 )
             return (
-                "Napisz proszę pełne pytanie lub konkretne pojęcie (np. `co to jest grawitacja`, `ile to 15% z 200`), "
-                "albo po prostu napisz, o czym chcesz porozmawiać!",
+                f"Nie jestem pewien, do czego dokładnie nawiązujesz{name_part}. Napisz proszę pełniej, o co zapytać albo co policzyć "
+                "(np. `co to jest fotosynteza` albo `ile to 7 * 8`).",
                 None,
             )
 
@@ -954,11 +1249,11 @@ class LanguageCortex:
             re.match(r"^(?:czesc|hej|hejka|siema|siemanko|witaj|witam|elo|yo|dzien dobry|dobry wieczor|jak sie czujesz)[!.\s?]*$", low)
         )
         if is_greeting:
-            sleep_hint = " Czuję się już lekko śpiący — przyda się `/sen`, aby skonsolidować pamięć na GPU." if energy <= self.cfg.drowsy_threshold else ""
+            me = f"Mam na imię {brain_name}. " if brain_name else ""
+            sleep_hint = " Jestem już trochę zmęczony — przyda się `/sen`, żebym utrwalił dzisiejsze rozmowy." if energy <= self.cfg.drowsy_threshold else ""
             return (
-                f"Cześć{name_part}! Jestem w pełni samowystarczalnym mózgiem PyTorch na GPU "
-                f"(Dzień #{day}, energia {energy:.0f}%, przespanych nocy: {sleeps}). "
-                f"Możesz ze mną normalnie porozmawiać, zapytać o dowolny temat albo czegoś mnie nauczyć.{sleep_hint}",
+                f"Cześć{name_part}! {me}Dzisiaj jest mój {day}. dzień pracy (energia {energy:.0f}%), "
+                f"wszystko działa lokalnie na moim własnym modelu GPU. O czym dzisiaj pogadamy?{sleep_hint}",
                 None,
             )
 
@@ -969,18 +1264,18 @@ class LanguageCortex:
         if is_mem_query:
             all_mems = []
             seen = set()
-            for x in (user_profile or []) + hippocampus_memories + semantic_memories:
+            for x in (user_profile or []) + (episodic_memories or []) + hippocampus_memories + semantic_memories:
                 c = _clean_fact_text(x)
                 if c and c.lower() not in seen:
                     seen.add(c.lower())
                     all_mems.append(c)
             if not all_mems and not self.core_knowledge_summary:
-                return ("Na razie moja pamięć jest jeszcze pusta. Kliknij `🎓 Szkoła Podstawowa` (lub wpisz `/szkola`), naucz mnie czegoś w rozmowie albo wpisz `/ucz <temat>`!", None)
-            lines = ["Oto najważniejsze rzeczy, które pamiętam:"]
+                return (f"Na razie moja pamięć jest jeszcze świeża{name_part}. Możemy po prostu porozmawiać, albo wgraj pakiet `/szkola`!", None)
+            lines = [f"Pamiętam już sporo rzeczy{name_part}:"]
             for item in all_mems[:8]:
                 lines.append(f"- {item}")
             if rem_reflections:
-                lines.append("\nWnioski ze snu REM:")
+                lines.append("\nA ze snu REM skojarzyłem jeszcze:")
                 for r in rem_reflections[:2]:
                     lines.append(f"- {_clean_fact_text(r)}")
             return ("\n".join(lines), None)
@@ -1001,18 +1296,27 @@ class LanguageCortex:
         )
         extracted_now = self.extract_memories_from_turn(msg)
         if extracted_now["memories"] and not is_question:
-            learned_str = "; ".join(m["text"] for m in extracted_now["memories"][:3])
-            return (f"Zapamiętałem w hipokampie: {learned_str}", None)
+            return (self._format_human_learn_ack(extracted_now["memories"]), None)
 
-        # 10) Knowledge / definition / explanation query grounded strictly in recalled memory
+        # 10) Knowledge / definition / contextual follow-up query grounded in recalled memory
         subj = _extract_query_subject(msg)
         subj_low = _strip_pl(subj.lower())
         conversational_tokens = {"moge", "mozesz", "mozemy", "toba", "mna", "ciebie", "jestem", "jestes", "rozmiac", "rozmawiac", "pogadac", "ale", "czy"}
         subj_words = [w for w in re.findall(r"[a-z0-9+#]{2,}", subj_low) if w not in _STOPWORDS_PL]
+
+        pronoun_or_followup = any(
+            w in {"on", "ona", "ono", "niego", "niej", "nim", "nia", "jego", "jej", "tego", "tym", "tej", "to", "zyl", "powstal", "wiecej"}
+            for w in subj_words
+        ) or len(subj_words) == 0
+        is_contextual_followup = bool(active_subject) and (pronoun_or_followup or low.startswith(("a ", "i ", "powiedz cos wiecej", "rozwin")))
+        effective_subj = active_subject if is_contextual_followup else subj
+        eff_low = _strip_pl(effective_subj.lower())
+        eff_words = [w for w in re.findall(r"[a-z0-9+#]{2,}", eff_low) if w not in _STOPWORDS_PL]
+
         is_non_topic_phrase = (
-            len(subj) <= 2
-            or not subj_words
-            or any(w in conversational_tokens for w in subj_words)
+            len(effective_subj) <= 2
+            or not eff_words
+            or any(w in conversational_tokens for w in eff_words)
         )
 
         candidates: list[str] = []
@@ -1026,18 +1330,18 @@ class LanguageCortex:
         if not candidates:
             if is_non_topic_phrase:
                 return (
-                    "Nie jestem pewien, o co dokładnie pytasz. Podaj proszę konkretne zagadnienie "
-                    "(np. `co to jest fotosynteza`), obliczenie (np. `ile to 8 * 7`) albo kliknij `🎓 Szkoła Podstawowa` (`/szkola`).",
+                    "Nie do końca złapałem, o co pytasz. Podaj proszę konkretne pojęcie "
+                    "(np. `co to jest fotosynteza`), działanie matematyczne albo wpisz `/szkola`, żebym poznał podstawy.",
                     None,
                 )
             return (
-                f"Nie mam jeszcze w swojej pamięci informacji na temat „{subj}”. "
-                f"Wpisz `/ucz {subj}`, a sam znajdę wiarygodne źródła w sieci i się tego nauczę!",
-                subj,
+                f"Szczerze mówiąc nie mam jeszcze w pamięci informacji o „{effective_subj}”. "
+                f"Jeśli wpiszesz `/ucz {effective_subj}`, sam doczytam o tym w sieci i zaraz pogadamy!",
+                effective_subj,
             )
 
         # Rank candidates jointly using GPU Semantic Encoder + Polish stem overlap + Transformer LM score
-        vecs = self.encode_texts([subj, msg] + candidates)
+        vecs = self.encode_texts([effective_subj, f"{effective_subj} {msg}"] + candidates)
         subj_vec = vecs[0]
         msg_vec = vecs[1]
         cand_vecs = vecs[2:]
@@ -1046,11 +1350,11 @@ class LanguageCortex:
 
         ranked: list[tuple[float, float, float, int, str, list[float]]] = []
         for cand, cvec, lms in zip(candidates, cand_vecs, lm_scores):
-            ov_subj = _stem_overlap(subj, cand)
+            ov_subj = _stem_overlap(effective_subj, cand)
             ov_msg = _stem_overlap(msg, cand)
-            ov = max(ov_subj, ov_msg)
+            ov = max(ov_subj, 0.7 * ov_msg)
             cand_stems = set(_tokenize_stems(cand))
-            subj_stems = _tokenize_stems(subj)
+            subj_stems = _tokenize_stems(effective_subj)
             matched_subj_words = sum(
                 1 for sw in subj_stems
                 if any(cs == sw or (len(sw) >= 4 and len(cs) >= 4 and cs[:4] == sw[:4]) for cs in cand_stems)
@@ -1058,48 +1362,47 @@ class LanguageCortex:
             subj_cos = _cosine_list(subj_vec, cvec)
             msg_cos = _cosine_list(msg_vec, cvec)
             cos = 0.75 * subj_cos + 0.25 * msg_cos
-            is_def = any(cue in cand.lower() for cue in ("znaczenie słowa", " to ", " jest ", " – ", " — ", "oznacza", "składa się"))
-            def_bonus = 0.14 if is_def else 0.0
+            date_bonus = 0.14 if ("kiedy" in low and re.search(r"\b\d{3,4}\b", cand)) else 0.0
+            is_def = any(cue in cand.lower() for cue in ("oznacza", " to ", " jest ", " – ", " — ", "składa się", "był "))
+            def_bonus = 0.12 if is_def else 0.0
             lm_bonus = max(-0.05, min(0.08, (lms + 6.0) * 0.015))
-            total = 0.48 * ov + 0.36 * cos + def_bonus + lm_bonus
+            total = 0.48 * ov + 0.36 * cos + def_bonus + date_bonus + lm_bonus
             ranked.append((total, ov, subj_cos, matched_subj_words, cand, cvec))
 
         ranked.sort(key=lambda x: x[0], reverse=True)
         top_score, top_ov, top_subj_cos, top_matched_words, _, _ = ranked[0]
 
-        # Anti-hallucination gate: require genuine relevance to the asked subject.
-        # When the subject has 2+ content words (e.g. "gwałt na uszy"), matching only 1 incidental word is not enough.
-        multi_word_mismatch = len(subj_words) >= 2 and top_matched_words < 2 and top_subj_cos < 0.68
+        multi_word_mismatch = len(eff_words) >= 2 and top_matched_words < 2 and top_subj_cos < 0.68
         if (top_ov < 0.25 and top_subj_cos < 0.52) or multi_word_mismatch:
             if is_non_topic_phrase:
                 return (
-                    "Nie do końca rozumiem, o jaki temat pytasz. Zadaj proszę pytanie o konkretne pojęcie "
-                    "albo wpisz `/szkola`, abym wgrał podstawową wiedzę szkolną.",
+                    "Nie jestem pewien, o jaki dokładnie temat pytasz. Napisz proszę nazwę pojęcia "
+                    "albo kliknij `🎓 Szkoła Podstawowa` (`/szkola`).",
                     None,
                 )
-            lookup_subj = subj
-            if len(subj_words) == 1 and recent_turns:
+            lookup_subj = effective_subj
+            if len(eff_words) == 1 and recent_turns and not is_contextual_followup:
                 for t in reversed(recent_turns):
                     if t.get("role") == "user":
                         prev_subj = _extract_query_subject(t.get("content", ""))
                         prev_words = [w for w in re.findall(r"[a-z0-9+#]{3,}", _strip_pl(prev_subj.lower())) if w not in _STOPWORDS_PL]
-                        if prev_words and prev_subj.lower() != subj.lower():
-                            lookup_subj = f"{subj} {prev_words[-1]}"
+                        if prev_words and prev_subj.lower() != effective_subj.lower():
+                            lookup_subj = f"{effective_subj} {prev_words[-1]}"
                         break
             return (
-                f"Nie jestem pewien odpowiedzi na temat „{subj}” — nie znalazłem pasujących faktów w pamięci. "
-                f"Użyj `/ucz {lookup_subj}`, abym zbadał ten temat w internecie!",
+                f"Nie wiem jeszcze wystarczająco dużo o „{effective_subj}”, żeby nie zmyślać. "
+                f"Wpisz `/ucz {lookup_subj}`, a chętnie się tego nauczę z internetu!",
                 lookup_subj,
             )
 
         relevant = [
             item for item in ranked
             if (item[1] >= 0.25 or item[2] >= max(0.50, top_subj_cos - 0.06))
-            and not (len(subj_words) >= 2 and item[3] < 2 and item[2] < 0.68)
+            and not (len(eff_words) >= 2 and item[3] < 2 and item[2] < 0.68)
         ]
         chosen_texts: list[str] = []
         chosen_vecs: list[list[float]] = []
-        max_facts = 3 if any(w in low for w in ("krotko", "w skrocie")) else 5
+        max_facts = 2 if any(w in low for w in ("krotko", "w skrocie")) else 4
 
         for _, _, _, _, cand, cvec in relevant:
             if any(_cosine_list(cvec, pv) > 0.84 for pv in chosen_vecs):
@@ -1112,46 +1415,48 @@ class LanguageCortex:
         if not chosen_texts:
             chosen_texts = [ranked[0][4]]
 
-        lead = chosen_texts[0].rstrip(".") + "."
-        extras = [t.rstrip(".") + "." for t in chosen_texts[1:]]
-
-        subj_title = (subj[0].upper() + subj[1:]) if subj else subj
-        first_word = lead.split(" ", 1)[0].lower() if lead else ""
-        if first_word in ("to", "jest", "są", "oznacza", "był", "była", "ktoś", "osoba"):
-            lead_fmt = lead[0].lower() + lead[1:]
+        ctx_hint = f"Rozmawialiśmy o: {active_subject}." if active_subject else ""
+        lm_reply = self._try_transformer_reply(
+            mem_hint=" ".join(chosen_texts[:2]),
+            ctx_hint=ctx_hint,
+            user_msg=msg,
+            reference_texts=chosen_texts,
+        )
+        if lm_reply:
+            final_reply = lm_reply
         else:
-            lead_fmt = lead
-        parts: list[str] = [
-            f"**{subj_title}** — {lead_fmt}"
-            if not lead.lower().startswith(subj.lower()) and len(subj.split()) <= 3
-            else lead
-        ]
-        if extras:
-            parts.append(" ".join(extras))
-
-        # Add relevant REM/graph insight if it overlaps with the subject
-        rel_rem = [r for r in rem_reflections if _stem_overlap(subj, r) >= 0.25]
-        if rel_rem:
-            parts.append(f"\n*Skojarzenie REM:* {_clean_fact_text(rel_rem[0])}")
-        elif concept_hints:
-            rel_hints = [h for h in concept_hints if _stem_overlap(subj, h) >= 0.25]
-            if rel_hints:
-                parts.append(f"\n*Powiązania w grafie EWC:* {'; '.join(rel_hints[:2])}")
-
-        # If asking about C++ pointers and memory confirms C++/pointer, add a crisp grounded C++ snippet
-        if ("wskaznik" in low or "wskaźnik" in low) and ("c++" in low or "cpp" in low):
-            parts.append(
-                "\n```cpp\n"
-                "int liczba = 42;\n"
-                "int* wskaznik = &liczba; // przechowuje adres zmiennej\n"
-                "int wartosc = *wskaznik; // dereferencja -> 42\n"
-                "```"
-            )
+            lead = chosen_texts[0].rstrip(".") + "."
+            extras = [t.rstrip(".") + "." for t in chosen_texts[1:]]
+            if is_contextual_followup and active_subject and active_subject.lower() not in lead.lower():
+                lead_body = lead[0].lower() + lead[1:] if lead[0].isupper() and not lead[:3].isupper() else lead
+                parts = [f"Jeśli chodzi o {active_subject}, to {lead_body}"]
+            else:
+                parts = [lead]
+            if extras:
+                parts.append(" ".join(extras))
+            if ("wskaznik" in low or "wskaźnik" in low) and ("c++" in low or "cpp" in low):
+                parts.append(
+                    "\n```cpp\n"
+                    "int liczba = 42;\n"
+                    "int* wskaznik = &liczba; // przechowuje adres zmiennej\n"
+                    "int wartosc = *wskaznik; // dereferencja -> 42\n"
+                    "```"
+                )
+            final_reply = "\n".join(parts).strip()
 
         if state_mode == "DROWSY" or energy <= self.cfg.drowsy_threshold:
-            parts.append("\n*(Energia niska — przyda się `/sen`, aby utrwalić świeżą wiedzę w sieci neuronowej na GPU.)*")
+            final_reply += "\n(Jestem już lekko śpiący — przyda się `/sen`, żebym utrwalił nowe rzeczy na GPU.)"
 
-        return ("\n".join(parts).strip(), None)
+        sample_seq = (
+            f"<MEM> {' '.join(chosen_texts[:2])[:220]} "
+            f"<CTX> {ctx_hint or 'początek rozmowy'} "
+            f"<USER> {msg[:120]} <BOT> {final_reply[:220]}"
+        )
+        self.online_dialogues.append(sample_seq)
+        if len(self.online_dialogues) > 200:
+            self.online_dialogues = self.online_dialogues[-200:]
+
+        return (final_reply, None)
 
     def chat_reply_stream(
         self,
@@ -1166,6 +1471,8 @@ class LanguageCortex:
         energy: float,
         state_mode: str,
         user_profile: list[str] | None = None,
+        episodic_memories: list[str] | None = None,
+        active_subject: str = "",
     ) -> Iterator[str]:
         reply = self.chat_reply(
             user_message=user_message,
@@ -1179,6 +1486,8 @@ class LanguageCortex:
             energy=energy,
             state_mode=state_mode,
             user_profile=user_profile,
+            episodic_memories=episodic_memories,
+            active_subject=active_subject,
         )
         # Stream smoothly in natural word chunks
         tokens = re.findall(r"\S+\s*", reply)

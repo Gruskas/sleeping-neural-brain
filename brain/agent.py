@@ -245,6 +245,19 @@ class SleepingBrain:
             if consolidate and (to_add or self.hippocampus.short_term_memories):
                 sleep_rep = self.sleep_now(visual_pacing=False, _from_nested=True)
 
+            # Train conversational dialogue phrasing on the new foundation facts
+            if to_add:
+                with self.lock:
+                    all_m = [m.text for m in self.hippocampus.semantic_memories if not m.superseded]
+                    user_p = [m.text for m in self.hippocampus.semantic_memories if not m.superseded and m.category == "użytkownik"]
+                self.language_cortex.train_language_cortex(
+                    all_memories=all_m,
+                    episodic_memories=[],
+                    chat_turns=[],
+                    user_profile=user_p,
+                    epochs=8,
+                )
+
             with self.lock:
                 total_sem = len([m for m in self.hippocampus.semantic_memories if not m.superseded])
                 if not _from_nested:
@@ -944,9 +957,55 @@ class SleepingBrain:
                     self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
             self._release_op("study")
 
+    def train_language_now(self, epochs: int | None = None) -> dict[str, Any]:
+        self._acquire_op("study")
+        try:
+            with self.lock:
+                all_m = [
+                    m.text for m in (self.hippocampus.short_term_memories + self.hippocampus.semantic_memories)
+                    if not m.superseded
+                ]
+                ep_m = [m.text for m in self.hippocampus.episodic_memories]
+                user_p = [
+                    m.text for m in (self.hippocampus.short_term_memories + self.hippocampus.semantic_memories)
+                    if not m.superseded and m.category == "użytkownik"
+                ]
+                turns = list(self.chat_log[-80:])
+
+            res = self.language_cortex.train_language_cortex(
+                all_memories=all_m,
+                episodic_memories=ep_m,
+                chat_turns=turns,
+                user_profile=user_p,
+                epochs=epochs,
+            )
+            with self.lock:
+                self._log(
+                    "STUDY",
+                    f"🗣️ Wykształcono model językowy na GPU ({res['dialogues']} dialogów, "
+                    f"loss {res['loss_start']}→{res['loss_end']}, płynność {res['fluency']:.0f}%).",
+                )
+                self._append_chat(
+                    "assistant",
+                    f"🗣️ Przeprowadziłem samodzielny trening językowy na GPU ({res['dialogues']} dialogów w {res['duration_ms']:.0f} ms). "
+                    f"Strata spadła z {res['loss_start']} do {res['loss_end']}, a moja płynność językowa wynosi teraz **{res['fluency']:.0f}%**!",
+                    meta={"kind": "study_done", "topic": "Trening językowy GPU"},
+                    add_to_working=False,
+                )
+            self.save_state()
+            return res
+        finally:
+            self._release_op("study")
+
     def _prepare_chat_turn(self, msg: str) -> dict[str, Any]:
-        # 1) Encode query & extract declarative memories OUTSIDE self.lock (Ollama HTTP calls)
-        q_vec = self.language_cortex.encode_text(msg)
+        # 1) Resolve conversational pronouns/follow-ups from working_chat & encode query
+        with self.lock:
+            turns_snap = list(self.working_chat)
+        ctx = self.language_cortex.resolve_conversational_context(msg, turns_snap)
+        search_q = ctx["search_query"]
+        active_subject = ctx["active_subject"]
+
+        q_vec = self.language_cortex.encode_text(search_q)
         extracted = self.language_cortex.extract_memories_from_turn(msg)
         mem_items = extracted.get("memories", [])
         mem_embs = self.language_cortex.encode_texts([item["text"] for item in mem_items])
@@ -955,7 +1014,7 @@ class SleepingBrain:
         with self.lock:
             recalled = self.hippocampus.search_memories(
                 query_vec=q_vec,
-                query_text=msg,
+                query_text=search_q,
                 current_day=self.day,
                 top_hippo=self.cfg.recall_top_hippo,
                 top_semantic=self.cfg.recall_top_semantic,
@@ -965,9 +1024,10 @@ class SleepingBrain:
             sem_texts = [m.text for m in recalled["semantic"]]
             rem_texts = [m.text for m in recalled["rem"]]
             user_profile_texts = [m.text for m in recalled.get("user_profile", [])]
+            episodic_texts = [m.text for m in recalled.get("episodic", [])]
 
             concept_hints: list[str] = []
-            words = [w.strip(".,!?;:\"'()").lower() for w in msg.split() if len(w) >= 3]
+            words = [w.strip(".,!?;:\"'()").lower() for w in search_q.split() if len(w) >= 3]
             seen_concepts: set[str] = set()
             for w in words:
                 resolved = self.concept_cortex.resolve_concept(w)
@@ -1001,6 +1061,8 @@ class SleepingBrain:
                 "sem_texts": sem_texts,
                 "rem_texts": rem_texts,
                 "user_profile": user_profile_texts,
+                "episodic_texts": episodic_texts,
+                "active_subject": active_subject,
                 "concept_hints": concept_hints,
                 "learned_memories": learned_memories,
                 "learned_triples": learned_triples,
@@ -1018,7 +1080,19 @@ class SleepingBrain:
         rem_texts = prep["rem_texts"]
         concept_hints = prep["concept_hints"]
 
+        # Record substantive user turns as episodic conversation memories (separate from short_term_memories)
+        low_msg = _strip_pl(msg.lower()).strip(" ?!.,;:")
+        skip_ep = (
+            len(msg) < 12
+            or any(p in low_msg for p in ("ale to nie prawda", "nieprawda", "bzdura", "pisalimi", "pisalismy", "poprzednie waidomosci"))
+            or low_msg in ("czesc", "hej", "witaj", "dzien dobry", "dobranoc", "dzieki", "dziekuje", "ale co")
+        )
+        ep_text = f"W rozmowie (Dzień {prep['day']}) pisałeś: „{msg[:120]}”." if not skip_ep else ""
+        ep_emb = self.language_cortex.encode_text(ep_text) if ep_text else []
+
         with self.lock:
+            if ep_text:
+                self.hippocampus.record_episodic(ep_text, day=self.day, embedding=ep_emb)
             self._append_chat("user", msg, meta={"learned_count": len(learned_memories)})
             self._append_chat(
                 "assistant",
@@ -1171,6 +1245,8 @@ class SleepingBrain:
             energy=prep["energy"],
             state_mode=prep["state_mode"],
             user_profile=prep.get("user_profile", []),
+            episodic_memories=prep.get("episodic_texts", []),
+            active_subject=prep.get("active_subject", ""),
         )
         if self.auto_web and missing_topic:
             prev_count = len(prep["learned_memories"])
@@ -1230,6 +1306,20 @@ class SleepingBrain:
                 "sleep_report": res.get("sleep_report"),
                 "learned_memories": [],
                 "recalled_memories": {},
+            }
+
+        if msg.lower() in ("/wyksztalc", "/wykształć", "/trenuj"):
+            with self.lock:
+                self._append_chat("user", msg, add_to_working=False)
+            res = self.train_language_now()
+            with self.lock:
+                last_msg = self.chat_log[-1] if self.chat_log else {"content": "Wytrenowano model językowy na GPU."}
+            return {
+                "reply": last_msg["content"],
+                "slept": False,
+                "learned_memories": [],
+                "recalled_memories": {},
+                "language_train": res,
             }
 
         if msg.lower() in ("/szkola siec", "/szkoła sieć", "/szkola web"):
@@ -1292,7 +1382,7 @@ class SleepingBrain:
         if not msg:
             raise ValueError("Wiadomość nie może być pusta.")
 
-        if msg.lower() in ("/sen", "/sleep", "idź spać", "idz spac", "/szkola", "/szkoła", "/podstawy", "/szkola siec", "/szkoła sieć", "/szkola web") or msg.lower().startswith("/ucz auto"):
+        if msg.lower() in ("/sen", "/sleep", "idź spać", "idz spac", "/szkola", "/szkoła", "/podstawy", "/szkola siec", "/szkoła sieć", "/szkola web", "/wyksztalc", "/wykształć", "/trenuj") or msg.lower().startswith("/ucz auto"):
             res = self.chat(msg)
             yield {"type": "done", **res}
             return
@@ -1661,6 +1751,9 @@ class SleepingBrain:
                     "total_params": self.language_cortex.total_parameters(),
                     "vocab_used": self.language_cortex.tokenizer.vocab_used,
                     "vocab_size": self.cfg.vocab_size,
+                    "fluency": self.language_cortex.transformer_lm.fluency_score,
+                    "trained_steps": self.language_cortex.transformer_lm.trained_steps,
+                    "last_loss": round(self.language_cortex.transformer_lm.last_loss, 3),
                     "core_knowledge_summary": self.language_cortex.core_knowledge_summary,
                 },
                 "limits": {

@@ -39,16 +39,19 @@ class BrainConfig:
     rem_max_new_links_per_night: int = 20
 
     # Self-Contained PyTorch Neural Language & Semantic Cortex (100% local on GPU)
-    language_model_id: str = "Autonomiczna-Kora-PyTorch-v1"
+    language_model_id: str = "Autonomiczna-Kora-PyTorch-v2"
     vocab_size: int = 16384
     ngram_buckets: int = 2048
-    cortex_dim: int = 256
-    cortex_layers: int = 4
+    embed_dim: int = 256
+    cortex_dim: int = 384
+    cortex_layers: int = 6
     cortex_heads: int = 8
-    cortex_ff_dim: int = 1024
-    cortex_max_seq_len: int = 192
-    cortex_sleep_epochs: int = 12
-    cortex_lr: float = 8e-4
+    cortex_ff_dim: int = 1536
+    cortex_max_seq_len: int = 320
+    cortex_sleep_epochs: int = 14
+    language_bootstrap_epochs: int = 8
+    language_train_epochs: int = 22
+    cortex_lr: float = 9e-4
     lora_max_replay_samples: int = 80
     embed_batch_size: int = 32
     max_new_tokens: int = 2400

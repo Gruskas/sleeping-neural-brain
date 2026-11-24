@@ -134,6 +134,7 @@ class Hippocampus:
         self.rem_dream_links: dict[tuple[str, str, str], ConceptFact] = {}
         self.semantic_memories: list[MemoryTrace] = []
         self.rem_reflections: list[MemoryTrace] = []
+        self.episodic_memories: list[MemoryTrace] = []
         self.studied_topics: dict[str, dict[str, Any]] = {}
 
     def record_fact(
@@ -178,7 +179,10 @@ class Hippocampus:
         emb = embedding or []
 
         for existing in self.short_term_memories:
-            if existing.text.lower() == clean.lower() or (emb and _cosine(existing.embedding, emb) > 0.92):
+            sim_thresh = 0.86 if category == "rozmowa" else 0.92
+            if existing.text.lower() == clean.lower() or (emb and _cosine(existing.embedding, emb) > sim_thresh):
+                if category == "rozmowa":
+                    existing.text = clean
                 existing.strength = min(4.0, existing.strength + 0.4)
                 existing.importance = max(existing.importance, importance)
                 existing.timestamp = time.time()
@@ -201,6 +205,34 @@ class Hippocampus:
             # Drop lowest-importance oldest short-term memory only if 5,000+ exceeded
             self.short_term_memories.sort(key=lambda m: (m.importance, m.timestamp), reverse=True)
             self.short_term_memories = self.short_term_memories[: self.max_short_term_memories]
+        return trace
+
+    def record_episodic(
+        self,
+        text: str,
+        day: int,
+        embedding: list[float] | None = None,
+    ) -> MemoryTrace:
+        clean = text.strip()
+        emb = embedding or []
+        for existing in self.episodic_memories[-12:]:
+            if existing.text.lower() == clean.lower() or (emb and _cosine(existing.embedding, emb) > 0.90):
+                existing.text = clean
+                existing.timestamp = time.time()
+                return existing
+        trace = MemoryTrace(
+            text=clean,
+            category="rozmowa",
+            importance=3,
+            strength=1.4,
+            day_created=day,
+            last_recalled_day=day,
+            consolidated=True,
+            embedding=emb,
+        )
+        self.episodic_memories.append(trace)
+        if len(self.episodic_memories) > 1000:
+            self.episodic_memories = self.episodic_memories[-1000:]
         return trace
 
     def add_rem_reflection(
@@ -288,13 +320,22 @@ class Hippocampus:
         user_profile = [
             m for m in (self.short_term_memories + active_sem)
             if not m.superseded and m.category == "użytkownik"
-        ][:6]
+        ][:8]
+
+        # Episodic conversation & event memories (preserved across sleeps)
+        episodic_pool = [
+            m for m in (self.episodic_memories + self.short_term_memories + active_sem)
+            if not m.superseded and m.category in ("rozmowa", "wydarzenie")
+        ]
+        episodic_pool.sort(key=lambda m: (score_trace(m) >= 0.18, m.timestamp), reverse=True)
+        episodic_hits = episodic_pool[:8]
 
         return {
             "hippocampus": hippo_hits,
             "semantic": sem_hits,
             "rem": rem_hits,
             "user_profile": user_profile,
+            "episodic": episodic_hits,
         }
 
     def consolidate_declarative_memories(
@@ -428,7 +469,7 @@ class Hippocampus:
         target = memory_id.strip()
         if not target:
             return False
-        for attr in ("short_term_memories", "semantic_memories", "rem_reflections"):
+        for attr in ("short_term_memories", "semantic_memories", "rem_reflections", "episodic_memories"):
             lst: list[MemoryTrace] = getattr(self, attr)
             before = len(lst)
             filtered = [m for m in lst if m.id != target]
@@ -462,6 +503,7 @@ class Hippocampus:
             "short_term_memories": [m.to_dict() for m in self.short_term_memories],
             "semantic_memories": [m.to_dict() for m in self.semantic_memories],
             "rem_reflections": [m.to_dict() for m in self.rem_reflections],
+            "episodic_memories": [m.to_dict() for m in self.episodic_memories],
             "studied_topics": self.studied_topics,
         }
 
@@ -476,4 +518,5 @@ class Hippocampus:
         self.short_term_memories = [MemoryTrace.from_dict(d) for d in data.get("short_term_memories", [])]
         self.semantic_memories = [MemoryTrace.from_dict(d) for d in data.get("semantic_memories", [])]
         self.rem_reflections = [MemoryTrace.from_dict(d) for d in data.get("rem_reflections", [])]
+        self.episodic_memories = [MemoryTrace.from_dict(d) for d in data.get("episodic_memories", [])]
         self.studied_topics = dict(data.get("studied_topics", {}))

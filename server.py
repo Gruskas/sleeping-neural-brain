@@ -138,6 +138,12 @@ class BrainServer:
                         self._send_json({"ok": True, **res})
                         return
 
+                    if parsed.path == "/api/train_language":
+                        epochs = int(body.get("epochs", 22))
+                        res = brain.train_language_now(epochs=epochs)
+                        self._send_json({"ok": True, **res})
+                        return
+
                     if parsed.path == "/api/study/continuous":
                         mins = int(body.get("duration_minutes", 60))
                         res = brain.start_continuous_learning_async(duration_minutes=mins)

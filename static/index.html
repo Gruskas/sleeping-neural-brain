@@ -465,6 +465,7 @@
         </div>
         <div class="chips" style="margin-top:2px">
           <button id="schoolBtn" class="primary" onclick="installSchoolFoundation()" style="padding:5px 10px;font-size:12px">🎓 Szkoła Podstawowa (Wgraj podstawy + GPU)</button>
+          <button id="trainLangBtn" class="study-btn" onclick="trainLanguageNow()" style="padding:5px 10px;font-size:12px" title="Wytrenuj własny model językowy na wszystkich wspomnieniach i rozmowach na GPU">🗣️ Wykształć język (GPU)</button>
           <button id="schoolWebBtn" onclick="startSchoolWebCourse()" style="padding:5px 10px;font-size:12px">📚 Kurs szkolny z Wikipedii</button>
           <button id="continuousStudyBtn" class="study-btn" onclick="startContinuousLearning(60)" style="padding:5px 10px;font-size:12px" title="Zostaw mózg na godzinę — sam będzie uczyć się kolejnych tematów z sieci i konsolidować wiedzę we śnie na GPU">⏱️ Auto-nauka 1h (z netu + sen GPU)</button>
         </div>
@@ -835,8 +836,9 @@
         : "CPU";
 
       const lc = s.language_cortex;
+      const fluency = Number(lc.fluency || 0).toFixed(0);
       document.getElementById("nnBadge").textContent =
-        `🧬 ${(Number(lc.total_params || 0) / 1e6).toFixed(2)}M param · słownik ${lc.vocab_used || 0}/${lc.vocab_size || 16384}`;
+        `🧬 ${(Number(lc.total_params || 0) / 1e6).toFixed(2)}M param · słownik ${lc.vocab_used || 0}/${lc.vocab_size || 16384} · 🗣️ ${fluency}%`;
 
       const banner = document.getElementById("llmBanner");
       if (lc.error) {
@@ -854,6 +856,8 @@
       document.getElementById("sendBtn").disabled = chatBusy || !lc.ready || studying;
       document.getElementById("studyBtn").disabled = !lc.ready || studying;
       document.getElementById("schoolBtn").disabled = !lc.ready || studying;
+      const tlBtn = document.getElementById("trainLangBtn");
+      if (tlBtn) tlBtn.disabled = !lc.ready || studying;
       document.getElementById("schoolWebBtn").disabled = !lc.ready || studying;
       const contBtn = document.getElementById("continuousStudyBtn");
       if (contBtn) contBtn.disabled = !lc.ready || studying;
@@ -1169,6 +1173,21 @@
       const res = await api("/api/curriculum", { deep_web: true, max_topics: 12 });
       if (!res.ok) alert(res.error || "Nie udało się uruchomić kursu szkolnego.");
       await poll();
+    }
+
+    async function trainLanguageNow() {
+      const btn = document.getElementById("trainLangBtn");
+      if (!btn) return;
+      btn.disabled = true;
+      const old = btn.textContent;
+      btn.textContent = "⏳ Trenuję model językowy na GPU...";
+      try {
+        const res = await api("/api/train_language", { epochs: 22 });
+        if (!res.ok) alert(res.error || "Nie udało się wytrenować języka.");
+      } finally {
+        btn.textContent = old;
+        await poll();
+      }
     }
 
     async function startContinuousLearning(minutes = 60) {

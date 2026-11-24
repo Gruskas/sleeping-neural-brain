@@ -83,15 +83,21 @@ class TestNeuralLanguageModels(unittest.TestCase):
         enc_s, enc_e = enc.train_contrastive(pairs, tok, epochs=10, lr=2e-3)
         self.assertLess(enc_e, enc_s)
 
-        lm = CorticalTransformerLM(vocab_size=4096, d_model=128, n_layers=2, n_heads=4, ff_dim=256, max_seq_len=96).to(device)
-        seqs = [f"<Q> {q} <A> {a}" for q, a in pairs]
-        lm_s, lm_e = lm.train_sleep_replay(seqs, tok, epochs=12, lr=2e-3)
+        lm = CorticalTransformerLM(vocab_size=4096, d_model=128, n_layers=2, n_heads=4, ff_dim=256, max_seq_len=128).to(device)
+        seqs = [f"<MEM> {a} <CTX> początek rozmowy <USER> {q} <BOT> {a}" for q, a in pairs]
+        lm_s, lm_e = lm.train_sleep_replay(seqs, tok, epochs=18, lr=2e-3)
         self.assertLess(lm_e, lm_s)
+        self.assertGreater(lm.fluency_score, 40.0)
+
+        gen = lm.generate_reply("<MEM> Kunktator to osoba powolna. <CTX> początek rozmowy <USER> kunktator <BOT>", tok, max_new_tokens=30)
+        self.assertIsInstance(gen["text"], str)
+        self.assertGreater(gen["num_tokens"], 0)
 
         exported = lm.export_state()
-        lm2 = CorticalTransformerLM(vocab_size=4096, d_model=128, n_layers=2, n_heads=4, ff_dim=256, max_seq_len=96).to(device)
+        lm2 = CorticalTransformerLM(vocab_size=4096, d_model=128, n_layers=2, n_heads=4, ff_dim=256, max_seq_len=128).to(device)
         lm2.import_state(exported)
         self.assertEqual(lm2.total_parameters(), lm.total_parameters())
+        self.assertEqual(lm2.fluency_score, lm.fluency_score)
 
 
 class TestLanguageCortexStandalone(unittest.TestCase):
@@ -358,6 +364,41 @@ class TestSleepingBrainAndServer(unittest.TestCase):
                     self.assertTrue("tlen" in foto or "glukoz" in foto)
                     self.assertTrue(any(w in brain.chat("ile planet ma Układ Słoneczny")["reply"].lower() for w in ("ośmiu", "8", "merkury")))
                     self.assertIn("966", brain.chat("kiedy był chrzest Polski")["reply"].lower())
+
+                    # Contextual follow-up across turns ("kto to był Mikołaj Kopernik?" -> "a kiedy żył?")
+                    kop1 = brain.chat("kto to był Mikołaj Kopernik?")["reply"]
+                    self.assertIn("kopernik", kop1.lower())
+                    kop2 = brain.chat("a kiedy żył?")["reply"]
+                    self.assertTrue("1473" in kop2 or "1543" in kop2, f"Expected Kopernik years in follow-up, got: {kop2}")
+
+                    # Human 1st/2nd person style & brain naming
+                    name_ack = brain.chat("Twoje imię to Krzysztof, a ja mam na imię Kuba")["reply"]
+                    self.assertNotIn("użytkownik ma na imię", name_ack.lower())
+                    self.assertIn("krzysztof", name_ack.lower())
+                    self.assertIn("krzysztof", brain.chat("jak masz na imię?")["reply"].lower())
+
+                    # Episodic conversation memory across sleep ("pamiętasz co wczenij pisalimi?")
+                    brain.chat("Dzisiaj piszę grę kosmiczną w Pythonie i chciałbym dodać grawitację.")
+                    brain.sleep_now(visual_pacing=False)
+                    ep_ans = brain.chat("pamiętasz co wczenij pisalimi?")["reply"].lower()
+                    self.assertTrue(
+                        any(w in ep_ans for w in ("kosmiczn", "python", "grawitacj", "kopernik", "krzysztof")),
+                        f"Expected episodic recall, got: {ep_ans}",
+                    )
+
+                    # Self-training endpoint POST /api/train_language
+                    req_tr = urllib.request.Request(
+                        f"{srv_url}/api/train_language",
+                        data=json.dumps({"epochs": 10}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    tr_res = json.loads(urllib.request.urlopen(req_tr, timeout=45).read().decode("utf-8"))
+                    self.assertTrue(tr_res["ok"])
+                    self.assertLess(tr_res["loss_end"], tr_res["loss_start"])
+                    self.assertGreater(tr_res["fluency"], 40.0)
+                    st2 = json.loads(urllib.request.urlopen(f"{srv_url}/api/state", timeout=5).read().decode("utf-8"))
+                    self.assertGreater(st2["language_cortex"]["fluency"], 40.0)
                 finally:
                     httpd.shutdown()
                     httpd.server_close()

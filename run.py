@@ -18,6 +18,9 @@ def run_cli(brain: SleepingBrain) -> None:
         return
     print("Gotowe! Pisz normalnie po polsku. Komendy specjalne:")
     print("  /ucz <temat|URL> -> mózg sam bada temat lub link w sieci aż go opanuje")
+    print("  /szkola          -> wgraj pakiet podstawowy (Szkoła Podstawowa ~140 pojęć + trening GPU)")
+    print("  /szkola siec     -> autonomiczny kurs 12 tematów szkolnych z Wikipedii")
+    print("  /wyksztalc       -> wykształć/dotrenuj własny model językowy PyTorch na GPU")
     print("  /sen             -> uśpij mózg (NREM + trening sieci PyTorch na GPU + REM)")
     print("  /pamiec          -> pokaż hipokamp, pamięć trwałą, refleksje REM")
     print("  /rdzen           -> pokaż skondensowany rdzeń wiedzy NREM")
@@ -93,6 +96,21 @@ def run_cli(brain: SleepingBrain) -> None:
                 print(f"--- REFLEKSJE REM ({m['rem_reflection_count']}) ---")
                 for r in m["rem_reflections"][-10:]:
                     print(f"  ✨ {r['text']}")
+                continue
+            if low in ("/szkola", "/szkoła", "/podstawy"):
+                print("\n[🎓 SZKOŁA PODSTAWOWA] Wgrywam fundamenty 9 przedmiotów i trenuję na GPU...")
+                res = brain.learn_elementary_foundation(consolidate=True)
+                print(f"[GOTOWE] Dodano {res['added_facts']} faktów, {res['added_triples']} relacji. Pamięć trwała: {res['total_semantic']}.")
+                continue
+            if low in ("/szkola siec", "/szkoła sieć", "/szkola web"):
+                print("\n[📚 KURS SZKOLNY Z SIECI] Rozpoczynam badanie tematów szkolnych w Wikipedii...")
+                res = brain.run_curriculum_online(max_topics=12)
+                print(f"[GOTOWE] Przeczytano {res['pages_read']} stron, zapisano {res['facts_learned']} faktów.")
+                continue
+            if low in ("/wyksztalc", "/wykształć", "/trenuj"):
+                print("\n[🗣️ SAMOKSZTAŁCENIE JĘZYKOWE] Trenuję model językowy PyTorch na GPU...")
+                res = brain.train_language_now()
+                print(f"[GOTOWE] Dialogów: {res['dialogues']} | Loss: {res['loss_start']}→{res['loss_end']} | Płynność: {res['fluency']:.0f}%")
                 continue
             if low.startswith("/ucz "):
                 topic = raw[5:].strip()
