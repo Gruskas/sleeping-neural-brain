@@ -466,6 +466,7 @@
         <div class="chips" style="margin-top:2px">
           <button id="schoolBtn" class="primary" onclick="installSchoolFoundation()" style="padding:5px 10px;font-size:12px">🎓 Szkoła Podstawowa (Wgraj podstawy + GPU)</button>
           <button id="schoolWebBtn" onclick="startSchoolWebCourse()" style="padding:5px 10px;font-size:12px">📚 Kurs szkolny z Wikipedii</button>
+          <button id="continuousStudyBtn" class="study-btn" onclick="startContinuousLearning(60)" style="padding:5px 10px;font-size:12px" title="Zostaw mózg na godzinę — sam będzie uczyć się kolejnych tematów z sieci i konsolidować wiedzę we śnie na GPU">⏱️ Auto-nauka 1h (z netu + sen GPU)</button>
         </div>
         <div id="studyProgress" class="study-progress">
           <div style="display:flex;justify-content:space-between;align-items:center">
@@ -854,6 +855,8 @@
       document.getElementById("studyBtn").disabled = !lc.ready || studying;
       document.getElementById("schoolBtn").disabled = !lc.ready || studying;
       document.getElementById("schoolWebBtn").disabled = !lc.ready || studying;
+      const contBtn = document.getElementById("continuousStudyBtn");
+      if (contBtn) contBtn.disabled = !lc.ready || studying;
       document.getElementById("stopStudyBtn").style.display = studying ? "inline-block" : "none";
 
       // Study live progress
@@ -1165,6 +1168,12 @@
     async function startSchoolWebCourse() {
       const res = await api("/api/curriculum", { deep_web: true, max_topics: 12 });
       if (!res.ok) alert(res.error || "Nie udało się uruchomić kursu szkolnego.");
+      await poll();
+    }
+
+    async function startContinuousLearning(minutes = 60) {
+      const res = await api("/api/study/continuous", { duration_minutes: minutes });
+      if (!res.ok) alert(res.error || "Nie udało się uruchomić auto-nauki.");
       await poll();
     }
 

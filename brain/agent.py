@@ -13,6 +13,7 @@ import torch
 
 from .config import BrainConfig
 from .curriculum import (
+    BROAD_AUTONOMOUS_SYLLABUS,
     ELEMENTARY_FOUNDATION_PACK,
     ELEMENTARY_FOUNDATION_TRIPLES,
     ELEMENTARY_WEB_SYLLABUS,
@@ -425,6 +426,187 @@ class SleepingBrain:
                 )
             self.save_state()
             return {"pages_read": total_pages, "facts_learned": total_facts}
+        finally:
+            with self.lock:
+                self.study_state["active"] = False
+                self.study_state["current_action"] = ""
+                if self.state_mode == "STUDYING":
+                    self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
+            self._release_op("study")
+
+    def start_continuous_learning_async(self, duration_minutes: int = 60) -> dict[str, Any]:
+        """Start autonomous multi-topic web learning + periodic GPU sleep for `duration_minutes`."""
+        mins = max(1, min(480, int(duration_minutes)))
+        self._acquire_op("study")
+        with self.lock:
+            self._study_stop_event.clear()
+            self.state_mode = "STUDYING"
+            self.study_state = {
+                "active": True,
+                "topic": f"Auto-nauka z sieci ({mins} min)",
+                "round": 0,
+                "max_rounds": mins,
+                "mastery": 0.0,
+                "pages_read": 0,
+                "facts_learned": 0,
+                "current_action": f"Przygotowuję autonomiczną sesję nauki ({mins} min)...",
+                "sources": [],
+                "summary": "",
+            }
+        try:
+            t = threading.Thread(
+                target=self.run_continuous_learning,
+                args=(mins, True),
+                daemon=True,
+            )
+            t.start()
+        except Exception:
+            with self.lock:
+                self.study_state["active"] = False
+                self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
+            self._release_op("study")
+            raise
+        return {"started": True, "duration_minutes": mins}
+
+    def run_continuous_learning(self, duration_minutes: int = 60, _op_acquired: bool = False) -> dict[str, Any]:
+        if not _op_acquired:
+            self._acquire_op("study")
+        mins = max(1, min(480, int(duration_minutes)))
+        deadline = time.monotonic() + mins * 60.0
+        try:
+            with self.lock:
+                self._study_stop_event.clear()
+                self.state_mode = "STUDYING"
+                self._append_chat(
+                    "assistant",
+                    f"🚀 Rozpoczynam ciągłą autonomiczną naukę z internetu na **{mins} minut**! "
+                    f"Będę uczyć się kolejnych tematów po kolei i co kilka tematów zasypiać, żeby utrwalać wiedzę na GPU.",
+                    meta={"kind": "study_start", "topic": f"Auto-nauka {mins} min"},
+                    add_to_working=False,
+                )
+
+            foundation_res = self.learn_elementary_foundation(consolidate=True, _from_nested=True)
+            total_pages = 0
+            total_facts = int(foundation_res.get("added_facts", 0))
+            topics_done = 0
+            sleeps_done = 1 if foundation_res.get("sleep_report") else 0
+            seen_urls: set[str] = set()
+            sources_list: list[dict[str, str]] = []
+            since_last_sleep = 0
+
+            def _next_topic() -> str | None:
+                with self.lock:
+                    studied_lower = set(self.hippocampus.studied_topics.keys())
+                    for t in BROAD_AUTONOMOUS_SYLLABUS:
+                        if t.lower() not in studied_lower:
+                            return t
+                    for cname in list(self.concept_cortex.id_to_concept.values()):
+                        if len(cname) >= 4 and cname.lower() not in studied_lower and " " not in cname[:3]:
+                            return cname
+                return None
+
+            while time.monotonic() < deadline and not self._study_stop_event.is_set():
+                topic = _next_topic()
+                if not topic:
+                    break
+                topics_done += 1
+                rem_min = max(1, int((deadline - time.monotonic()) / 60.0) + 1)
+                with self.lock:
+                    self.state_mode = "STUDYING"
+                    self.study_state["round"] = topics_done
+                    self.study_state["topic"] = f"Auto-nauka ({rem_min} min): {topic}"
+                    self.study_state["current_action"] = f"Temat #{topics_done}: badam „{topic}” w sieci..."
+
+                docs = gather_web_sources(
+                    query=topic,
+                    seen_urls=seen_urls,
+                    max_docs=2,
+                    timeout=self.cfg.study_http_timeout,
+                    max_workers=self.cfg.study_fetch_workers,
+                )
+                topic_facts_count = 0
+                for doc in docs:
+                    if self._study_stop_event.is_set() or time.monotonic() >= deadline:
+                        break
+                    total_pages += 1
+                    self.study_state["pages_read"] = total_pages
+                    sources_list.append({"title": doc.title, "url": doc.url, "source": doc.source})
+                    self.study_state["sources"] = sources_list[-12:]
+                    lead_def = extract_lead_definition(doc)
+                    if lead_def:
+                        emb_l = self.language_cortex.encode_text(lead_def)
+                        with self.lock:
+                            self.hippocampus.record_memory(
+                                text=lead_def,
+                                category="nauka_z_sieci",
+                                importance=5,
+                                day=self.day,
+                                embedding=emb_l,
+                                source_url=doc.url,
+                                topic=topic,
+                            )
+                            topic_facts_count += 1
+                            total_facts += 1
+                            self.study_state["facts_learned"] = total_facts
+                    for ch in chunk_text(doc.text, focus_query=topic, max_chars=2400, max_chunks=2):
+                        if self._study_stop_event.is_set():
+                            break
+                        extracted = self.language_cortex.study_document_chunk(topic, doc.title, ch)
+                        facts = extracted.get("facts", [])
+                        fact_embs = self.language_cortex.encode_texts([item["text"] for item in facts])
+                        with self.lock:
+                            for item, emb in zip(facts, fact_embs):
+                                self.hippocampus.record_memory(
+                                    text=item["text"],
+                                    category="nauka_z_sieci",
+                                    importance=item.get("importance", 4),
+                                    day=self.day,
+                                    embedding=emb,
+                                    source_url=doc.url,
+                                    topic=topic,
+                                )
+                                topic_facts_count += 1
+                                total_facts += 1
+                                self.study_state["facts_learned"] = total_facts
+                            for s, rel, d in extracted.get("triples", []):
+                                self.hippocampus.record_fact(s, rel, d, day=self.day, source="AUTO_WEB")
+
+                with self.lock:
+                    self.hippocampus.studied_topics[topic.lower()] = {
+                        "topic": topic,
+                        "mastery": 85.0 if topic_facts_count > 0 else 40.0,
+                        "facts_learned": topic_facts_count,
+                        "pages_read": len(docs),
+                        "day": self.day,
+                        "summary": f"Zebrano {topic_facts_count} faktów.",
+                        "sources": sources_list[-4:],
+                    }
+                    elapsed_pct = min(99.0, max(2.0, ((mins * 60.0 - max(0.0, deadline - time.monotonic())) / (mins * 60.0)) * 100.0))
+                    self.study_state["mastery"] = round(elapsed_pct, 1)
+
+                since_last_sleep += 1
+                if since_last_sleep >= 4 or self.energy <= self.cfg.sleep_threshold:
+                    self.study_state["current_action"] = "Konsolidacja zdobytej wiedzy we śnie (NREM + REM na GPU)..."
+                    self.sleep_now(visual_pacing=False, _from_nested=True)
+                    sleeps_done += 1
+                    since_last_sleep = 0
+
+            if self.hippocampus.short_term_memories:
+                self.study_state["current_action"] = "Końcowa konsolidacja wiedzy na GPU..."
+                self.sleep_now(visual_pacing=False, _from_nested=True)
+                sleeps_done += 1
+
+            with self.lock:
+                self._append_chat(
+                    "assistant",
+                    f"✅ Zakończyłem ciągłą naukę z sieci! Przerobiłem **{topics_done} tematów** "
+                    f"({total_pages} stron, **+{total_facts} faktów**, {sleeps_done} cykli snu na GPU). "
+                    f"Możesz teraz ze mną rozmawiać i pytać o zdobytą wiedzę!",
+                    meta={"kind": "study_done", "topic": "Auto-nauka", "facts": total_facts},
+                    add_to_working=False,
+                )
+            self.save_state()
+            return {"topics": topics_done, "pages": total_pages, "facts": total_facts, "sleeps": sleeps_done}
         finally:
             with self.lock:
                 self.study_state["active"] = False
@@ -991,6 +1173,7 @@ class SleepingBrain:
             user_profile=prep.get("user_profile", []),
         )
         if self.auto_web and missing_topic:
+            prev_count = len(prep["learned_memories"])
             sources = self._quick_web_lookup(missing_topic, msg, prep)
             if sources:
                 reply2, still_missing = self.language_cortex._chat_reply_with_meta(
@@ -1006,9 +1189,13 @@ class SleepingBrain:
                     state_mode=prep["state_mode"],
                     user_profile=prep.get("user_profile", []),
                 )
+                src_note = ", ".join(sources[:2])
                 if not still_missing:
-                    src_note = ", ".join(sources[:2])
                     return f"{reply2}\n\n*Sprawdzone w sieci:* {src_note}"
+                fresh_facts = [m["text"] for m in prep["learned_memories"][prev_count:prev_count + 3]]
+                if fresh_facts:
+                    joined = " ".join(f.rstrip(".") + "." for f in fresh_facts)
+                    return f"{joined}\n\n*Sprawdzone w sieci:* {src_note}"
         return reply
 
     # ── Natural Polish Chat + Automatic Human-like Memory Encoding ────────────
@@ -1057,6 +1244,22 @@ class SleepingBrain:
                 "recalled_memories": {},
             }
 
+        if msg.lower().startswith("/ucz auto"):
+            parts = msg.split()
+            mins = 60
+            if len(parts) >= 3 and parts[2].isdigit():
+                mins = int(parts[2])
+            with self.lock:
+                self._append_chat("user", msg, add_to_working=False)
+            info = self.start_continuous_learning_async(duration_minutes=mins)
+            return {
+                "reply": f"🚀 Rozpoczynam ciągłą autonomiczną naukę z sieci na {info['duration_minutes']} min! Obserwuj pasek postępu u góry.",
+                "study_started": True,
+                "slept": False,
+                "learned_memories": [],
+                "recalled_memories": {},
+            }
+
         study_topic = self._parse_web_study_intent(msg)
         if study_topic:
             with self.lock:
@@ -1089,7 +1292,7 @@ class SleepingBrain:
         if not msg:
             raise ValueError("Wiadomość nie może być pusta.")
 
-        if msg.lower() in ("/sen", "/sleep", "idź spać", "idz spac", "/szkola", "/szkoła", "/podstawy", "/szkola siec", "/szkoła sieć", "/szkola web"):
+        if msg.lower() in ("/sen", "/sleep", "idź spać", "idz spac", "/szkola", "/szkoła", "/podstawy", "/szkola siec", "/szkoła sieć", "/szkola web") or msg.lower().startswith("/ucz auto"):
             res = self.chat(msg)
             yield {"type": "done", **res}
             return

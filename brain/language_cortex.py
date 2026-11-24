@@ -1044,11 +1044,17 @@ class LanguageCortex:
         with self._op_lock:
             lm_scores = self.transformer_lm.sequence_scores(candidates, self.tokenizer)
 
-        ranked: list[tuple[float, float, float, str, list[float]]] = []
+        ranked: list[tuple[float, float, float, int, str, list[float]]] = []
         for cand, cvec, lms in zip(candidates, cand_vecs, lm_scores):
             ov_subj = _stem_overlap(subj, cand)
             ov_msg = _stem_overlap(msg, cand)
             ov = max(ov_subj, ov_msg)
+            cand_stems = set(_tokenize_stems(cand))
+            subj_stems = _tokenize_stems(subj)
+            matched_subj_words = sum(
+                1 for sw in subj_stems
+                if any(cs == sw or (len(sw) >= 4 and len(cs) >= 4 and cs[:4] == sw[:4]) for cs in cand_stems)
+            )
             subj_cos = _cosine_list(subj_vec, cvec)
             msg_cos = _cosine_list(msg_vec, cvec)
             cos = 0.75 * subj_cos + 0.25 * msg_cos
@@ -1056,31 +1062,46 @@ class LanguageCortex:
             def_bonus = 0.14 if is_def else 0.0
             lm_bonus = max(-0.05, min(0.08, (lms + 6.0) * 0.015))
             total = 0.48 * ov + 0.36 * cos + def_bonus + lm_bonus
-            ranked.append((total, ov, subj_cos, cand, cvec))
+            ranked.append((total, ov, subj_cos, matched_subj_words, cand, cvec))
 
         ranked.sort(key=lambda x: x[0], reverse=True)
-        top_score, top_ov, top_subj_cos, _, _ = ranked[0]
+        top_score, top_ov, top_subj_cos, top_matched_words, _, _ = ranked[0]
 
-        # Anti-hallucination gate: require genuine relevance to the asked subject
-        if top_ov < 0.25 and top_subj_cos < 0.52:
+        # Anti-hallucination gate: require genuine relevance to the asked subject.
+        # When the subject has 2+ content words (e.g. "gwałt na uszy"), matching only 1 incidental word is not enough.
+        multi_word_mismatch = len(subj_words) >= 2 and top_matched_words < 2 and top_subj_cos < 0.68
+        if (top_ov < 0.25 and top_subj_cos < 0.52) or multi_word_mismatch:
             if is_non_topic_phrase:
                 return (
                     "Nie do końca rozumiem, o jaki temat pytasz. Zadaj proszę pytanie o konkretne pojęcie "
                     "albo wpisz `/szkola`, abym wgrał podstawową wiedzę szkolną.",
                     None,
                 )
+            lookup_subj = subj
+            if len(subj_words) == 1 and recent_turns:
+                for t in reversed(recent_turns):
+                    if t.get("role") == "user":
+                        prev_subj = _extract_query_subject(t.get("content", ""))
+                        prev_words = [w for w in re.findall(r"[a-z0-9+#]{3,}", _strip_pl(prev_subj.lower())) if w not in _STOPWORDS_PL]
+                        if prev_words and prev_subj.lower() != subj.lower():
+                            lookup_subj = f"{subj} {prev_words[-1]}"
+                        break
             return (
                 f"Nie jestem pewien odpowiedzi na temat „{subj}” — nie znalazłem pasujących faktów w pamięci. "
-                f"Użyj `/ucz {subj}`, abym zbadał ten temat w internecie!",
-                subj,
+                f"Użyj `/ucz {lookup_subj}`, abym zbadał ten temat w internecie!",
+                lookup_subj,
             )
 
-        relevant = [item for item in ranked if item[1] >= 0.25 or item[2] >= max(0.50, top_subj_cos - 0.06)]
+        relevant = [
+            item for item in ranked
+            if (item[1] >= 0.25 or item[2] >= max(0.50, top_subj_cos - 0.06))
+            and not (len(subj_words) >= 2 and item[3] < 2 and item[2] < 0.68)
+        ]
         chosen_texts: list[str] = []
         chosen_vecs: list[list[float]] = []
         max_facts = 3 if any(w in low for w in ("krotko", "w skrocie")) else 5
 
-        for _, _, _, cand, cvec in relevant:
+        for _, _, _, _, cand, cvec in relevant:
             if any(_cosine_list(cvec, pv) > 0.84 for pv in chosen_vecs):
                 continue
             chosen_texts.append(cand)
@@ -1089,7 +1110,7 @@ class LanguageCortex:
                 break
 
         if not chosen_texts:
-            chosen_texts = [ranked[0][3]]
+            chosen_texts = [ranked[0][4]]
 
         lead = chosen_texts[0].rstrip(".") + "."
         extras = [t.rstrip(".") + "." for t in chosen_texts[1:]]

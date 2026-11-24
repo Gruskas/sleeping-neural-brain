@@ -115,6 +115,8 @@ ELEMENTARY_FOUNDATION_PACK: list[dict[str, Any]] = [
     {"topic": "Informatyka — jednostki danych", "importance": 4, "category": "wiedza", "text": "Jednostki pojemności pamięci: 1 kilobajt (KB) to około tysiąca bajtów (1024 B), następnie megabajt (MB), gigabajt (GB) i terabajt (TB)."},
     {"topic": "Informatyka — programowanie", "importance": 5, "category": "wiedza", "text": "W programowaniu zmienna przechowuje wartość, instrukcja warunkowa (if/else) podejmuje decyzje, pętla (for/while) powtarza działania, a funkcja grupuje kod wielokrotnego użycia."},
     {"topic": "Informatyka — internet", "importance": 4, "category": "wiedza", "text": "Internet to ogólnoświatowa sieć komputerowa łącząca urządzenia za pomocą protokołów TCP/IP oraz adresów IP i domen (DNS)."},
+    {"topic": "Informatyka — podzespoły komputera", "importance": 5, "category": "wiedza", "text": "Komputer składa się z podzespołów: procesora (CPU), płyty głównej, pamięci operacyjnej RAM, karty graficznej (GPU), dysku SSD lub HDD, zasilacza (PSU), układu chłodzenia oraz obudowy."},
+    {"topic": "Informatyka — podzespoły komputera", "importance": 5, "category": "wiedza", "text": "Płyta główna łączy wszystkie podzespoły komputera, pamięć RAM przechowuje dane aktualnie uruchomionych programów, a dysk SSD przechowuje system i pliki na stałe."},
 
     # ── 9. Wiedza codzienna ──────────────────────────────────────────────────
     {"topic": "Wiedza codzienna — kalendarz", "importance": 5, "category": "wiedza", "text": "Tydzień ma siedem dni: poniedziałek, wtorek, środa, czwartek, piątek, sobota i niedziela."},
@@ -248,4 +250,22 @@ ELEMENTARY_WEB_SYLLABUS: list[str] = [
     "Internet",
     "Ekologia",
     "Demokracja",
+]
+
+# Broad multi-domain Polish Wikipedia syllabus for long autonomous learning sessions (e.g. 1 hour+)
+BROAD_AUTONOMOUS_SYLLABUS: list[str] = ELEMENTARY_WEB_SYLLABUS + [
+    "Komputer", "Podzespoły komputera", "Płyta główna", "Pamięć RAM", "Karta graficzna",
+    "Dysk SSD", "Sztuczna inteligencja", "Sieć neuronowa", "Uczenie maszynowe",
+    "Język programowania Python", "System operacyjny", "Linux", "Kryptografia",
+    "Czarna dziura", "Droga Mleczna", "Wielki Wybuch", "Teoria względności",
+    "Mechanika kwantowa", "DNA", "Ewolucja", "Mózg człowieka", "Układ nerwowy",
+    "Układ odpornościowy", "Szczepionka", "Antybiotyk", "Witamina",
+    "Zmiany klimatu", "Energia odnawialna", "Energia jądrowa", "Fotowoltaika",
+    "Rewolucja przemysłowa", "Starożytny Rzym", "Starożytna Grecja", "Starożytny Egipt",
+    "Średniowiecze", "Renesans", "Oświecenie", "Zimna wojna", "Unia Europejska",
+    "Ekonomia", "Inflacja", "Pieniądz", "Giełda", "Psychologia", "Pamięć człowieka",
+    "Sen", "Emocje", "Filozofia", "Logika", "Etyka", "Socjologia",
+    "Literatura polska", "Romantyzm", "Muzyka klasyczna", "Architektura",
+    "Fotografia", "Kinematografia", "Astronomia", "Geologia", "Wulkan",
+    "Trzęsienie ziemi", "Ocean", "Pustynia", "Las deszczowy",
 ]
