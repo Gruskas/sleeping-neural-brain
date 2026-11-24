@@ -40,7 +40,7 @@ class BrainConfig:
 
     # Self-Contained PyTorch Neural Language & Semantic Cortex (100% local on GPU)
     language_model_id: str = "Autonomiczna-Kora-PyTorch-v2"
-    vocab_size: int = 16384
+    vocab_size: int = 32768
     ngram_buckets: int = 2048
     embed_dim: int = 256
     cortex_dim: int = 384
