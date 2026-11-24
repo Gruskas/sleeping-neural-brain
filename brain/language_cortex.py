@@ -1011,7 +1011,7 @@ class LanguageCortex:
         user_msg: str,
         reference_texts: list[str],
     ) -> str | None:
-        if self.transformer_lm.fluency_score < 70.0 or not reference_texts:
+        if self.transformer_lm.fluency_score < 45.0 or not reference_texts:
             return None
         prompt = (
             f"<MEM> {mem_hint[:220] if mem_hint else 'brak'} "
@@ -1019,18 +1019,59 @@ class LanguageCortex:
             f"<USER> {user_msg[:120]} <BOT>"
         )
         with self._op_lock:
-            gen = self.transformer_lm.generate_reply(prompt, self.tokenizer, max_new_tokens=75, temperature=0.20)
+            gen = self.transformer_lm.generate_reply(prompt, self.tokenizer, max_new_tokens=75, temperature=0.28)
         cand = gen["text"].strip()
-        if len(cand) < 18 or gen["mean_prob"] < 0.68:
+        if len(cand) < 18 or gen["mean_prob"] < 0.50:
             return None
         ref_blob = " ".join(reference_texts)
         ref_nums = set(re.findall(r"\d+", ref_blob))
         gen_nums = set(re.findall(r"\d+", cand))
         if gen_nums and not gen_nums.issubset(ref_nums):
             return None
-        if _stem_overlap(cand, ref_blob) < 0.30:
+        if _stem_overlap(cand, ref_blob) < 0.28:
             return None
         return cand
+
+    def _compose_human_reply(
+        self,
+        subj: str,
+        chosen_texts: list[str],
+        is_contextual_followup: bool,
+        active_subject: str,
+    ) -> str:
+        """Turn grounded memory facts into natural, conversational Polish prose ranked by the Transformer LM."""
+        cleaned = [clean_human_fact(t) for t in chosen_texts if clean_human_fact(t)]
+        if not cleaned:
+            cleaned = [t.rstrip(".") + "." for t in chosen_texts]
+
+        lead = cleaned[0].rstrip(".") + "."
+        lead_body = lead[0].lower() + lead[1:] if len(lead) > 1 and lead[0].isupper() and not lead[:3].isupper() else lead
+
+        if is_contextual_followup and active_subject and active_subject.lower() not in lead.lower():
+            base_variants = [f"Jeśli chodzi o {active_subject}, to {lead_body}"]
+        else:
+            base_variants = [
+                f"Najprościej mówiąc: {lead_body}",
+                f"Z tego co pamiętam, {lead_body}",
+                lead,
+            ]
+
+        if len(base_variants) > 1:
+            with self._op_lock:
+                scores = self.transformer_lm.sequence_scores(base_variants, self.tokenizer)
+            best_idx = max(range(len(base_variants)), key=lambda i: scores[i])
+            main_text = base_variants[best_idx]
+        else:
+            main_text = base_variants[0]
+
+        if len(cleaned) > 1:
+            extra = cleaned[1].rstrip(".") + "."
+            extra_body = extra[0].lower() + extra[1:] if len(extra) > 1 and extra[0].isupper() and not extra[:3].isupper() else extra
+            main_text = f"{main_text} Warto też dodać, że {extra_body}"
+        if len(cleaned) > 2:
+            extra2 = cleaned[2].rstrip(".") + "."
+            main_text = f"{main_text} {extra2}"
+        return main_text.strip()
 
     def chat_reply(
         self,
@@ -1411,12 +1452,12 @@ class LanguageCortex:
 
         relevant = [
             item for item in ranked
-            if (item[1] >= 0.25 or item[2] >= max(0.50, top_subj_cos - 0.06))
+            if (item[1] >= 0.30 or item[2] >= max(0.58, top_subj_cos - 0.05))
             and not (len(eff_words) >= 2 and item[3] < 2 and item[2] < 0.68)
         ]
         chosen_texts: list[str] = []
         chosen_vecs: list[list[float]] = []
-        max_facts = 2 if any(w in low for w in ("krotko", "w skrocie")) else 4
+        max_facts = 1 if any(w in low for w in ("krotko", "w skrocie")) else 3
 
         for _, _, _, _, cand, cvec in relevant:
             if any(_cosine_list(cvec, pv) > 0.84 for pv in chosen_vecs):
@@ -1439,24 +1480,20 @@ class LanguageCortex:
         if lm_reply:
             final_reply = lm_reply
         else:
-            lead = chosen_texts[0].rstrip(".") + "."
-            extras = [t.rstrip(".") + "." for t in chosen_texts[1:]]
-            if is_contextual_followup and active_subject and active_subject.lower() not in lead.lower():
-                lead_body = lead[0].lower() + lead[1:] if lead[0].isupper() and not lead[:3].isupper() else lead
-                parts = [f"Jeśli chodzi o {active_subject}, to {lead_body}"]
-            else:
-                parts = [lead]
-            if extras:
-                parts.append(" ".join(extras))
+            final_reply = self._compose_human_reply(
+                subj=effective_subj,
+                chosen_texts=chosen_texts,
+                is_contextual_followup=is_contextual_followup,
+                active_subject=active_subject,
+            )
             if ("wskaznik" in low or "wskaźnik" in low) and ("c++" in low or "cpp" in low):
-                parts.append(
+                final_reply += (
                     "\n```cpp\n"
                     "int liczba = 42;\n"
                     "int* wskaznik = &liczba; // przechowuje adres zmiennej\n"
                     "int wartosc = *wskaznik; // dereferencja -> 42\n"
                     "```"
                 )
-            final_reply = "\n".join(parts).strip()
 
         if state_mode == "DROWSY" or energy <= self.cfg.drowsy_threshold:
             final_reply += "\n(Jestem już lekko śpiący — przyda się `/sen`, żebym utrwalił nowe rzeczy na GPU.)"

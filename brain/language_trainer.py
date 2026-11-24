@@ -48,7 +48,10 @@ def clean_human_fact(raw: str) -> str:
     s = re.sub(r"==+[^=]+==+", " ", s)
     s = re.sub(r"\[\d+\]|\[[a-z]\]", "", s)
     s = re.sub(r"\(\d+\.\d+\)", "", s)
+    s = re.sub(r"\(\s*(?:z\s+)?(?:gr\.|łac\.|ang\.|fr\.|niem\.|ros\.)[^)]{0,80}\)", "", s, flags=re.I)
     s = re.sub(r"\([a-ząćęłńóśźż]{1,6}\.\s*$", "", s, flags=re.I)  # broken trailing '(łac.'
+    # Convert encyclopedic "X – Y" into natural spoken "X to Y"
+    s = re.sub(r"^([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9\s]{2,40}?)\s+[–—-]\s+([a-ząćęłńóśźż])", r"\1 to \2", s)
     s = re.sub(r"\s+", " ", s).strip(" ;,-")
     if s and s[-1] not in ".!?":
         s += "."
@@ -141,17 +144,19 @@ def build_training_dialogues(
         seen_facts.add(key)
 
         # Extract candidate subject from the beginning of the sentence
+        lower_body = clean[0].lower() + clean[1:] if len(clean) > 1 and not clean[:2].isupper() else clean
         m_subj = re.match(r"^([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#\s„”-]{2,42}?)\s+(?:to|jest|są|oznacza|był|była|składa się|ma)\b", clean)
         if m_subj:
             subj = m_subj.group(1).strip(" „”:-")
             if 2 <= len(subj) <= 36:
-                add_seq(clean, "", f"co wiesz o: {subj}?", clean)
-                add_seq(clean, f"Rozmawialiśmy o: {subj}.", "powiedz coś więcej na ten temat", f"Jeśli chodzi o {subj}, to {clean[0].lower() + clean[1:]}")
+                add_seq(clean, "", f"co to jest {subj}?", f"Najprościej mówiąc: {lower_body}")
+                add_seq(clean, "", f"co wiesz o {subj}?", f"Z tego co pamiętam, {lower_body}")
+                add_seq(clean, f"Rozmawialiśmy o: {subj}.", "powiedz coś więcej na ten temat", f"Jeśli chodzi o {subj}, to {lower_body}")
         else:
             words = re.findall(r"[A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#]{4,}", clean)
             if words:
                 hint = " ".join(words[:2])
-                add_seq(clean, "", f"wyjaśnij krótko {hint}", clean)
+                add_seq(clean, "", f"wyjaśnij krótko {hint}", f"W skrócie: {lower_body}")
 
         if len(sequences) >= max_total - 40:
             break
