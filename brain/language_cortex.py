@@ -292,6 +292,7 @@ class LanguageCortex:
         self.lora_updates_count: int = 0
         self.core_knowledge_summary: str = ""
         self.online_dialogues: list[str] = []
+        self.last_thinking_steps: list[str] = []
         self.available_models: list[str] = [cfg.language_model_id]
         self.status_message: str = ""
         self._refresh_status()
@@ -1038,6 +1039,8 @@ class LanguageCortex:
         chosen_texts: list[str],
         is_contextual_followup: bool,
         active_subject: str,
+        rem_reflections: list[str] | None = None,
+        concept_hints: list[str] | None = None,
     ) -> str:
         """Turn grounded memory facts into natural, conversational Polish prose ranked by the Transformer LM."""
         cleaned = [clean_human_fact(t) for t in chosen_texts if clean_human_fact(t)]
@@ -1071,6 +1074,18 @@ class LanguageCortex:
         if len(cleaned) > 2:
             extra2 = cleaned[2].rstrip(".") + "."
             main_text = f"{main_text} {extra2}"
+
+        # Weave in a matching REM reflection or EWC graph association for deeper reasoning
+        if rem_reflections:
+            rel_rem = [r for r in rem_reflections if _stem_overlap(subj, r) >= 0.25]
+            if rel_rem:
+                r_clean = clean_human_fact(rel_rem[0])
+                if r_clean and r_clean.lower() not in main_text.lower():
+                    main_text = f"{main_text} Patrząc szerzej: {r_clean}"
+        elif concept_hints:
+            rel_hints = [h for h in concept_hints if _stem_overlap(subj, h) >= 0.25]
+            if rel_hints:
+                main_text = f"{main_text} (Powiązane pojęcia w grafie: {rel_hints[0]}.)"
         return main_text.strip()
 
     def chat_reply(
@@ -1124,6 +1139,8 @@ class LanguageCortex:
     ) -> tuple[str, str | None]:
         msg = user_message.strip()
         low = _strip_pl(msg.lower()).strip(" ?!.,;:")
+        thinking: list[str] = [f"Analizuję wiadomość: „{msg[:90]}”."]
+        self.last_thinking_steps = thinking
 
         # 1) Correction / disagreement / opinion reaction
         if any(
@@ -1135,6 +1152,7 @@ class LanguageCortex:
                 "zle mowisz", "zle piszesz", "co ty gadasz", "co ty piszesz",
             )
         ):
+            thinking.append("Wykryto niezgodę lub korektę ze strony użytkownika — nie narzucam starego wpisu i proszę o jego wersję.")
             return (
                 "Rozumiem, że masz inne zdanie — dzięki za poprawkę! Nie będę upierać się przy tamtym wpisie. "
                 "Napisz proszę, jak Ty to widzisz zdaniem twierdzącym, albo podaj temat do `/ucz <temat>`, żebym sprawdził inne źródła.",
@@ -1432,14 +1450,24 @@ class LanguageCortex:
             total = 0.48 * ov + 0.36 * cos + def_bonus + date_bonus + lm_bonus
             ranked.append((total, ov, subj_cos, matched_subj_words, cand, cvec))
 
+        thinking.append(
+            f"Temat roboczy: „{effective_subj}”"
+            + (f" (kontekst rozmowy: „{active_subject}”)" if active_subject else "")
+            + f". Przeszukano {len(candidates)} wspomnień."
+        )
         ranked.sort(key=lambda x: x[0], reverse=True)
         top_score, top_ov, top_subj_cos, top_matched_words, _, _ = ranked[0]
+        thinking.append(
+            f"Najlepsze dopasowanie: pokrycie słów={top_ov:.2f}, podobieństwo semantyczne={top_subj_cos:.2f}, "
+            f"trafione rdzenie={top_matched_words}."
+        )
 
         # Never return a random unrelated memory when there is zero lexical overlap
         no_lexical_grounding = top_ov < 0.12
         multi_word_mismatch = len(eff_words) >= 2 and top_matched_words < 2 and top_ov < 0.45
         if no_lexical_grounding or (top_ov < 0.25 and top_subj_cos < 0.55) or multi_word_mismatch:
             if is_non_topic_phrase:
+                thinking.append("Brak wystarczającego pokrycia w pamięci i fraza nie jest nazwą tematu — proszę o doprecyzowanie.")
                 return (
                     "Nie jestem pewien, o jaki dokładnie temat pytasz. Napisz proszę nazwę pojęcia "
                     "albo kliknij `🎓 Szkoła Podstawowa` (`/szkola`).",
@@ -1454,6 +1482,7 @@ class LanguageCortex:
                         if prev_words and prev_subj.lower() != effective_subj.lower():
                             lookup_subj = f"{effective_subj} {prev_words[-1]}"
                         break
+            thinking.append(f"Za mała pewność odpowiedzi dla „{lookup_subj}” — potrzebna nauka z sieci (Auto-sieć lub /ucz).")
             return (
                 f"Nie wiem jeszcze wystarczająco dużo o „{effective_subj}”, żeby nie zmyślać. "
                 f"Wpisz `/ucz {lookup_subj}`, a chętnie się tego nauczę z internetu!",
@@ -1488,13 +1517,23 @@ class LanguageCortex:
             reference_texts=chosen_texts,
         )
         if lm_reply:
+            thinking.append(
+                f"Wygenerowano odpowiedź bezpośrednio przez Transformer LM (płynność {self.transformer_lm.fluency_score:.0f}%) "
+                f"na podstawie {len(chosen_texts)} faktów."
+            )
             final_reply = lm_reply
         else:
+            thinking.append(
+                f"Zsyntetyzowano naturalną odpowiedź z {len(chosen_texts)} faktów i oceniono warianty przez Transformer LM "
+                f"(płynność {self.transformer_lm.fluency_score:.0f}%)."
+            )
             final_reply = self._compose_human_reply(
                 subj=effective_subj,
                 chosen_texts=chosen_texts,
                 is_contextual_followup=is_contextual_followup,
                 active_subject=active_subject,
+                rem_reflections=rem_reflections,
+                concept_hints=concept_hints,
             )
             if ("wskaznik" in low or "wskaźnik" in low) and ("c++" in low or "cpp" in low):
                 final_reply += (

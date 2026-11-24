@@ -1281,6 +1281,7 @@ class SleepingBrain:
                     "recalled_rem": rem_texts[:6],
                     "concept_hints": concept_hints[:6],
                     "learned": [m["text"] for m in learned_memories],
+                    "thinking": prep.get("thinking", [])[:8],
                 },
             )
 
@@ -1426,8 +1427,10 @@ class SleepingBrain:
             episodic_memories=prep.get("episodic_texts", []),
             active_subject=prep.get("active_subject", ""),
         )
+        thinking = list(self.language_cortex.last_thinking_steps)
         if self.auto_web and missing_topic:
             prev_count = len(prep["learned_memories"])
+            thinking.append(f"Uruchamiam Auto-sieć dla tematu „{missing_topic}”...")
             sources = self._quick_web_lookup(missing_topic, msg, prep)
             if sources:
                 reply2, still_missing = self.language_cortex._chat_reply_with_meta(
@@ -1442,14 +1445,21 @@ class SleepingBrain:
                     energy=prep["energy"],
                     state_mode=prep["state_mode"],
                     user_profile=prep.get("user_profile", []),
+                    episodic_memories=prep.get("episodic_texts", []),
+                    active_subject=prep.get("active_subject", ""),
                 )
                 src_note = ", ".join(sources[:2])
                 if not still_missing:
+                    thinking.extend(self.language_cortex.last_thinking_steps[-2:])
+                    prep["thinking"] = thinking
                     return f"{reply2}\n\n*Sprawdzone w sieci:* {src_note}"
                 fresh_facts = [m["text"] for m in prep["learned_memories"][prev_count:prev_count + 3]]
                 if fresh_facts:
+                    thinking.append(f"Zsyntetyzowano odpowiedź z {len(fresh_facts)} świeżych faktów z sieci ({src_note}).")
+                    prep["thinking"] = thinking
                     joined = " ".join(f.rstrip(".") + "." for f in fresh_facts)
                     return f"{joined}\n\n*Sprawdzone w sieci:* {src_note}"
+        prep["thinking"] = thinking
         return reply
 
     # ── Natural Polish Chat + Automatic Human-like Memory Encoding ────────────
@@ -1606,6 +1616,7 @@ class SleepingBrain:
                     "rem": prep["rem_texts"],
                 },
                 "concept_hints": prep["concept_hints"][:6],
+                "thinking": prep.get("thinking", [])[:8],
             }
 
             import time

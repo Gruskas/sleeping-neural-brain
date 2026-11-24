@@ -757,6 +757,9 @@
       if (meta.concept_hints && meta.concept_hints.length) {
         p.push(`<span class="pill pill-graph" onclick="toggleRecallBox('${msgKey}')">🕸️ Skojarzenia (${meta.concept_hints.length})</span>`);
       }
+      if (meta.thinking && meta.thinking.length) {
+        p.push(`<span class="pill pill-rem" onclick="toggleRecallBox('${msgKey}')">💭 Myślenie (${meta.thinking.length})</span>`);
+      }
       if (meta.lora_trained) {
         p.push(`<span class="pill pill-rem">⚡ Rdzeń NREM skonsolidowany</span>`);
       }
@@ -764,6 +767,9 @@
       let details = "";
       if (openRecallBoxes.has(msgKey)) {
         const blocks = [];
+        if (meta.thinking && meta.thinking.length) {
+          blocks.push(`<div><strong>💭 Proces myślenia mózgu:</strong><ol>${meta.thinking.map(x => `<li>${escapeHtml(x)}</li>`).join("")}</ol></div>`);
+        }
         if (meta.learned && meta.learned.length) {
           blocks.push(`<div><strong>Zapamiętano teraz:</strong><ul>${meta.learned.map(x => `<li>${escapeHtml(x)}</li>`).join("")}</ul></div>`);
         }
