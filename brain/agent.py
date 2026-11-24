@@ -447,7 +447,7 @@ class SleepingBrain:
                     self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
             self._release_op("study")
 
-    def start_turbo_learn_async(self, topics_count: int = 35) -> dict[str, Any]:
+    def start_turbo_learn_async(self, topics_count: int = 200) -> dict[str, Any]:
         """Fast parallel multi-topic web learning + GPU sleep + language training."""
         count = max(5, min(len(BROAD_AUTONOMOUS_SYLLABUS), int(topics_count)))
         self._acquire_op("study")
@@ -481,7 +481,7 @@ class SleepingBrain:
             raise
         return {"started": True, "topics": count}
 
-    def run_turbo_learn(self, topics_count: int = 35, _op_acquired: bool = False) -> dict[str, Any]:
+    def run_turbo_learn(self, topics_count: int = 200, _op_acquired: bool = False) -> dict[str, Any]:
         if not _op_acquired:
             self._acquire_op("study")
         count = max(5, min(len(BROAD_AUTONOMOUS_SYLLABUS), int(topics_count)))
@@ -529,13 +529,15 @@ class SleepingBrain:
                 return topic, docs
 
             done_topics = 0
-            with ThreadPoolExecutor(max_workers=6) as pool:
+            since_last_sleep = 0
+            with ThreadPoolExecutor(max_workers=10) as pool:
                 futures = [pool.submit(_fetch_one, t) for t in pending_topics]
                 for fut in as_completed(futures):
                     if self._study_stop_event.is_set():
                         break
                     topic, docs = fut.result()
                     done_topics += 1
+                    since_last_sleep += 1
                     topic_facts = 0
                     for doc in docs:
                         total_pages += 1
@@ -589,9 +591,13 @@ class SleepingBrain:
                         self.study_state["pages_read"] = total_pages
                         self.study_state["facts_learned"] = total_facts
                         self.study_state["sources"] = sources_list[-12:]
-                        self.study_state["topic"] = f"⚡ Turbo-nauka: {topic}"
+                        self.study_state["topic"] = f"⚡ Mega Turbo-nauka: {topic}"
                         self.study_state["mastery"] = round((done_topics / max(1, len(pending_topics))) * 85.0, 1)
                         self.study_state["current_action"] = f"Pobrano {done_topics}/{len(pending_topics)} tematów (+{total_facts} faktów)..."
+                    if since_last_sleep >= 60 and not self._study_stop_event.is_set():
+                        self.study_state["current_action"] = f"Śródokresowy sen na GPU ({done_topics}/{len(pending_topics)} tematów)..."
+                        self.sleep_now(visual_pacing=False, _from_nested=True)
+                        since_last_sleep = 0
 
             if self.hippocampus.short_term_memories and not self._study_stop_event.is_set():
                 self.study_state["current_action"] = "Konsolidacja wiedzy we śnie + kształcenie języka na GPU..."
@@ -1506,6 +1512,22 @@ class SleepingBrain:
                 "recalled_memories": {},
             }
 
+        if msg.lower().startswith("/ucz turbo"):
+            parts = msg.split()
+            cnt = 200
+            if len(parts) >= 3 and parts[2].isdigit():
+                cnt = int(parts[2])
+            with self.lock:
+                self._append_chat("user", msg, add_to_working=False)
+            info = self.start_turbo_learn_async(topics_count=cnt)
+            return {
+                "reply": f"⚡ Rozpoczynam Mega Turbo-naukę ({info['topics']} tematów równolegle + sen GPU + trening języka)! Obserwuj pasek postępu u góry.",
+                "study_started": True,
+                "slept": False,
+                "learned_memories": [],
+                "recalled_memories": {},
+            }
+
         if msg.lower().startswith("/ucz auto"):
             parts = msg.split()
             mins = 60
@@ -1554,7 +1576,7 @@ class SleepingBrain:
         if not msg:
             raise ValueError("Wiadomość nie może być pusta.")
 
-        if msg.lower() in ("/sen", "/sleep", "idź spać", "idz spac", "/szkola", "/szkoła", "/podstawy", "/szkola siec", "/szkoła sieć", "/szkola web", "/wyksztalc", "/wykształć", "/trenuj") or msg.lower().startswith("/ucz auto"):
+        if msg.lower() in ("/sen", "/sleep", "idź spać", "idz spac", "/szkola", "/szkoła", "/podstawy", "/szkola siec", "/szkoła sieć", "/szkola web", "/wyksztalc", "/wykształć", "/trenuj") or msg.lower().startswith("/ucz auto") or msg.lower().startswith("/ucz turbo"):
             res = self.chat(msg)
             yield {"type": "done", **res}
             return

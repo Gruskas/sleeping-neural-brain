@@ -151,7 +151,7 @@ class BrainServer:
                         return
 
                     if parsed.path == "/api/study/turbo":
-                        count = int(body.get("topics_count", 35))
+                        count = int(body.get("topics_count", 200))
                         res = brain.start_turbo_learn_async(topics_count=count)
                         self._send_json({"ok": True, **res})
                         return
