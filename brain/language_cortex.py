@@ -1206,6 +1206,20 @@ class LanguageCortex:
                 None,
             )
 
+        # 2d) Short summary request for the previous assistant reply ("w skrócie", "krótko", "streść")
+        if low in ("w skrocie", "krotko", "krocej", "stresc", "stresc to", "podsumuj", "podsumuj to"):
+            last_bot = ""
+            for t in reversed(recent_turns or []):
+                if t.get("role") == "assistant":
+                    last_bot = t.get("content", "").strip()
+                    break
+            if last_bot:
+                clean_bot = re.sub(r"\*[^*]+:\*.*$", "", last_bot, flags=re.S).strip()
+                sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean_bot) if s.strip()]
+                short_ans = sents[0] if sents else clean_bot[:220]
+                return (f"W skrócie: {short_ans}", None)
+            return ("Napisz najpierw pytanie lub temat, a potem mogę go streścić!", None)
+
         # 3) Farewell
         if low in ("dobranoc", "do zobaczenia", "pa", "nara", "czesc na dzis"):
             sleep_note = " Masz w hipokampie świeże wspomnienia — możesz wpisać `/sen`, abym je utrwalił na GPU." if hippocampus_memories else ""

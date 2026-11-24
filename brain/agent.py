@@ -447,6 +447,178 @@ class SleepingBrain:
                     self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
             self._release_op("study")
 
+    def start_turbo_learn_async(self, topics_count: int = 35) -> dict[str, Any]:
+        """Fast parallel multi-topic web learning + GPU sleep + language training."""
+        count = max(5, min(len(BROAD_AUTONOMOUS_SYLLABUS), int(topics_count)))
+        self._acquire_op("study")
+        with self.lock:
+            self._study_stop_event.clear()
+            self.state_mode = "STUDYING"
+            self.study_state = {
+                "active": True,
+                "topic": f"⚡ Turbo-nauka ({count} tematów)",
+                "round": 0,
+                "max_rounds": count,
+                "mastery": 0.0,
+                "pages_read": 0,
+                "facts_learned": 0,
+                "current_action": f"Uruchamiam równoległe pobieranie {count} tematów...",
+                "sources": [],
+                "summary": "",
+            }
+        try:
+            t = threading.Thread(
+                target=self.run_turbo_learn,
+                args=(count, True),
+                daemon=True,
+            )
+            t.start()
+        except Exception:
+            with self.lock:
+                self.study_state["active"] = False
+                self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
+            self._release_op("study")
+            raise
+        return {"started": True, "topics": count}
+
+    def run_turbo_learn(self, topics_count: int = 35, _op_acquired: bool = False) -> dict[str, Any]:
+        if not _op_acquired:
+            self._acquire_op("study")
+        count = max(5, min(len(BROAD_AUTONOMOUS_SYLLABUS), int(topics_count)))
+        try:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with self.lock:
+                self._study_stop_event.clear()
+                self.state_mode = "STUDYING"
+                self._append_chat(
+                    "assistant",
+                    f"⚡ Rozpoczynam **Turbo-naukę ({count} tematów)**! Pobieram wiedzę równolegle z sieci, "
+                    f"a na koniec przeprowadzę sen na GPU i wykształcę model językowy.",
+                    meta={"kind": "study_start", "topic": f"Turbo-nauka {count} tematów"},
+                    add_to_working=False,
+                )
+
+            foundation_res = self.learn_elementary_foundation(consolidate=False, _from_nested=True)
+            with self.lock:
+                self.state_mode = "STUDYING"
+                studied_lower = set(self.hippocampus.studied_topics.keys())
+                pending_topics = [t for t in BROAD_AUTONOMOUS_SYLLABUS if t.lower() not in studied_lower][:count]
+                if not pending_topics:
+                    pending_topics = list(BROAD_AUTONOMOUS_SYLLABUS[:count])
+                self.study_state["max_rounds"] = max(1, len(pending_topics))
+
+            total_pages = 0
+            total_facts = int(foundation_res.get("added_facts", 0))
+            sources_list: list[dict[str, str]] = []
+            seen_urls: set[str] = set()
+            url_lock = threading.Lock()
+
+            def _fetch_one(topic: str) -> tuple[str, list[Any]]:
+                with url_lock:
+                    local_seen = set(seen_urls)
+                docs = gather_web_sources(
+                    query=topic,
+                    seen_urls=local_seen,
+                    max_docs=1,
+                    timeout=min(8, self.cfg.study_http_timeout),
+                    max_workers=2,
+                )
+                with url_lock:
+                    for d in docs:
+                        seen_urls.add(d.url)
+                return topic, docs
+
+            done_topics = 0
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                futures = [pool.submit(_fetch_one, t) for t in pending_topics]
+                for fut in as_completed(futures):
+                    if self._study_stop_event.is_set():
+                        break
+                    topic, docs = fut.result()
+                    done_topics += 1
+                    topic_facts = 0
+                    for doc in docs:
+                        total_pages += 1
+                        sources_list.append({"title": doc.title, "url": doc.url, "source": doc.source})
+                        lead_def = extract_lead_definition(doc)
+                        if lead_def:
+                            emb_l = self.language_cortex.encode_text(lead_def)
+                            with self.lock:
+                                self.hippocampus.record_memory(
+                                    text=lead_def,
+                                    category="nauka_z_sieci",
+                                    importance=5,
+                                    day=self.day,
+                                    embedding=emb_l,
+                                    source_url=doc.url,
+                                    topic=topic,
+                                )
+                                topic_facts += 1
+                                total_facts += 1
+                        for ch in chunk_text(doc.text, focus_query=topic, max_chars=2200, max_chunks=1):
+                            extracted = self.language_cortex.study_document_chunk(topic, doc.title, ch)
+                            facts = extracted.get("facts", [])[:4]
+                            if facts:
+                                fact_embs = self.language_cortex.encode_texts([item["text"] for item in facts])
+                                with self.lock:
+                                    for item, emb in zip(facts, fact_embs):
+                                        self.hippocampus.record_memory(
+                                            text=item["text"],
+                                            category="nauka_z_sieci",
+                                            importance=item.get("importance", 4),
+                                            day=self.day,
+                                            embedding=emb,
+                                            source_url=doc.url,
+                                            topic=topic,
+                                        )
+                                        topic_facts += 1
+                                        total_facts += 1
+                                    for s, rel, d in extracted.get("triples", [])[:4]:
+                                        self.hippocampus.record_fact(s, rel, d, day=self.day, source="TURBO_WEB")
+                    with self.lock:
+                        self.hippocampus.studied_topics[topic.lower()] = {
+                            "topic": topic,
+                            "mastery": 85.0 if topic_facts > 0 else 40.0,
+                            "facts_learned": topic_facts,
+                            "pages_read": len(docs),
+                            "day": self.day,
+                            "summary": f"Turbo-nauka: {topic_facts} faktów.",
+                            "sources": sources_list[-3:],
+                        }
+                        self.study_state["round"] = done_topics
+                        self.study_state["pages_read"] = total_pages
+                        self.study_state["facts_learned"] = total_facts
+                        self.study_state["sources"] = sources_list[-12:]
+                        self.study_state["topic"] = f"⚡ Turbo-nauka: {topic}"
+                        self.study_state["mastery"] = round((done_topics / max(1, len(pending_topics))) * 85.0, 1)
+                        self.study_state["current_action"] = f"Pobrano {done_topics}/{len(pending_topics)} tematów (+{total_facts} faktów)..."
+
+            if self.hippocampus.short_term_memories and not self._study_stop_event.is_set():
+                self.study_state["current_action"] = "Konsolidacja wiedzy we śnie + kształcenie języka na GPU..."
+                self.study_state["mastery"] = 92.0
+                self.sleep_now(visual_pacing=False, _from_nested=True)
+                self.train_language_now(epochs=16, _from_nested=True)
+
+            self.study_state["mastery"] = 100.0
+            with self.lock:
+                self._append_chat(
+                    "assistant",
+                    f"⚡ Zakończyłem **Turbo-naukę**! Przerobiłem **{done_topics} tematów** "
+                    f"({total_pages} stron, **+{total_facts} faktów**), skonsolidowałem pamięć we śnie "
+                    f"i wykształciłem model językowy na GPU. Możesz już ze mną rozmawiać!",
+                    meta={"kind": "study_done", "topic": "Turbo-nauka", "facts": total_facts},
+                    add_to_working=False,
+                )
+            self.save_state()
+            return {"topics": done_topics, "pages": total_pages, "facts": total_facts}
+        finally:
+            with self.lock:
+                self.study_state["active"] = False
+                self.study_state["current_action"] = ""
+                if self.state_mode == "STUDYING":
+                    self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
+            self._release_op("study")
+
     def start_continuous_learning_async(self, duration_minutes: int = 60) -> dict[str, Any]:
         """Start autonomous multi-topic web learning + periodic GPU sleep for `duration_minutes`."""
         mins = max(1, min(480, int(duration_minutes)))
