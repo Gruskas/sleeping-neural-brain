@@ -1176,38 +1176,54 @@ class SleepingBrain:
             self._release_op("study")
 
     def _prepare_chat_turn(self, msg: str) -> dict[str, Any]:
-        # 1) Resolve conversational pronouns/follow-ups from working_chat & encode query
+        # 1) Resolve conversational pronouns/follow-ups & query intent
         with self.lock:
             turns_snap = list(self.working_chat)
         ctx = self.language_cortex.resolve_conversational_context(msg, turns_snap)
         search_q = ctx["search_query"]
         active_subject = ctx["active_subject"]
+        intent_info = self.language_cortex.analyze_query_intent(search_q)
+        sub_concepts = [sc for sc in intent_info.get("sub_concepts", []) if sc.strip()][:5]
+        use_multihop_ctx = intent_info["intent"] != "self_capability" and bool(sub_concepts)
 
-        q_vec = self.language_cortex.encode_text(search_q)
+        if use_multihop_ctx:
+            vecs = self.language_cortex.encode_texts([search_q] + sub_concepts)
+            q_vec = vecs[0]
+            sub_vecs = vecs[1:]
+        else:
+            q_vec = self.language_cortex.encode_text(search_q)
+            sub_vecs = []
+
         extracted = self.language_cortex.extract_memories_from_turn(msg)
         mem_items = extracted.get("memories", [])
         mem_embs = self.language_cortex.encode_texts([item["text"] for item in mem_items])
 
-        # 2) Fast RAM recall, concept resolution & recording INSIDE self.lock
+        # 2) Fast RAM recall, multi-hop graph paths, concept resolution & recording INSIDE self.lock
         with self.lock:
-            recalled = self.hippocampus.search_memories(
-                query_vec=q_vec,
-                query_text=search_q,
-                current_day=self.day,
-                top_hippo=self.cfg.recall_top_hippo,
-                top_semantic=self.cfg.recall_top_semantic,
-                top_rem=self.cfg.recall_top_rem,
-            )
-            hippo_texts = [m.text for m in recalled["hippocampus"]]
-            sem_texts = [m.text for m in recalled["semantic"]]
-            rem_texts = [m.text for m in recalled["rem"]]
-            user_profile_texts = [m.text for m in recalled.get("user_profile", [])]
-            episodic_texts = [m.text for m in recalled.get("episodic", [])]
+            words = [w.strip(".,!?;:\"'()").lower() for w in search_q.split() if len(w.strip(".,!?;:\"'()")) >= 3]
+            if use_multihop_ctx:
+                concept_paths = self.hippocampus.find_concept_paths(
+                    sub_concepts + words,
+                    max_hops=3,
+                    max_paths=6,
+                )
+            else:
+                concept_paths = []
 
+            bridge_terms: list[str] = []
+            seen_bridges: set[str] = set()
             concept_hints: list[str] = []
-            words = [w.strip(".,!?;:\"'()").lower() for w in search_q.split() if len(w) >= 3]
+            for p in concept_paths[:3]:
+                if p.get("summary"):
+                    concept_hints.append(f"🔗 {p['summary']}")
+                for br in p.get("bridges", []):
+                    bn = br.strip().lower()
+                    if bn and bn not in seen_bridges:
+                        seen_bridges.add(bn)
+                        bridge_terms.append(br.strip())
+
             seen_concepts: set[str] = set()
-            for w in words:
+            for w in sub_concepts + words:
                 resolved = self.concept_cortex.resolve_concept(w)
                 if resolved and resolved not in seen_concepts:
                     seen_concepts.add(resolved)
@@ -1215,6 +1231,39 @@ class SleepingBrain:
                     if assocs:
                         a_str = ", ".join(f"{a['concept']} ({a['via_relation']})" for a in assocs)
                         concept_hints.append(f"{resolved} → {a_str}")
+                        for a in assocs[:2]:
+                            ac = a["concept"].strip().lower()
+                            if ac and ac not in seen_bridges and a.get("score", 0.0) >= 0.45:
+                                seen_bridges.add(ac)
+                                bridge_terms.append(a["concept"])
+
+            if use_multihop_ctx and (len(sub_concepts) >= 2 or bridge_terms):
+                recalled = self.hippocampus.search_memories_multihop(
+                    query_vec=q_vec,
+                    query_text=search_q,
+                    sub_queries=sub_concepts,
+                    sub_vecs=sub_vecs,
+                    bridge_terms=bridge_terms,
+                    current_day=self.day,
+                    top_hippo=self.cfg.recall_top_hippo,
+                    top_semantic=self.cfg.recall_top_semantic,
+                    top_rem=self.cfg.recall_top_rem,
+                )
+            else:
+                recalled = self.hippocampus.search_memories(
+                    query_vec=q_vec,
+                    query_text=search_q,
+                    current_day=self.day,
+                    top_hippo=self.cfg.recall_top_hippo,
+                    top_semantic=self.cfg.recall_top_semantic,
+                    top_rem=self.cfg.recall_top_rem,
+                )
+
+            hippo_texts = [m.text for m in recalled["hippocampus"]]
+            sem_texts = [m.text for m in recalled["semantic"]]
+            rem_texts = [m.text for m in recalled["rem"]]
+            user_profile_texts = [m.text for m in recalled.get("user_profile", [])]
+            episodic_texts = [m.text for m in recalled.get("episodic", [])]
 
             learned_memories: list[dict[str, Any]] = []
             for item, emb in zip(mem_items, mem_embs):
@@ -1241,6 +1290,8 @@ class SleepingBrain:
                 "user_profile": user_profile_texts,
                 "episodic_texts": episodic_texts,
                 "active_subject": active_subject,
+                "sub_concepts": sub_concepts,
+                "concept_paths": concept_paths,
                 "concept_hints": concept_hints,
                 "learned_memories": learned_memories,
                 "learned_triples": learned_triples,
@@ -1407,6 +1458,8 @@ class SleepingBrain:
                     prep["hippo_texts"].insert(0, t)
             prep["sem_texts"] = [m.text for m in recalled["semantic"]]
             prep["rem_texts"] = [m.text for m in recalled["rem"]]
+            sub_terms = prep.get("sub_concepts") or [clean_topic]
+            prep["concept_paths"] = self.hippocampus.find_concept_paths(sub_terms, max_hops=3, max_paths=6)
             self._log("WEB", f"Auto-sieć sprawdziła '{clean_topic}' ({len(source_titles)} źródła, +{len(new_texts)} faktów).")
 
         return source_titles
@@ -1415,9 +1468,9 @@ class SleepingBrain:
         reply, missing_topic = self.language_cortex._chat_reply_with_meta(
             user_message=msg,
             recent_turns=prep["recent_turns"],
-            hippocampus_memories=prep["hippo_texts"][: self.cfg.recall_top_hippo],
-            semantic_memories=prep["sem_texts"][: self.cfg.recall_top_semantic],
-            rem_reflections=prep["rem_texts"][: self.cfg.recall_top_rem],
+            hippocampus_memories=prep["hippo_texts"][: self.cfg.recall_top_hippo + 6],
+            semantic_memories=prep["sem_texts"][: self.cfg.recall_top_semantic + 8],
+            rem_reflections=prep["rem_texts"][: self.cfg.recall_top_rem + 4],
             concept_hints=prep["concept_hints"][:6],
             day=prep["day"],
             sleeps=prep["sleeps"],
@@ -1426,6 +1479,7 @@ class SleepingBrain:
             user_profile=prep.get("user_profile", []),
             episodic_memories=prep.get("episodic_texts", []),
             active_subject=prep.get("active_subject", ""),
+            concept_paths=prep.get("concept_paths", []),
         )
         thinking = list(self.language_cortex.last_thinking_steps)
         if self.auto_web and missing_topic:
@@ -1436,9 +1490,9 @@ class SleepingBrain:
                 reply2, still_missing = self.language_cortex._chat_reply_with_meta(
                     user_message=msg,
                     recent_turns=prep["recent_turns"],
-                    hippocampus_memories=prep["hippo_texts"][: self.cfg.recall_top_hippo],
-                    semantic_memories=prep["sem_texts"][: self.cfg.recall_top_semantic],
-                    rem_reflections=prep["rem_texts"][: self.cfg.recall_top_rem],
+                    hippocampus_memories=prep["hippo_texts"][: self.cfg.recall_top_hippo + 6],
+                    semantic_memories=prep["sem_texts"][: self.cfg.recall_top_semantic + 8],
+                    rem_reflections=prep["rem_texts"][: self.cfg.recall_top_rem + 4],
                     concept_hints=prep["concept_hints"][:6],
                     day=prep["day"],
                     sleeps=prep["sleeps"],
@@ -1447,6 +1501,7 @@ class SleepingBrain:
                     user_profile=prep.get("user_profile", []),
                     episodic_memories=prep.get("episodic_texts", []),
                     active_subject=prep.get("active_subject", ""),
+                    concept_paths=prep.get("concept_paths", []),
                 )
                 src_note = ", ".join(sources[:2])
                 if not still_missing:

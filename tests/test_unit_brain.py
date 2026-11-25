@@ -200,6 +200,124 @@ class TestHippocampusAndCortex(unittest.TestCase):
         proj = cortex.compute_2d_projection(limit=10, concepts=["kunktator", "fabiusz", "konsulem"])
         self.assertEqual(set(proj.keys()), {"kunktator", "fabiusz", "konsulem"})
 
+    def test_sleep_rem_reflections_and_convergent_dreaming(self):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cfg = BrainConfig(nrem_concept_epochs=35, cortex_sleep_epochs=4, rem_similarity_threshold=-1.0)
+        lc = LanguageCortex(cfg=cfg, device=device)
+        self.assertTrue(lc.load_sync())
+        cortex = AssociativeConceptCortex(cfg, device)
+        hippo = Hippocampus()
+
+        # Interconnected biology facts + unrelated facts (which must NOT be fused)
+        m_bio1 = "Chloroplasty występują w komórkach roślinnych i przeprowadzają fotosyntezę."
+        m_bio2 = "Fotosynteza to proces zachodzący pod wpływem światła słonecznego, który wytwarza glukozę oraz tlen."
+        m_bio3 = "Układ oddechowy z płucami dostarcza organizmowi tlen z powietrza."
+        m_unrel1 = "Dzielenie przez zero jest w matematyce niedozwolone."
+        m_unrel2 = "Kornwalia jest jednym z regionów Wielkiej Brytanii."
+        m_stub = "Słowo „przeszukiwać” oznacza: czasowniki przechodnie, rejestr wyrazów."
+
+        for m in (m_bio1, m_bio2, m_bio3, m_unrel1, m_unrel2, m_stub):
+            hippo.record_memory(m, "wiedza", 5, day=1, embedding=lc.encode_text(m))
+
+        hippo.record_fact("chloroplasty", "przeprowadzają", "fotosyntezę", day=1)
+        hippo.record_fact("fotosyntezę", "wytwarza", "tlen", day=1)
+        hippo.record_fact("układ oddechowy", "dostarcza", "tlen", day=1)
+
+        engine = SleepEngine(cfg=cfg, concept_cortex=cortex, hippocampus=hippo, device=device, language_cortex=lc)
+        rep = engine.run_sleep_cycle(night_number=1)
+
+        # Transitive (chloroplasty <-> tlen) AND convergent (fotosyntezę <-> układ oddechowy via tlen)
+        link_pairs = {(l["src"], l["dst"]) for l in rep.rem_new_links} | {(l["dst"], l["src"]) for l in rep.rem_new_links}
+        self.assertIn(("chloroplasty", "tlen"), link_pairs)
+        self.assertIn(("fotosyntezę", "układ oddechowy"), link_pairs)
+
+        # Reflections must be clean, non-truncated, without stopword garbage or unrelated pairings
+        self.assertGreaterEqual(len(rep.rem_reflections), 1)
+        for refl in rep.rem_reflections:
+            self.assertNotIn("czyl,", refl.lower())
+            self.assertNotIn("czasowniki przechodnie", refl.lower())
+            self.assertFalse("dzielen" in refl.lower() and "kornwali" in refl.lower())
+
+        # Subsequent manual sleep with empty STM still synthesizes new non-duplicate reflections
+        self.assertEqual(len(hippo.short_term_memories), 0)
+        rep2 = engine.run_sleep_cycle(night_number=2)
+        for refl in rep2.rem_reflections:
+            self.assertNotIn(refl, rep.rem_reflections)
+
+    def test_compound_queries_fact_connecting_and_deliberative_answering(self):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cfg = BrainConfig(nrem_concept_epochs=25, cortex_sleep_epochs=4, language_bootstrap_epochs=2)
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
+            brain.auto_web = False
+            # Seed key facts + graph triples without running full 22-epoch curriculum training
+            seed_facts = [
+                "Słońce jest gwiazdą znajdującą się w centrum Układu Słonecznego i głównym źródłem światła oraz ciepła dla Ziemi.",
+                "Fotosynteza to proces zachodzący w roślinach pod wpływem światła słonecznego, w którym z wody i dwutlenku węgla powstają glukoza (cukier) oraz tlen.",
+                "Układ oddechowy z płucami dostarcza organizmowi tlen z powietrza i usuwa dwutlenek węgla.",
+                "Procesor (CPU) wykonuje rozkazy programu, karta graficzna (GPU) przyspiesza obliczenia graficzne, pamięć RAM przechowuje dane tymczasowe, a dysk SSD służy do zapisu trwałego.",
+                "Prędkość światła w próżni wynosi około 300 000 km/s, natomiast dźwięk rozchodzi się w powietrzu z prędkością około 340 m/s i nie rozchodzi się w próżni.",
+                "Bitwa pod Grunwaldem odbyła się 15 lipca 1410 roku; wojska polsko-litewskie pod wodzą króla Władysława Jagiełły pokonały Zakon Krzyżacki.",
+            ]
+            embs = brain.language_cortex.encode_texts(seed_facts)
+            for txt, emb in zip(seed_facts, embs):
+                brain.hippocampus.record_memory(txt, "wiedza", 5, day=1, embedding=emb)
+            for s, r, d in [
+                ("słońce", "jest źródłem", "światła słonecznego"),
+                ("fotosynteza", "wymaga", "światła słonecznego"),
+                ("fotosynteza", "wytwarza", "tlen"),
+                ("układ oddechowy", "dostarcza", "tlen"),
+                ("władysław jagiełło", "dowodził w", "bitwa pod grunwaldem"),
+                ("bitwa pod grunwaldem", "odbyła się w", "1410 rok"),
+            ]:
+                brain.hippocampus.record_fact(s, r, d, day=1)
+            brain.sleep_now(visual_pacing=False)
+
+            # 1) Connection query
+            conn = brain.chat("Jaki jest związek między fotosyntezą a oddychaniem człowieka?")
+            conn_low = conn["reply"].lower()
+            self.assertNotIn("/ucz", conn_low)
+            self.assertFalse(conn_low.startswith("najprościej mówiąc:"))
+            self.assertTrue("tlen" in conn_low or "dwutlen" in conn_low, f"Expected bridge in: {conn['reply']}")
+            self.assertIn("oddech", conn_low)
+            self.assertTrue(any("Porównanie wariantów" in step for step in brain.language_cortex.last_thinking_steps))
+
+            # 2) Causal multi-hop query
+            why_res = brain.chat("Dlaczego bez Słońca nie byłoby tlenu na Ziemi?")
+            why_low = why_res["reply"].lower()
+            self.assertFalse(why_low.startswith("najprościej mówiąc:"))
+            self.assertIn("fotosyntez", why_low)
+            self.assertIn("tlen", why_low)
+
+            # 3) Comparison query
+            comp = brain.chat("Porównaj pamięć RAM i dysk SSD")
+            comp_low = comp["reply"].lower()
+            self.assertFalse(comp_low.startswith("najprościej mówiąc:"))
+            self.assertIn("ram", comp_low)
+            self.assertIn("ssd", comp_low)
+            self.assertIn("tymczasow", comp_low)
+            self.assertIn("trwał", comp_low)
+
+            # 4) Yes/No grounded query
+            yn = brain.chat("Czy dźwięk rozchodzi się w próżni?")
+            yn_low = yn["reply"].lower()
+            self.assertTrue(yn_low.startswith("**nie.**"), f"Expected '**Nie.**', got: {yn['reply']}")
+            self.assertIn("próżni", yn_low)
+
+            # 5) Multi-part factual query
+            mp = brain.chat("Kto dowodził pod Grunwaldem i kiedy to było?")
+            mp_low = mp["reply"].lower()
+            self.assertIn("jagiełł", mp_low)
+            self.assertIn("1410", mp_low)
+
+            # 6) Self-capability query (must NOT give dictionary definition or '/ucz pliki' fallback)
+            cap = brain.chat("mozesz pliki przeszukiwac?")
+            cap_low = cap["reply"].lower()
+            self.assertNotIn("/ucz pliki", cap_low)
+            self.assertNotIn("nie wiem jeszcze", cap_low)
+            self.assertNotIn("czasowniki przechodnie", cap_low)
+            self.assertTrue("plik" in cap_low or "dostępu" in cap_low)
+
 
 class TestWebLearner(unittest.TestCase):
     def test_query_cleaning_relevance_and_direct_url(self):
@@ -334,13 +452,14 @@ class TestSleepingBrainAndServer(unittest.TestCase):
                     self.assertNotIn("/ucz o czy", cap_chat["reply"].lower())
 
                     # POST /api/curriculum (Elementary School pack + GPU training + idempotency)
+                    train_timeout = 60 if torch.cuda.is_available() else 420
                     req_curr = urllib.request.Request(
                         f"{srv_url}/api/curriculum",
                         data=json.dumps({"deep_web": False}).encode("utf-8"),
                         headers={"Content-Type": "application/json"},
                         method="POST",
                     )
-                    curr = json.loads(urllib.request.urlopen(req_curr, timeout=60).read().decode("utf-8"))
+                    curr = json.loads(urllib.request.urlopen(req_curr, timeout=train_timeout).read().decode("utf-8"))
                     self.assertTrue(curr["ok"])
                     self.assertGreaterEqual(curr["added_facts"], 80)
                     self.assertGreaterEqual(curr["added_triples"], 70)
@@ -393,7 +512,7 @@ class TestSleepingBrainAndServer(unittest.TestCase):
                         headers={"Content-Type": "application/json"},
                         method="POST",
                     )
-                    tr_res = json.loads(urllib.request.urlopen(req_tr, timeout=45).read().decode("utf-8"))
+                    tr_res = json.loads(urllib.request.urlopen(req_tr, timeout=train_timeout).read().decode("utf-8"))
                     self.assertTrue(tr_res["ok"])
                     self.assertLess(tr_res["loss_end"], tr_res["loss_start"])
                     self.assertGreater(tr_res["fluency"], 40.0)

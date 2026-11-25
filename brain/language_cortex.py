@@ -66,13 +66,173 @@ def _cosine_list(a: list[float], b: list[float]) -> float:
 
 _STOPWORDS_PL = {
     "jest", "są", "sa", "to", "oraz", "lub", "albo", "czy", "jak", "jaki", "jaka",
-    "jakie", "kto", "co", "czym", "gdzie", "kiedy", "dlaczego", "dla", "przez",
+    "jakie", "kto", "co", "czym", "gdzie", "kiedy", "dlaczego", "czemu", "dla", "przez",
     "przy", "nad", "pod", "przed", "bez", "jako", "jego", "jej", "ich", "tego",
     "tym", "tej", "ten", "ta", "te", "tak", "nie", "ale", "lecz", "więc", "wiec",
-    "że", "ze", "się", "sie", "w", "we", "z", "ze", "na", "do", "od", "po", "o",
+    "że", "ze", "się", "sie", "w", "we", "z", "na", "do", "od", "po", "o",
     "u", "za", "i", "a", "no", "krótko", "krotko", "wyjaśnij", "wyjasnij",
     "powiedz", "opowiedz", "opisz", "zdefiniuj", "napisz", "podaj", "temat",
+    "czyli", "jednak", "również", "rowniez", "także", "takze", "ponieważ", "poniewaz",
+    "można", "mozna", "który", "ktory", "która", "ktora", "które", "ktore",
+    "których", "ktorych", "często", "czesto", "bardzo", "między", "miedzy",
+    "związek", "zwiazek", "różnica", "roznica", "porównaj", "porownaj",
+    "łączy", "laczy", "wpływ", "wplyw", "zależy", "zalezy", "natomiast",
+    "ponadto", "wtedy", "słowo", "slowo", "oznacza", "wiele", "każdy", "kazdy",
+    "inny", "inne", "innych", "tylko", "jeszcze", "będzie", "bedzie", "może", "moze",
+    "był", "byl", "była", "byla", "było", "bylo", "sposób", "sposob", "polega",
+    "następnie", "nastepnie", "najpierw", "potem", "później", "pozniej",
+    "wcześniej", "wczesniej", "obecnie", "zwykle", "gdyż", "gdyz", "zatem",
+    "równocześnie", "rownoczesnie", "jednocześnie", "jednoczesnie", "podczas",
+    "pomimo", "mimo", "wobec",
 }
+
+_STOPWORDS_PL_NORM = {_strip_pl(w) for w in _STOPWORDS_PL}
+
+_SHORT_DOMAIN_ACRONYMS = {
+    "c++", "c#", "ai", "ip", "si", "pi", "o2", "co2", "h2o", "cpu", "gpu",
+    "ram", "ssd", "hdd", "dna", "rna", "sql", "dns", "psu", "onz",
+}
+
+_POLISH_ROOT_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("slonc", "slonecz"),
+    ("oddychan", "oddech"),
+    ("czlowiek", "ludz"),
+    ("swiatl", "swietl"),
+    ("roslin", "roslinn"),
+    ("ziemi", "ziemsk"),
+    ("komork", "komor"),
+    ("energi", "energet"),
+    ("pamiec", "pamiet"),
+    ("dzien", "dni"),
+    ("procesor", "cpu"),
+    ("graficzn", "gpu"),
+    ("dysk", "ssd", "hdd"),
+    ("ram", "operacyjn"),
+    ("tlen", "tlenu", "tlenow"),
+    ("dwutlen", "co2"),
+    ("wod", "h2o"),
+)
+
+
+_WEAK_BRIDGE_WORDS_NORM = {
+    "zycie", "zycia", "zyciu", "swiat", "swiata", "swiecie", "czas", "czasu",
+    "miejsce", "miejsca", "czesc", "czesci", "forma", "formy", "rodzaj",
+    "przyklad", "przykladu", "czlowiek", "czlowieka", "ludzie", "ludzi",
+    "proces", "procesu", "uklad", "ukladu", "system", "systemu", "gwiazda",
+    "dzialanie", "dzialania", "powietrzu", "wokol",
+}
+
+
+def _word_matches(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    if len(a) >= 4 and len(b) >= 4 and abs(len(a) - len(b)) <= 5:
+        a_stem = a[: max(4, min(len(a) - 2, 6))]
+        b_stem = b[: max(4, min(len(b) - 2, 6))]
+        if b.startswith(a_stem) or a.startswith(b_stem):
+            return True
+    for grp in _POLISH_ROOT_GROUPS:
+        a_hit = any((a == g or (len(g) >= 4 and a.startswith(g))) for g in grp)
+        if a_hit:
+            b_hit = any((b == g or (len(g) >= 4 and b.startswith(g))) for g in grp)
+            if b_hit:
+                return True
+    return False
+
+
+def _extract_meaningful_words(text: str, keep_originals: bool = False) -> list[str]:
+    raw_tokens = re.findall(r"[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ0-9+#]{2,}", text or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for tok in raw_tokens:
+        low_orig = tok.lower()
+        norm = _strip_pl(low_orig)
+        if norm.isdigit():
+            continue
+        if norm in _STOPWORDS_PL_NORM:
+            continue
+        if len(norm) < 3 and norm not in _SHORT_DOMAIN_ACRONYMS:
+            continue
+        if norm not in seen:
+            seen.add(norm)
+            out.append(low_orig if keep_originals else norm)
+    return out
+
+
+def _shared_meaningful_concepts(text_a: str, text_b: str, allow_weak: bool = False) -> list[str]:
+    words_a = _extract_meaningful_words(text_a, keep_originals=True)
+    words_b = _extract_meaningful_words(text_b, keep_originals=False)
+    if not words_a or not words_b:
+        return []
+    shared: list[str] = []
+    seen_norm: set[str] = set()
+    for wa in words_a:
+        na = _strip_pl(wa)
+        if na in seen_norm:
+            continue
+        if not allow_weak and na in _WEAK_BRIDGE_WORDS_NORM:
+            continue
+        if any(_word_matches(na, wb) for wb in words_b):
+            seen_norm.add(na)
+            shared.append(wa)
+    return shared
+
+
+def _lc_first(text: str) -> str:
+    s = (text or "").strip()
+    if len(s) > 1 and s[0].isupper() and not s[:3].isupper():
+        return s[0].lower() + s[1:]
+    return s
+
+
+def _trim_sentence_clean(text: str, max_len: int = 165) -> str:
+    clean = _clean_fact_text(text)
+    if not clean:
+        return ""
+    if len(clean) <= max_len:
+        return clean if clean[-1] in ".!?" else clean + "."
+    sents = _split_polish_sentences(clean)
+    if sents and len(sents[0]) <= max_len:
+        acc = sents[0]
+        if len(sents) > 1 and len(acc) + 1 + len(sents[1]) <= max_len:
+            acc = f"{acc} {sents[1]}"
+        return acc if acc[-1] in ".!?" else acc + "."
+    cut = clean[:max_len]
+    # Prefer clause boundary or last complete word
+    for sep in ("; ", ", ", " "):
+        idx = cut.rfind(sep)
+        if idx >= max(28, max_len // 2):
+            cut = cut[:idx]
+            break
+    cut = cut.rstrip(" ,;:-")
+    return cut + "." if cut and cut[-1] not in ".!?" else cut
+
+
+def _is_noisy_memory(text: str) -> bool:
+    low = (text or "").strip().lower()
+    if len(low) < 16 or low.endswith("?"):
+        return True
+    noise_markers = (
+        "rzeczownik, rodzaj",
+        "czasowniki przechodnie",
+        "czasownik przechodni",
+        "źródło: „https://",
+        "zródło: „https://",
+        "dopuszczalne w grach",
+        "słownik ortograficzny",
+        "odmienność tak",
+        "rejestr wyraz",
+    )
+    return any(m in low for m in noise_markers)
+
+
+def _is_bare_definition(text: str) -> bool:
+    low = (text or "").strip().lower()
+    return (
+        low.startswith("słowo „")
+        or low.startswith("znaczenie słowa")
+        or " oznacza:" in low
+    )
 
 
 def _tokenize_stems(text: str) -> set[str]:
@@ -80,7 +240,7 @@ def _tokenize_stems(text: str) -> set[str]:
     words = re.findall(r"[a-z0-9+#]{2,}", stripped)
     stems: set[str] = set()
     for w in words:
-        if w in _STOPWORDS_PL:
+        if w in _STOPWORDS_PL_NORM:
             continue
         stems.add(w)
         if len(w) >= 5:
@@ -93,21 +253,17 @@ def _tokenize_stems(text: str) -> set[str]:
 def _stem_overlap(query: str, candidate: str) -> float:
     q_words = [
         w for w in re.findall(r"[a-z0-9+#]{2,}", _strip_pl(query.lower()))
-        if w not in _STOPWORDS_PL
+        if w not in _STOPWORDS_PL_NORM and (len(w) >= 3 or w in _SHORT_DOMAIN_ACRONYMS)
     ]
     if not q_words:
         return 0.0
-    cand_stems = _tokenize_stems(candidate)
-    if not cand_stems:
+    cand_words = [
+        w for w in re.findall(r"[a-z0-9+#]{2,}", _strip_pl(candidate.lower()))
+        if len(w) >= 2
+    ]
+    if not cand_words:
         return 0.0
-    hits = 0
-    for qw in q_words:
-        q_stem = qw[: max(4, len(qw) - 2)] if len(qw) >= 5 else qw
-        if qw in cand_stems or q_stem in cand_stems or any(
-            cs.startswith(q_stem) or (len(cs) >= 4 and qw.startswith(cs[: max(4, len(cs) - 2)]))
-            for cs in cand_stems
-        ):
-            hits += 1
+    hits = sum(1 for qw in q_words if any(_word_matches(qw, cw) for cw in cand_words))
     return hits / max(1, len(q_words))
 
 
@@ -451,6 +607,48 @@ class LanguageCortex:
                 dedup.append(c)
         return dedup[:3]
 
+    def extract_triples_from_memory(self, text: str, topic: str | None = None) -> list[tuple[str, str, str]]:
+        """Extract concise relational (src, rel, dst) triples from Polish declarative sentences."""
+        clean = _clean_fact_text(text)
+        if not clean or _is_noisy_memory(clean):
+            return []
+
+        rel_patterns = [
+            (
+                r"^([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#\s-]{2,42}?)\s+"
+                r"(składa się z|składają się z|należy do|należą do|polega na|krąży wokół|leży nad|"
+                r"wytwarza|wytwarzają|zużywa|zużywają|wymaga|powoduje|powodują|przechowuje|przechowują|"
+                r"dostarcza|dostarczają|kieruje|chroni|łączy|wykorzystuje|przeprowadza|przeprowadzają|"
+                r"odkrył|odkryła|napisał|ma stolicę|ma wzór|emituje|wskazuje|umożliwia|tworzy|zawiera)\s+"
+                r"([^.,;!?]{3,55})",
+                None,
+            ),
+            (r"^([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#\s-]{2,42}?)\s+(?:–|—|-|:)\s+([^.,;!?]{4,55})", "oznacza"),
+            (r"^([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#\s-]{2,42}?)\s+(?:to|jest|są)\s+([^.,;!?]{4,55})", "jest"),
+        ]
+
+        triples: list[tuple[str, str, str]] = []
+        seen_t: set[tuple[str, str, str]] = set()
+        for sent in (_split_polish_sentences(clean) or [clean]):
+            for pat, fixed_rel in rel_patterns:
+                m = re.match(pat, sent, flags=re.I)
+                if not m:
+                    continue
+                s = m.group(1).strip(" „”:-").lower()[:50]
+                if fixed_rel is None:
+                    r = m.group(2).strip().lower()[:35]
+                    d = m.group(3).strip(" „”.").lower()[:50]
+                else:
+                    r = fixed_rel
+                    d = m.group(2).strip(" „”.").lower()[:50]
+                if len(s) >= 2 and len(d) >= 3 and s != d and (s, r, d) not in seen_t:
+                    seen_t.add((s, r, d))
+                    triples.append((s, r, d))
+                    break
+            if len(triples) >= 4:
+                break
+        return triples
+
     def study_document_chunk(self, topic: str, title: str, chunk: str) -> dict[str, Any]:
         sentences = _split_polish_sentences(chunk)
         if not sentences:
@@ -505,27 +703,15 @@ class LanguageCortex:
         topic_key = topic.strip().lower()[:50]
         title_key = re.sub(r"^Słownik\s*\([A-Z]+\):\s*", "", title).strip().lower()[:50]
 
-        rel_patterns = [
-            (r"^([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#\s-]{3,42}?)\s+(?:–|—|-|:)\s+([^.,;]{4,55})", "oznacza"),
-            (r"^([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#\s-]{3,42}?)\s+(?:to|jest)\s+([^.,;]{4,55})", "jest"),
-            (r"^([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#\s-]{3,42}?)\s+(przechowuje|wskazuje|umożliwia|oznacza|tworzy|emituje|powoduje)\s+([^.,;]{4,55})", None),
-        ]
         for item in selected_facts:
-            txt = item["text"]
-            for pat, fixed_rel in rel_patterns:
-                m = re.match(pat, txt)
-                if m:
-                    s = m.group(1).strip().lower()[:50]
-                    if fixed_rel is None:
-                        r = m.group(2).strip().lower()[:35]
-                        d = m.group(3).strip().lower()[:50]
-                    else:
-                        r = fixed_rel
-                        d = m.group(2).strip().lower()[:50]
-                    if s and r and d and s != d and (s, r, d) not in seen_t:
-                        seen_t.add((s, r, d))
-                        triples.append((s, r, d))
-                        break
+            for tr in self.extract_triples_from_memory(item["text"], topic=topic):
+                if tr not in seen_t:
+                    seen_t.add(tr)
+                    triples.append(tr)
+                if len(triples) >= 6:
+                    break
+            if len(triples) >= 6:
+                break
 
         if topic_key and title_key and topic_key != title_key and len(triples) < 6:
             t_link = (topic_key, "dotyczy", title_key)
@@ -675,48 +861,148 @@ class LanguageCortex:
         summary = " ".join(summary_facts)[:320]
         return {"mastery": mastery, "next_queries": next_queries[:2], "summary": summary}
 
-    def synthesize_rem_reflections(self, new_memories: list[str], old_memories: list[str]) -> list[str]:
-        if not new_memories:
+    def synthesize_rem_reflections(
+        self,
+        new_memories: list[str],
+        old_memories: list[str],
+        rem_links: list[dict[str, Any]] | None = None,
+        existing_reflections: list[str] | None = None,
+    ) -> list[str]:
+        if not new_memories and not rem_links:
             return []
-        pool_new = new_memories[:12]
-        pool_old = old_memories[:16] if old_memories else new_memories[1:12]
-        if not pool_old:
-            return []
 
-        vecs_new = self.encode_texts(pool_new)
-        vecs_old = self.encode_texts(pool_old)
+        pool_new = [_clean_fact_text(m) for m in new_memories if not _is_noisy_memory(m)]
+        pool_new = [m for m in pool_new if m][:18]
+        pool_old = [_clean_fact_text(m) for m in old_memories if not _is_noisy_memory(m)]
+        pool_old = [m for m in pool_old if m][:24]
+        if not pool_old and len(pool_new) >= 2:
+            pool_old = list(pool_new)
 
-        best_pairs: list[tuple[float, str, str, list[str]]] = []
-        for mn, vn in zip(pool_new, vecs_new):
-            sn = _tokenize_stems(mn)
-            for mo, vo in zip(pool_old, vecs_old):
-                if mn.lower() == mo.lower():
-                    continue
-                cos = _cosine_list(vn, vo)
-                if 0.25 <= cos <= 0.85:
-                    shared = sorted(w for w in (sn & _tokenize_stems(mo)) if len(w) >= 4)
-                    score = cos + min(0.25, len(shared) * 0.08)
-                    best_pairs.append((score, mn, mo, shared))
+        existing_clean = [_clean_fact_text(r) for r in (existing_reflections or []) if _clean_fact_text(r)]
+        existing_vecs = self.encode_texts(existing_clean[-40:]) if existing_clean else []
 
-        best_pairs.sort(key=lambda x: x[0], reverse=True)
+        def is_dup_reflection(cand: str, cand_vec: list[float] | None = None) -> bool:
+            clow = cand.lower()
+            if any(clow == e.lower() or clow[:48] == e.lower()[:48] for e in existing_clean):
+                return True
+            if cand_vec and existing_vecs:
+                if any(_cosine_list(cand_vec, ev) > 0.85 for ev in existing_vecs):
+                    return True
+            return False
+
         reflections: list[str] = []
         used_texts: set[str] = set()
-        for _, mn, mo, shared in best_pairs:
-            if mn in used_texts or mo in used_texts:
-                continue
-            used_texts.add(mn)
-            used_texts.add(mo)
-            c1 = _clean_fact_text(mn).rstrip(".")
-            c2 = _clean_fact_text(mo).rstrip(".")
-            if shared:
-                bridge = ", ".join(shared[:2])
-                refl = f"Skojarzenie REM ({bridge}): {c1[:110]} — łączy się z: {c2[:110]}."
-            else:
-                refl = f"Wniosek REM: {c1[:110]} uzupełnia pamięć o: {c2[:110]}."
-            reflections.append(refl)
-            if len(reflections) >= 2:
-                break
-        return reflections
+
+        # Pass 1: Graph-Chain Reflections grounded in discovered REM links
+        all_mems = pool_new + [m for m in pool_old if m not in pool_new]
+        if rem_links:
+            for link in rem_links[:6]:
+                src = str(link.get("src", "")).strip()
+                dst = str(link.get("dst", "")).strip()
+                bridge_raw = str(link.get("bridge", "")).strip()
+                if not src or not dst or src == dst:
+                    continue
+                bridge_node = ""
+                bm = re.search(r"^(?:przez|wspólny most|wspólne źródło):\s*([^(\n]+)", bridge_raw, flags=re.I)
+                if bm:
+                    bridge_node = bm.group(1).strip()
+
+                m_src = None
+                m_dst = None
+                for m in all_mems:
+                    if m in used_texts:
+                        continue
+                    if _stem_overlap(src, m) >= 0.5 and (not bridge_node or _stem_overlap(bridge_node, m) >= 0.4):
+                        m_src = m
+                        break
+                if m_src is None:
+                    for m in all_mems:
+                        if m not in used_texts and _stem_overlap(src, m) >= 0.5:
+                            m_src = m
+                            break
+
+                for m in all_mems:
+                    if m in used_texts or m == m_src:
+                        continue
+                    if _stem_overlap(dst, m) >= 0.5 and (not bridge_node or _stem_overlap(bridge_node, m) >= 0.4):
+                        m_dst = m
+                        break
+                if m_dst is None:
+                    for m in all_mems:
+                        if m not in used_texts and m != m_src and _stem_overlap(dst, m) >= 0.5:
+                            m_dst = m
+                            break
+
+                if m_src and m_dst:
+                    c1 = _trim_sentence_clean(m_src, 130)
+                    c2 = _trim_sentence_clean(m_dst, 130)
+                    b_label = bridge_node or "wspólny kontekst"
+                    refl = (
+                        f"Połączenie faktów ({src} ↔ {dst} przez „{b_label}”): "
+                        f"{c1} Z kolei {_lc_first(c2)}"
+                    )
+                elif bridge_node:
+                    refl = f"Skojarzenie REM: pojęcia „{src}” i „{dst}” łączą się poprzez „{bridge_node}” ({bridge_raw})."
+                else:
+                    continue
+
+                r_vec = self.encode_text(refl)
+                if not is_dup_reflection(refl, r_vec):
+                    reflections.append(refl)
+                    existing_clean.append(refl)
+                    existing_vecs.append(r_vec)
+                    if m_src:
+                        used_texts.add(m_src)
+                    if m_dst:
+                        used_texts.add(m_dst)
+                if len(reflections) >= 2:
+                    break
+
+        # Pass 2: Cross-topic semantic & conceptual bridges across memories
+        if pool_new and pool_old:
+            vecs_new = self.encode_texts(pool_new)
+            vecs_old = self.encode_texts(pool_old) if pool_old is not pool_new else vecs_new
+
+            best_pairs: list[tuple[float, str, str, list[str]]] = []
+            for mn, vn in zip(pool_new, vecs_new):
+                for mo, vo in zip(pool_old, vecs_old):
+                    if mn.lower() == mo.lower() or mn.lower()[:30] == mo.lower()[:30]:
+                        continue
+                    cos = _cosine_list(vn, vo)
+                    if cos > 0.80 or _stem_overlap(mn, mo) > 0.50:
+                        continue
+                    shared = _shared_meaningful_concepts(mn, mo)
+                    if not ((len(shared) >= 1 and 0.18 <= cos <= 0.80) or (len(shared) == 0 and 0.46 <= cos <= 0.78)):
+                        continue
+                    stub_bonus = 0.06 if (not _is_bare_definition(mn) and not _is_bare_definition(mo)) else 0.0
+                    score = cos + min(0.32, len(shared) * 0.14) + stub_bonus
+                    best_pairs.append((score, mn, mo, shared))
+
+            best_pairs.sort(key=lambda x: x[0], reverse=True)
+            for _, mn, mo, shared in best_pairs:
+                if mn in used_texts or mo in used_texts:
+                    continue
+                c1 = _trim_sentence_clean(mn, 135)
+                c2 = _trim_sentence_clean(mo, 135)
+                if not c1 or not c2:
+                    continue
+                if shared:
+                    bridge = ", ".join(shared[:2])
+                    refl = f"Wniosek REM (most: {bridge}): {c1} Wiąże się to z tym, że {_lc_first(c2)}"
+                else:
+                    refl = f"Wniosek REM: {c1} Uzupełnia to fakt, że {_lc_first(c2)}"
+                r_vec = self.encode_text(refl)
+                if is_dup_reflection(refl, r_vec):
+                    continue
+                used_texts.add(mn)
+                used_texts.add(mo)
+                reflections.append(refl)
+                existing_clean.append(refl)
+                existing_vecs.append(r_vec)
+                if len(reflections) >= 4:
+                    break
+
+        return reflections[:4]
 
     def check_memory_update(self, new_fact: str, candidate_old_facts: list[str]) -> int | None:
         if not candidate_old_facts:
@@ -746,30 +1032,60 @@ class LanguageCortex:
         new_memories: list[str],
         replay_memories: list[str],
         rem_reflections: list[str],
+        rem_links: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         Real NREM Deep Sleep GPU Training (100% self-contained PyTorch):
           1) Expands tokenizer vocabulary with newly encountered Polish/code tokens
-          2) Contrastively trains `CorticalSemanticEncoder` on GPU
+          2) Contrastively trains `CorticalSemanticEncoder` on GPU (including cross-fact bridges)
           3) Trains `CorticalTransformerLM` via Experience Replay on GPU
           4) Updates structured `core_knowledge_summary`
         """
-        if not self.ready or not new_memories:
+        if not self.ready or (not new_memories and not rem_reflections):
             return {"trained": False, "samples": 0, "loss_start": 0.0, "loss_end": 0.0, "duration_ms": 0.0}
 
         t0 = time.perf_counter()
         sample_limit = max(self.cfg.lora_max_replay_samples, min(200, len(new_memories) + 20))
         all_items = (new_memories[:160] + replay_memories[:40])[:sample_limit]
 
-        # Build contrastive pairs & natural conversational dialogues for self-training on GPU
+        # Build contrastive pairs (single-fact + cross-fact bridge pairs)
         pairs: list[tuple[str, str]] = []
+        cleaned_items: list[str] = []
         for item in all_items:
             clean = _clean_fact_text(item)
             if len(clean) < 8:
                 continue
-            words = re.findall(r"[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ0-9+#]{3,}", clean)
-            hint = " ".join(words[:3]) if words else clean[:24]
+            cleaned_items.append(clean)
+            mwords = _extract_meaningful_words(clean, keep_originals=True)
+            hint = " ".join(mwords[:3]) if mwords else clean[:24]
             pairs.append((hint, clean))
+
+        # Add cross-fact bridge contrastive pairs so the encoder embeds connected topics closer
+        for i in range(min(30, len(cleaned_items))):
+            fi = cleaned_items[i]
+            if _is_noisy_memory(fi):
+                continue
+            for j in range(i + 1, min(40, len(cleaned_items))):
+                fj = cleaned_items[j]
+                if _is_noisy_memory(fj):
+                    continue
+                shared = _shared_meaningful_concepts(fi, fj)
+                if shared:
+                    si = _extract_meaningful_words(fi, keep_originals=True)
+                    sj = _extract_meaningful_words(fj, keep_originals=True)
+                    if si and sj and si[0] != sj[0]:
+                        pairs.append((f"{si[0]} {sj[0]} {shared[0]}", f"{fi[:110]} {fj[:110]}"))
+                        if len(pairs) >= 100:
+                            break
+            if len(pairs) >= 100:
+                break
+
+        for link in (rem_links or [])[:8]:
+            src = str(link.get("src", "")).strip()
+            dst = str(link.get("dst", "")).strip()
+            bridge = str(link.get("bridge", "")).strip()
+            if src and dst:
+                pairs.append((f"{src} {dst}", f"{src} łączy się z {dst} ({bridge})"))
 
         sequences = build_training_dialogues(
             memories=all_items,
@@ -781,14 +1097,19 @@ class LanguageCortex:
         for refl in rem_reflections[:6]:
             clean_r = _clean_fact_text(refl)
             if len(clean_r) >= 10:
+                rwords = _extract_meaningful_words(clean_r, keep_originals=True)
                 sequences.append(f"<MEM> {clean_r} <CTX> sen REM <USER> czego nowego się domyśliłeś? <BOT> {clean_r}")
+                if len(rwords) >= 2:
+                    sequences.append(
+                        f"<MEM> {clean_r} <CTX> łączenie faktów <USER> jaki jest związek między {rwords[0]} a {rwords[1]}? <BOT> {clean_r}"
+                    )
         if self.online_dialogues:
             sequences.extend(self.online_dialogues[-60:])
 
         with self._op_lock:
             self.tokenizer.learn_texts(all_items + rem_reflections + sequences)
             enc_s, enc_e = self.semantic_encoder.train_contrastive(
-                pairs=pairs[:80],
+                pairs=pairs[:96],
                 tokenizer=self.tokenizer,
                 epochs=max(4, self.cfg.cortex_sleep_epochs // 2),
                 lr=self.cfg.cortex_lr,
@@ -962,6 +1283,162 @@ class LanguageCortex:
             "search_query": msg,
         }
 
+    def analyze_query_intent(self, query: str) -> dict[str, Any]:
+        """Classify query intent and decompose compound/multi-entity queries into sub-concepts."""
+        msg = (query or "").strip()
+        low = _strip_pl(msg.lower()).strip(" ?!.,;:")
+
+        # 1) Assistant-directed capability / local action questions
+        if re.match(
+            r"^(?:czy\s+)?(?:ty\s+)?(?:mozesz|moglbys|moglabys|potrafisz|umiesz|masz\s+dostep|umialbys)\b",
+            low,
+        ):
+            return {
+                "intent": "self_capability",
+                "detail_kind": None,
+                "sub_intents": [],
+                "sub_concepts": [],
+                "is_compound": False,
+            }
+
+        sub_intents: list[str] = []
+        if re.search(r"\bkiedy\b|\bw\s+ktorym\s+roku\b|\bjak\s+dlugo\b", low):
+            sub_intents.append("when")
+        if re.search(r"\bgdzie\b|\bskad\b|\bdokad\b", low):
+            sub_intents.append("where")
+        if re.search(r"\bile\b|\bilu\b|\bjak\s+duzo\b|\bjak\s+wiele\b", low):
+            sub_intents.append("how_many")
+        if re.search(r"\bkto\b|\bkim\b|\bczyim\b", low):
+            sub_intents.append("who")
+
+        # 2) Detect primary intent
+        is_connection = bool(
+            re.search(
+                r"\b(?:zwiazek|zwiazki|laczy|lacza|powiazan\w*|wspoln\w*|relacj\w*|zaleznosc\w*|jak\s+ma\s+sie|wplyw\w*\s+na|zalezy\s+od)\b",
+                low,
+            )
+        )
+        is_comparison = bool(
+            re.search(
+                r"\b(?:porownaj|roznic\w*|czym\s+sie\s+rozni\w*|vs\.?|kontra|podobienstw\w*)\b",
+                low,
+            )
+        ) or (" a czym " in low)
+        is_causal = bool(
+            re.search(
+                r"\b(?:dlaczego|czemu|po\s+co|skad\s+sie\s+bierze|co\s+sie\s+stanie|co\s+by\s+bylo|bez\s+czego|co\s+powoduje|jak\s+wplywa|wazne\s+dla)\b",
+                low,
+            )
+        ) or low.startswith("dlaczego ") or low.startswith("czemu ") or (" bez " in low and any(w in low for w in ("nie byloby", "nie ma", "brak", "zabrak")))
+        is_how = bool(
+            re.search(
+                r"\b(?:jak\s+dziala\w*|w\s+jaki\s+sposob|na\s+czym\s+polega|jak\s+przebiega|jak\s+powstaje|jak\s+zachodzi|jak\s+odbywa|do\s+czego\s+sluzy)\b",
+                low,
+            )
+        )
+        is_yes_no = low.startswith("czy ") and not is_comparison and not is_connection
+        is_explicit_def = bool(
+            re.match(
+                r"^(?:no\s+to\s+|a\s+)?(?:co\s+to\s+(?:jest|sa)|czym\s+(?:jest|sa)|kim\s+(?:jest|byl)|kto\s+to\s+(?:jest|byl)|zdefiniuj|co\s+oznacza|znaczenie\s+slowa)\b",
+                low,
+            )
+        )
+
+        # 3) Decompose into sub-concepts for compound / multi-entity queries
+        raw_clean = msg.strip(" ?!.")
+        # Strip leading framing phrases
+        framing_patterns = [
+            r"^(?:powiedz\s+mi|wyjaśnij(?:\s+krótko)?|wyjasnij(?:\s+krotko)?|wytłumacz|wytlumacz|opowiedz(?:\s+o)?|opisz|podaj|porównaj|porownaj)\s+",
+            r"^(?:jaki\s+jest\s+związek\s+(?:między|pomiedzy|pomiędzy)|jaki\s+jest\s+zwiazek\s+(?:miedzy|pomiedzy)|co\s+łączy|co\s+laczy|jaka\s+jest\s+różnica\s+(?:między|pomiędzy)|jaka\s+jest\s+roznica\s+(?:miedzy|pomiedzy)|czym\s+się\s+różni|czym\s+sie\s+rozni)\s+",
+            r"^(?:dlaczego\s+bez|dlaczego|czemu|czy|jak\s+działa|jak\s+dziala|na\s+czym\s+polega|w\s+jaki\s+sposób|w\s+jaki\s+sposob)\s+",
+        ]
+        body = raw_clean
+        for _ in range(3):
+            prev = body
+            for fp in framing_patterns:
+                body = re.sub(fp, "", body, flags=re.I).strip(" ?!.,;:")
+            if body == prev:
+                break
+
+        # Split around compound connectors (między X a Y, X i Y, X oraz Y, X vs Y, bez X nie byłoby Y)
+        clauses = re.split(
+            r"\s+(?:oraz|vs\.?|kontra|a\s+także|a\s+takze)\s+|,\s*(?:a\s+)?|\s+\ba\b\s+|\s+\bi\b\s+|\s+(?:na|od|w|z|przez)\s+(?=(?:[A-ZŁŚŻŹĆŃ]|[a-ząćęłńóśźż]{4,}))",
+            body,
+            flags=re.I,
+        )
+        # Clean causal fragments like "Słońca nie byłoby tlenu"
+        split_clauses: list[str] = []
+        for cl in clauses:
+            for sub_cl in re.split(r"\b(?:nie\s+byłoby|nie\s+byloby|nie\s+ma|powoduje|prowadzi\s+do|daje)\b", cl, flags=re.I):
+                sub_cl = sub_cl.strip(" ?!.,;:")
+                if sub_cl:
+                    split_clauses.append(sub_cl)
+
+        sub_concepts: list[str] = []
+        seen_sc: set[str] = set()
+        for cl in split_clauses:
+            subj_cl = _extract_query_subject(cl)
+            mwords = _extract_meaningful_words(subj_cl, keep_originals=True)
+            if not mwords:
+                continue
+            # Preserve readable short phrase (up to 4 meaningful words)
+            phrase = " ".join(mwords[:4]) if len(mwords) > 4 else subj_cl.strip(" ?!.,;:")
+            # Remove leading/trailing stopwords from phrase
+            p_tokens = [
+                t for t in re.findall(r"[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ0-9+#-]+", phrase)
+                if _strip_pl(t.lower()) not in _STOPWORDS_PL_NORM
+            ]
+            if not p_tokens:
+                continue
+            clean_phrase = " ".join(p_tokens[:4])
+            key_norm = _strip_pl(clean_phrase.lower())
+            if key_norm not in seen_sc and len(key_norm) >= 2:
+                seen_sc.add(key_norm)
+                sub_concepts.append(clean_phrase)
+
+        # For single-concept explicit definitions or simple queries, keep _extract_query_subject as single concept if split collapsed/over-split
+        base_subj = _extract_query_subject(msg)
+        base_mwords = _extract_meaningful_words(base_subj, keep_originals=True)
+        if not sub_concepts and base_mwords:
+            sub_concepts = [base_subj]
+
+        is_multi_part = (
+            len(sub_intents) >= 2
+            or (len(sub_concepts) >= 2 and not is_explicit_def and not is_connection and not is_comparison and not is_causal and not is_how and not is_yes_no)
+            or (" i kiedy " in low or " i kto " in low or " i gdzie " in low or " i ile " in low)
+        )
+
+        if is_connection:
+            intent = "connection"
+        elif is_comparison:
+            intent = "comparison"
+        elif is_causal:
+            intent = "causal_why"
+        elif is_how:
+            intent = "how_process"
+        elif is_yes_no:
+            intent = "yes_no"
+        elif is_multi_part:
+            intent = "multi_part"
+        elif sub_intents:
+            intent = "factual_detail"
+        elif is_explicit_def:
+            intent = "definition"
+        else:
+            intent = "open_question"
+
+        # Keep single clean subject for simple explicit definitions like "co to jest kwark powabny"
+        if intent == "definition" and len(base_mwords) >= 1 and len(sub_concepts) > 1 and not any(sep in low for sep in (" i ", " oraz ", ",")):
+            sub_concepts = [base_subj]
+
+        return {
+            "intent": intent,
+            "detail_kind": sub_intents[0] if sub_intents else None,
+            "sub_intents": sub_intents,
+            "sub_concepts": sub_concepts[:5],
+            "is_compound": len(sub_concepts) >= 2 or len(sub_intents) >= 2,
+        }
+
     def _format_human_learn_ack(self, mems: list[dict[str, Any]]) -> str:
         phrases: list[str] = []
         brain_named = ""
@@ -1033,6 +1510,342 @@ class LanguageCortex:
             return None
         return cand
 
+    def _extract_entity_clause(self, fact: str, entity: str) -> str:
+        """Pick the most relevant clause from a compound sentence for a specific entity."""
+        clean = _clean_fact_text(fact)
+        if not clean:
+            return ""
+        # Split compound sentences into focused clauses
+        clauses = [
+            c.strip(" ,;.")
+            for c in re.split(
+                r";\s+|,\s+(?:a|natomiast|podczas\s+gdy|zaś|jednak)\s+|,\s+(?=(?:[a-ząćęłńóśźż]+\s+){1,2}(?:przechowuje|służy|ma|jest|wykonuje|przyspiesza|dostarcza|odpowiada))",
+                clean,
+                flags=re.I,
+            )
+            if len(c.strip(" ,;.")) >= 10
+        ]
+        if len(clauses) <= 1:
+            return clean if clean.endswith((".", "!", "?")) else clean + "."
+        best = max(clauses, key=lambda cl: (_stem_overlap(entity, cl), -len(cl)))
+        if _stem_overlap(entity, best) > 0.0:
+            res = best[0].upper() + best[1:] if len(best) > 1 and best[0].islower() else best
+            return res if res.endswith((".", "!", "?")) else res + "."
+        return clean if clean.endswith((".", "!", "?")) else clean + "."
+
+    def _deliberate_best_answer(
+        self,
+        msg: str,
+        intent_info: dict[str, Any],
+        effective_subj: str,
+        is_contextual_followup: bool,
+        active_subject: str,
+        chosen_texts: list[str],
+        bridges: list[str],
+        concept_paths: list[dict[str, Any]],
+        rem_reflections: list[str],
+        concept_hints: list[str],
+        missing_concepts: list[str],
+        grounded_concepts: list[str],
+        thinking: list[str],
+    ) -> str:
+        """
+        Generate 2-4 grounded candidate answers tailored to the user's intent,
+        score them on intent fit, concept coverage, connection depth, and LM fluency,
+        and pick the strongest answer (recording the reasoning in `thinking`).
+        """
+        intent = intent_info["intent"]
+        detail_kind = intent_info.get("detail_kind")
+        sub_intents = intent_info.get("sub_intents", [])
+        sub_concepts = intent_info.get("sub_concepts", [])
+        cleaned = [clean_human_fact(t) or t.rstrip(".") + "." for t in chosen_texts if t.strip()]
+        cleaned = [c if c[-1] in ".!?" else c + "." for c in cleaned]
+
+        matching_rem: list[str] = []
+        for r in rem_reflections:
+            rc = clean_human_fact(r)
+            if not rc:
+                continue
+            rc_body = re.sub(
+                r"^(?:Wniosek\s+REM(?:\s*\([^)]*\))?|Połączenie\s+faktów(?:\s*\([^)]*\))?|Skojarzenie\s+REM(?:\s*\([^)]*\))?):\s*",
+                "",
+                rc,
+                flags=re.I,
+            ).strip()
+            rc_for_match = re.sub(
+                r"\b(?:uzupełnia\s+pamięć\s+o:|wiąże\s+się\s+to\s+z\s+tym,\s+że|z\s+kolei)\b",
+                " ",
+                rc_body,
+                flags=re.I,
+            )
+            ov_sub = sum(1 for sc in sub_concepts if _stem_overlap(sc, rc_for_match) >= 0.45)
+            min_sub = 2 if (intent in ("connection", "comparison") and len(sub_concepts) >= 2) else 1
+            if ov_sub >= min_sub or (intent not in ("connection", "comparison") and _stem_overlap(effective_subj, rc_for_match) >= 0.30):
+                if rc_body and rc_body.lower() not in " ".join(cleaned).lower():
+                    matching_rem.append(rc_body)
+
+        path_summaries = [p["summary"] for p in (concept_paths or []) if p.get("summary")]
+        top_bridge = bridges[0] if bridges else ""
+
+        candidates: list[tuple[str, str]] = []
+
+        if intent == "connection":
+            # Strategy A: Lead with discovered bridge / chain, then connect supporting facts
+            f1 = _trim_sentence_clean(cleaned[0], 150)
+            f2 = _trim_sentence_clean(cleaned[1], 150) if len(cleaned) > 1 else ""
+            if top_bridge and f2:
+                cand_conn = (
+                    f"Łączy je przede wszystkim **{top_bridge}**: {f1} "
+                    f"Jednocześnie {_lc_first(f2)}"
+                )
+            elif f2:
+                cand_conn = f"{f1} Z kolei {_lc_first(f2)}"
+            else:
+                cand_conn = f1
+            if path_summaries:
+                cand_conn += f" (Łańcuch pojęć: {path_summaries[0]}.)"
+            elif matching_rem:
+                cand_conn += f" {matching_rem[0]}"
+            candidates.append(("łączenie faktów (most + łańcuch)", cand_conn))
+
+            if len(cleaned) >= 2:
+                joined = " ".join(_trim_sentence_clean(c, 145) for c in cleaned[:3])
+                prefix = f"Kluczowy związek opiera się na pojęciu **{top_bridge}**. " if top_bridge else ""
+                candidates.append(("synteza powiązanych faktów", f"{prefix}{joined}"))
+
+        elif intent == "comparison":
+            # Strategy A: Focused per-entity clause contrast
+            if len(sub_concepts) >= 2:
+                c_parts: list[str] = []
+                used_clauses: set[str] = set()
+                for sc in sub_concepts[:3]:
+                    best_f = max(cleaned, key=lambda f: _stem_overlap(sc, f))
+                    if _stem_overlap(sc, best_f) > 0.0:
+                        cl = self._extract_entity_clause(best_f, sc)
+                        if cl.lower() not in used_clauses:
+                            used_clauses.add(cl.lower())
+                            c_parts.append(cl)
+                if len(c_parts) >= 2:
+                    comp_txt = f"{c_parts[0]} Natomiast {_lc_first(c_parts[1])}"
+                    if len(c_parts) > 2:
+                        comp_txt += f" Z kolei {_lc_first(c_parts[2])}"
+                    if top_bridge:
+                        comp_txt += f" Łączy je wspólny kontekst: **{top_bridge}**."
+                    candidates.append(("porównanie aspektów", comp_txt))
+            if len(cleaned) >= 2:
+                candidates.append(
+                    (
+                        "zestawienie pełnych faktów",
+                        f"{_trim_sentence_clean(cleaned[0], 150)} Z kolei {_lc_first(_trim_sentence_clean(cleaned[1], 150))}",
+                    )
+                )
+            else:
+                candidates.append(("zestawienie z jednego faktu", cleaned[0]))
+
+        elif intent in ("causal_why", "how_process"):
+            # Order cause/source -> bridge mechanism -> effect when multiple facts exist
+            ordered = list(cleaned)
+            if intent == "causal_why" and len(ordered) >= 2 and len(sub_concepts) >= 2:
+                cause_sc = sub_concepts[0]
+                effect_sc = sub_concepts[1]
+                # Prefer a fact mentioning cause + bridge (not just an incidental orbit fact)
+                ordered.sort(
+                    key=lambda f: (
+                        _stem_overlap(cause_sc, f) > 0 and (_stem_overlap(effect_sc, f) > 0 or (bool(top_bridge) and _stem_overlap(top_bridge, f) > 0)),
+                        _stem_overlap(effect_sc, f) > 0,
+                        _stem_overlap(cause_sc, f) > 0,
+                    ),
+                    reverse=True,
+                )
+            lead_f = _trim_sentence_clean(ordered[0], 165)
+            if len(ordered) >= 2:
+                second_f = _trim_sentence_clean(ordered[1], 160)
+                if intent == "causal_why":
+                    if top_bridge and _stem_overlap(top_bridge, " ".join(ordered[:2])) > 0:
+                        cand_c = (
+                            f"Kluczową rolę odgrywa tu **{top_bridge}**: {lead_f} "
+                            f"Dlatego {_lc_first(second_f)}"
+                        )
+                    else:
+                        cand_c = f"Wynika to z tego, że {_lc_first(lead_f)} Ponadto {_lc_first(second_f)}"
+                else:
+                    cand_c = f"{lead_f} Kolejny krok polega na tym, że {_lc_first(second_f)}"
+                if len(ordered) >= 3 and any(_stem_overlap(sc, ordered[2]) > 0 for sc in sub_concepts[:2]):
+                    cand_c += f" {_trim_sentence_clean(ordered[2], 145)}"
+                candidates.append(("wyjaśnienie przyczynowo-skutkowe", cand_c))
+            else:
+                if intent == "causal_why":
+                    candidates.append(("uzasadnienie bezpośrednie", f"Dzieje się tak dlatego, że {_lc_first(lead_f)}"))
+                else:
+                    candidates.append(("opis mechanizmu", lead_f))
+
+            if matching_rem:
+                candidates.append(("wyjaśnienie z wnioskiem REM", f"{lead_f} {matching_rem[0]}"))
+
+        elif intent == "yes_no":
+            # Pick the clause matching the query best to verify polarity accurately
+            best_fact = cleaned[0]
+            focused = self._extract_entity_clause(best_fact, effective_subj or msg)
+            f_low = _strip_pl(focused.lower())
+            q_low = _strip_pl(msg.lower())
+            neg_in_fact = bool(re.search(r"\b(?:nie|niedozwolone|brak|nigdy|niemozliwe|bez)\b", f_low))
+            neg_in_q = bool(re.search(r"\b(?:nie|brak|nigdy)\b", q_low))
+            if neg_in_fact != neg_in_q:
+                polarity = "**Nie.**"
+            else:
+                polarity = "**Tak.**"
+            cand_yn = f"{polarity} {focused}"
+            if len(cleaned) > 1:
+                extra_yn = _trim_sentence_clean(cleaned[1], 130)
+                cov_extra = sum(1 for sc in sub_concepts if _stem_overlap(sc, extra_yn) > 0)
+                if extra_yn.lower() not in cand_yn.lower() and cov_extra >= min(2, len(sub_concepts)):
+                    cand_yn += f" {extra_yn}"
+            candidates.append(("weryfikacja tak/nie", cand_yn))
+            candidates.append(("uzasadnienie opisowe", f"{focused}"))
+
+        elif intent in ("multi_part", "factual_detail"):
+            parts: list[str] = []
+            seen_p: set[str] = set()
+            if len(sub_concepts) >= 2:
+                for sc in sub_concepts[:3]:
+                    bf = max(cleaned, key=lambda f: _stem_overlap(sc, f))
+                    if _stem_overlap(sc, bf) > 0.0 and bf.lower() not in seen_p:
+                        seen_p.add(bf.lower())
+                        parts.append(_trim_sentence_clean(bf, 155))
+            for c in cleaned[:3]:
+                tc = _trim_sentence_clean(c, 155)
+                if tc.lower() not in seen_p:
+                    seen_p.add(tc.lower())
+                    parts.append(tc)
+            # For when/who multi-part queries, prioritize facts containing years or named persons
+            if "when" in sub_intents and len(parts) > 1:
+                parts.sort(key=lambda p: bool(re.search(r"\b\d{3,4}\b", p)), reverse=True)
+            direct_ans = " ".join(parts[:3])
+            candidates.append(("bezpośrednia odpowiedź wielowątkowa", direct_ans))
+            if len(cleaned) == 1:
+                candidates.append(("odpowiedź z pamięci", f"Z tego co pamiętam, {_lc_first(cleaned[0])}"))
+
+        else:
+            # open_question or definition
+            if is_contextual_followup and active_subject and active_subject.lower() not in cleaned[0].lower():
+                candidates.append(("kontynuacja kontekstowa", f"Jeśli chodzi o {active_subject}, to {_lc_first(cleaned[0])}"))
+            if intent == "definition":
+                candidates.append(("definicja klarowna", f"Najprościej mówiąc: {_lc_first(cleaned[0])}"))
+                candidates.append(("odpowiedź bezpośrednia", cleaned[0]))
+            else:
+                # Prefer direct synthesis over generic "Najprościej mówiąc:" for open questions
+                synth = _trim_sentence_clean(cleaned[0], 165)
+                if len(cleaned) > 1:
+                    synth += f" Ponadto {_lc_first(_trim_sentence_clean(cleaned[1], 150))}"
+                if len(cleaned) > 2:
+                    synth += f" {_trim_sentence_clean(cleaned[2], 140)}"
+                candidates.append(("synteza wiedzy", synth))
+                candidates.append(("odpowiedź z pamięci", f"Z tego co pamiętam, {_lc_first(cleaned[0])}"))
+
+        # Add matching REM insight or graph path if helpful and not already included
+        if matching_rem and candidates:
+            base_lbl, base_txt = candidates[0]
+            if matching_rem[0].lower() not in base_txt.lower() and intent not in ("yes_no", "definition"):
+                candidates.append((f"{base_lbl} + REM", f"{base_txt} Patrząc szerzej: {matching_rem[0]}"))
+
+        # Optional neural Transformer LM candidate (only if genuinely fluent & grounded)
+        ctx_hint = f"Rozmawialiśmy o: {active_subject}." if active_subject else f"Intencja: {intent}."
+        lm_reply = self._try_transformer_reply(
+            mem_hint=" ".join(cleaned[:2]),
+            ctx_hint=ctx_hint,
+            user_msg=msg,
+            reference_texts=cleaned,
+        )
+        if lm_reply:
+            candidates.append(("Transformer LM", lm_reply))
+
+        # Deduplicate candidates
+        uniq_cands: list[tuple[str, str]] = []
+        seen_cand_txt: set[str] = set()
+        for lbl, txt in candidates:
+            t_clean = txt.strip()
+            if t_clean and t_clean.lower() not in seen_cand_txt:
+                seen_cand_txt.add(t_clean.lower())
+                uniq_cands.append((lbl, t_clean))
+
+        if not uniq_cands:
+            uniq_cands = [("odpowiedź bazowa", cleaned[0] if cleaned else "")]
+
+        # Score candidates jointly across 4 criteria
+        cand_texts = [txt for _, txt in uniq_cands]
+        with self._op_lock:
+            lm_scores = self.transformer_lm.sequence_scores(cand_texts, self.tokenizer)
+        min_lm = min(lm_scores)
+        max_lm = max(lm_scores)
+        lm_span = max(1e-4, max_lm - min_lm)
+
+        scored_cands: list[tuple[float, str, str]] = []
+        target_concepts = grounded_concepts or sub_concepts
+        for (lbl, txt), lms in zip(uniq_cands, lm_scores):
+            t_low = txt.lower()
+            # 1) Intent fit (0..0.38)
+            intent_fit = 0.24
+            is_def_style = t_low.startswith(("najprościej mówiąc:", "słowo „", "znaczenie słowa"))
+            if intent == "definition":
+                intent_fit = 0.36 if is_def_style else 0.28
+            else:
+                if is_def_style:
+                    intent_fit = 0.08  # penalize definition boilerplate on non-definition questions
+                elif intent == "connection" and any(k in t_low for k in ("łączy", "łańcuch", "jednocześnie", "z kolei", "most")):
+                    intent_fit = 0.37
+                elif intent == "comparison":
+                    if lbl.startswith("porównanie aspektów"):
+                        intent_fit = 0.44
+                    elif any(k in t_low for k in ("natomiast", "z kolei", "łączy je")):
+                        intent_fit = 0.28
+                    else:
+                        intent_fit = 0.22
+                elif intent in ("causal_why", "how_process") and any(k in t_low for k in ("dlatego", "wynika", "kluczową", "kolejny krok", "ponieważ", "dzięki")):
+                    intent_fit = 0.36
+                elif intent == "yes_no":
+                    intent_fit = 0.44 if (t_low.startswith("**tak.**") or t_low.startswith("**nie.**")) else 0.18
+                elif intent in ("multi_part", "factual_detail"):
+                    intent_fit = 0.34
+                elif intent == "open_question":
+                    intent_fit = 0.33
+
+            # 2) Concept coverage (0..0.28)
+            if target_concepts:
+                cov = sum(1 for sc in target_concepts if _stem_overlap(sc, txt) > 0.0) / len(target_concepts)
+            else:
+                cov = 1.0 if _stem_overlap(effective_subj, txt) > 0.0 else 0.5
+            cov_score = 0.28 * cov
+
+            # 3) Connection depth (0..0.20)
+            conn_score = 0.06
+            if top_bridge and _stem_overlap(top_bridge, txt) > 0.0:
+                conn_score += 0.07
+            if len(cleaned) >= 2 and sum(1 for c in cleaned[:3] if _stem_overlap(c[:50], txt) >= 0.4) >= 2:
+                conn_score += 0.05
+            if "patrząc szerzej" in t_low or "łańcuch pojęć" in t_low:
+                conn_score += 0.02
+
+            # 4) LM fluency (0..0.14)
+            norm_lm = (lms - min_lm) / lm_span if len(uniq_cands) > 1 else 0.5
+            lm_fit = 0.14 * norm_lm
+
+            total = intent_fit + cov_score + conn_score + lm_fit
+            scored_cands.append((total, lbl, txt))
+
+        scored_cands.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_lbl, best_reply = scored_cands[0]
+
+        if missing_concepts and grounded_concepts:
+            missing_str = ", ".join(missing_concepts[:2])
+            best_reply += (
+                f"\n\n*(Brakuje mi jeszcze pewnych danych o: „{missing_str}” — "
+                f"możesz użyć `/ucz {missing_concepts[0]}`, żebym uzupełnił lukę.)*"
+            )
+
+        summary_scores = ", ".join(f"{lbl}={sc:.2f}" for sc, lbl, _ in scored_cands[:3])
+        thinking.append(f"Porównanie wariantów odpowiedzi ({summary_scores}) → wybrano: „{best_lbl}”.")
+        return best_reply.strip()
+
     def _compose_human_reply(
         self,
         subj: str,
@@ -1103,6 +1916,7 @@ class LanguageCortex:
         user_profile: list[str] | None = None,
         episodic_memories: list[str] | None = None,
         active_subject: str = "",
+        concept_paths: list[dict[str, Any]] | None = None,
     ) -> str:
         reply, _ = self._chat_reply_with_meta(
             user_message=user_message,
@@ -1118,6 +1932,7 @@ class LanguageCortex:
             user_profile=user_profile,
             episodic_memories=episodic_memories,
             active_subject=active_subject,
+            concept_paths=concept_paths,
         )
         return reply
 
@@ -1136,6 +1951,7 @@ class LanguageCortex:
         user_profile: list[str] | None = None,
         episodic_memories: list[str] | None = None,
         active_subject: str = "",
+        concept_paths: list[dict[str, Any]] | None = None,
     ) -> tuple[str, str | None]:
         msg = user_message.strip()
         low = _strip_pl(msg.lower()).strip(" ?!.,;:")
@@ -1307,6 +2123,24 @@ class LanguageCortex:
                 None,
             )
 
+        # 4b) Assistant-directed capability / local action questions ("mozesz pliki przeszukiwac?")
+        intent_info = self.analyze_query_intent(msg)
+        if intent_info["intent"] == "self_capability":
+            thinking.append("Wykryto pytanie o własne możliwości działania/narzędzia asystenta — odpowiadam uczciwie o zakresie funkcji.")
+            if any(k in low for k in ("plik", "folder", "katalog", "dysk", "komputer", "pulpit", "terminal", "system")):
+                return (
+                    f"Nie mam bezpośredniego dostępu do plików ani folderów na Twoim komputerze{name_part} — działam wyłącznie "
+                    "wewnątrz własnej pamięci i modelu PyTorch w tej aplikacji.\n"
+                    "Mogę jednak od razu pomóc na inne sposoby: wklej tu fragment tekstu albo zapamiętaj fakty zdaniami twierdzącymi, "
+                    "użyj `/ucz <temat lub adres URL>`, a także łączę pojęcia w grafie i liczę zadania matematyczne.",
+                    None,
+                )
+            return (
+                f"Jako lokalny mózg PyTorch potrafię rozmawiać po polsku, zapamiętywać fakty, łączyć je przez graf skojarzeń i sen REM, "
+                f"liczyć zadania matematyczne oraz uczyć się nowych tematów z sieci przez `/ucz <temat>` (lub Auto-sieć){name_part}.",
+                None,
+            )
+
         # 5) Short conversational follow-ups / confusion without a specific subject
         follow_up_phrases = (
             "ale co", "co", "no i", "i co", "o co chodzi", "dlaczego", "czemu",
@@ -1379,11 +2213,11 @@ class LanguageCortex:
         if extracted_now["memories"] and not is_question:
             return (self._format_human_learn_ack(extracted_now["memories"]), None)
 
-        # 10) Knowledge / definition / contextual follow-up query grounded in recalled memory
+        # 10) Knowledge / multi-hop reasoning / contextual follow-up query grounded in recalled memory
         subj = _extract_query_subject(msg)
         subj_low = _strip_pl(subj.lower())
         conversational_tokens = {"moge", "mozesz", "mozemy", "toba", "mna", "ciebie", "jestem", "jestes", "rozmiac", "rozmawiac", "pogadac", "ale", "czy"}
-        subj_words = [w for w in re.findall(r"[a-z0-9+#]{2,}", subj_low) if w not in _STOPWORDS_PL]
+        subj_words = [w for w in re.findall(r"[a-z0-9+#]{2,}", subj_low) if w not in _STOPWORDS_PL_NORM]
 
         pronoun_or_followup = any(
             w in {"on", "ona", "ono", "niego", "niej", "nim", "nia", "jego", "jej", "tego", "tym", "tej", "to", "zyl", "powstal", "wiecej"}
@@ -1392,21 +2226,35 @@ class LanguageCortex:
         is_contextual_followup = bool(active_subject) and (pronoun_or_followup or low.startswith(("a ", "i ", "powiedz cos wiecej", "rozwin")))
         effective_subj = active_subject if is_contextual_followup else subj
         eff_low = _strip_pl(effective_subj.lower())
-        eff_words = [w for w in re.findall(r"[a-z0-9+#]{2,}", eff_low) if w not in _STOPWORDS_PL]
+        eff_words = [w for w in re.findall(r"[a-z0-9+#]{2,}", eff_low) if w not in _STOPWORDS_PL_NORM]
+
+        if is_contextual_followup and active_subject:
+            intent_info = self.analyze_query_intent(f"{active_subject} {msg}")
+        sub_concepts: list[str] = list(intent_info.get("sub_concepts", []))
+        if is_contextual_followup and active_subject and active_subject.lower() not in [s.lower() for s in sub_concepts]:
+            sub_concepts = [active_subject] + sub_concepts[:4]
+        intent = intent_info["intent"]
+        detail_kind = intent_info.get("detail_kind")
 
         is_non_topic_phrase = (
             len(effective_subj) <= 2
-            or not eff_words
-            or any(w in conversational_tokens for w in eff_words)
+            or (not eff_words and not sub_concepts)
+            or (len(sub_concepts) <= 1 and any(w in conversational_tokens for w in eff_words))
         )
 
-        candidates: list[str] = []
+        raw_pool = hippocampus_memories + semantic_memories
+        clean_candidates: list[str] = []
+        fallback_candidates: list[str] = []
         seen_c: set[str] = set()
-        for raw in hippocampus_memories + semantic_memories:
+        for raw in raw_pool:
             c = _clean_fact_text(raw)
-            if c and c.lower() not in seen_c:
-                seen_c.add(c.lower())
-                candidates.append(c)
+            if not c or c.lower() in seen_c:
+                continue
+            seen_c.add(c.lower())
+            fallback_candidates.append(c)
+            if not _is_noisy_memory(c):
+                clean_candidates.append(c)
+        candidates = clean_candidates if clean_candidates else fallback_candidates
 
         if not candidates:
             if is_non_topic_phrase:
@@ -1415,138 +2263,302 @@ class LanguageCortex:
                     "(np. `co to jest fotosynteza`), działanie matematyczne albo wpisz `/szkola`, żebym poznał podstawy.",
                     None,
                 )
+            ask_topic = sub_concepts[0] if sub_concepts else effective_subj
             return (
-                f"Szczerze mówiąc nie mam jeszcze w pamięci informacji o „{effective_subj}”. "
-                f"Jeśli wpiszesz `/ucz {effective_subj}`, sam doczytam o tym w sieci i zaraz pogadamy!",
-                effective_subj,
+                f"Szczerze mówiąc nie mam jeszcze w pamięci informacji o „{ask_topic}”. "
+                f"Jeśli wpiszesz `/ucz {ask_topic}`, sam doczytam o tym w sieci i zaraz pogadamy!",
+                ask_topic,
             )
 
-        # Rank candidates jointly using GPU Semantic Encoder + Polish stem overlap + Transformer LM score
-        vecs = self.encode_texts([effective_subj, f"{effective_subj} {msg}"] + candidates)
+        # Rank candidates jointly using GPU Semantic Encoder + intent fit + sub-concept coverage + Transformer LM score
+        sub_list = sub_concepts[:5] if sub_concepts else [effective_subj]
+        vecs = self.encode_texts([effective_subj, f"{effective_subj} {msg}"] + sub_list + candidates)
         subj_vec = vecs[0]
         msg_vec = vecs[1]
-        cand_vecs = vecs[2:]
+        sub_vecs = vecs[2 : 2 + len(sub_list)]
+        cand_vecs = vecs[2 + len(sub_list) :]
         with self._op_lock:
             lm_scores = self.transformer_lm.sequence_scores(candidates, self.tokenizer)
 
-        ranked: list[tuple[float, float, float, int, str, list[float]]] = []
+        subj_mwords = _extract_meaningful_words(effective_subj)
+        ranked: list[tuple[float, float, float, int, list[str], str, list[float]]] = []
         for cand, cvec, lms in zip(candidates, cand_vecs, lm_scores):
             ov_subj = _stem_overlap(effective_subj, cand)
             ov_msg = _stem_overlap(msg, cand)
-            ov = max(ov_subj, 0.7 * ov_msg)
-            cand_stems = set(_tokenize_stems(cand))
-            subj_stems = _tokenize_stems(effective_subj)
+            ov = max(ov_subj, 0.85 * ov_msg)
+
+            cand_mwords = _extract_meaningful_words(cand)
             matched_subj_words = sum(
-                1 for sw in subj_stems
-                if any(cs == sw or (len(sw) >= 4 and len(cs) >= 4 and cs[:4] == sw[:4]) for cs in cand_stems)
+                1 for sw in subj_mwords if any(_word_matches(sw, cw) for cw in cand_mwords)
             )
+            covered_subs = [
+                sc for sc in sub_list
+                if _stem_overlap(sc, cand) >= 0.45
+                or (len(_extract_meaningful_words(sc)) == 1 and _stem_overlap(sc, cand) > 0.0)
+            ]
+
             subj_cos = _cosine_list(subj_vec, cvec)
             msg_cos = _cosine_list(msg_vec, cvec)
-            cos = 0.75 * subj_cos + 0.25 * msg_cos
-            date_bonus = 0.14 if ("kiedy" in low and re.search(r"\b\d{3,4}\b", cand)) else 0.0
-            is_def = any(cue in cand.lower() for cue in ("oznacza", " to ", " jest ", " – ", " — ", "składa się", "był "))
-            def_bonus = 0.12 if is_def else 0.0
-            lm_bonus = max(-0.05, min(0.08, (lms + 6.0) * 0.015))
-            total = 0.48 * ov + 0.36 * cos + def_bonus + date_bonus + lm_bonus
-            ranked.append((total, ov, subj_cos, matched_subj_words, cand, cvec))
+            best_sub_cos = max((_cosine_list(sv, cvec) for sv in sub_vecs), default=subj_cos)
+            cos = 0.55 * max(subj_cos, best_sub_cos) + 0.45 * msg_cos
+
+            # Intent-aligned bonuses / penalties
+            intent_adj = 0.0
+            cand_low = cand.lower()
+            is_def_cue = any(cue in cand_low for cue in ("oznacza", " to ", " jest ", " – ", " — ", "składa się", "był "))
+            if intent == "definition":
+                intent_adj += 0.10 if is_def_cue else 0.0
+            else:
+                if _is_bare_definition(cand):
+                    intent_adj -= 0.18
+                if intent in ("causal_why", "how_process", "connection") and any(
+                    cue in cand_low for cue in ("powoduje", "wytwarza", "dostarcza", "wymaga", "dzięki", "polega", "przechowuje", "służy", "umożliwia", "tworzy")
+                ):
+                    intent_adj += 0.12
+                if (detail_kind == "when" or "when" in intent_info.get("sub_intents", [])) and re.search(r"\b\d{3,4}\b", cand):
+                    intent_adj += 0.14
+                if (detail_kind == "how_many" or "how_many" in intent_info.get("sub_intents", [])) and re.search(r"\b(?:\d+|jeden|dwa|trzy|cztery|pięć|sześć|siedem|osiem|ośmiu|dziewięć|dziesięć|dwanaście)\b", cand_low):
+                    intent_adj += 0.12
+                if detail_kind == "where" and any(cue in cand_low for cue in ("leży", "znajduje", "nad ", "w ", "na ")):
+                    intent_adj += 0.08
+                if intent == "yes_no" and any(cue in cand_low for cue in ("nie ", "niedozwolone", "tak", "zawsze", "nigdy", "każdy")):
+                    intent_adj += 0.10
+
+            sub_cov_bonus = 0.10 * min(2, len(covered_subs)) if len(sub_list) >= 2 else 0.0
+            lm_bonus = max(-0.04, min(0.07, (lms + 6.0) * 0.014))
+            total = 0.44 * ov + 0.34 * cos + intent_adj + sub_cov_bonus + lm_bonus
+            ranked.append((total, ov, max(subj_cos, best_sub_cos), matched_subj_words, covered_subs, cand, cvec))
 
         thinking.append(
-            f"Temat roboczy: „{effective_subj}”"
-            + (f" (kontekst rozmowy: „{active_subject}”)" if active_subject else "")
+            f"Intencja: {intent}"
+            + (f" ({detail_kind})" if detail_kind else "")
+            + (f" · pojęcia: {', '.join(sub_list)}" if sub_list else f" · temat: „{effective_subj}”")
             + f". Przeszukano {len(candidates)} wspomnień."
         )
         ranked.sort(key=lambda x: x[0], reverse=True)
-        top_score, top_ov, top_subj_cos, top_matched_words, _, _ = ranked[0]
-        thinking.append(
-            f"Najlepsze dopasowanie: pokrycie słów={top_ov:.2f}, podobieństwo semantyczne={top_subj_cos:.2f}, "
-            f"trafione rdzenie={top_matched_words}."
-        )
+        top_score, top_ov, top_subj_cos, top_matched_words, _, _, _ = ranked[0]
 
-        # Never return a random unrelated memory when there is zero lexical overlap
-        no_lexical_grounding = top_ov < 0.12
-        multi_word_mismatch = len(eff_words) >= 2 and top_matched_words < 2 and top_ov < 0.45
-        if no_lexical_grounding or (top_ov < 0.25 and top_subj_cos < 0.55) or multi_word_mismatch:
-            if is_non_topic_phrase:
-                thinking.append("Brak wystarczającego pokrycia w pamięci i fraza nie jest nazwą tematu — proszę o doprecyzowanie.")
+        # Grounding check: strict for single-concept queries, multi-concept aware for compound queries
+        if len(sub_list) >= 2:
+            facts_by_concept: dict[str, list[tuple[float, float, str, list[float]]]] = {}
+            grounded_concepts: list[str] = []
+            missing_concepts: list[str] = []
+            path_nodes_text = " ".join(
+                f"{p.get('start', '')} {p.get('end', '')}" for p in (concept_paths or [])
+            )
+            for sc in sub_list:
+                sc_mwords = _extract_meaningful_words(sc)
+                sc_in_paths = bool(path_nodes_text and _stem_overlap(sc, path_nodes_text) >= 0.45)
+                sc_hits: list[tuple[float, float, str, list[float]]] = []
+                for total, ov, scos, _, cov_subs, cand, cvec in ranked:
+                    ov_sc = _stem_overlap(sc, cand)
+                    cand_mw = _extract_meaningful_words(cand)
+                    matched_cnt = sum(1 for sw in sc_mwords if any(_word_matches(sw, cw) for cw in cand_mw))
+                    if len(sc_mwords) >= 2:
+                        ok = matched_cnt >= 2 or (ov_sc >= 0.5 and (scos >= 0.32 or sc_in_paths))
+                    else:
+                        ok = ov_sc > 0.0 or sc in cov_subs
+                    if ok:
+                        sc_hits.append((total + 0.35 * ov_sc, ov_sc, cand, cvec))
+                sc_hits.sort(key=lambda x: x[0], reverse=True)
+                if sc_hits:
+                    facts_by_concept[sc] = sc_hits
+                    grounded_concepts.append(sc)
+                else:
+                    missing_concepts.append(sc)
+
+            if not grounded_concepts:
+                lookup_subj = " ".join(sub_list[:2])
+                thinking.append(f"Brak ugruntowanych faktów dla pojęć ({lookup_subj}) — potrzebna nauka z sieci.")
                 return (
-                    "Nie jestem pewien, o jaki dokładnie temat pytasz. Napisz proszę nazwę pojęcia "
-                    "albo kliknij `🎓 Szkoła Podstawowa` (`/szkola`).",
-                    None,
+                    f"Nie wiem jeszcze wystarczająco dużo o „{lookup_subj}”, żeby nie zmyślać. "
+                    f"Wpisz `/ucz {lookup_subj}`, a chętnie się tego nauczę z internetu!",
+                    lookup_subj,
                 )
-            lookup_subj = effective_subj
-            if len(eff_words) == 1 and recent_turns and not is_contextual_followup:
-                for t in reversed(recent_turns):
-                    if t.get("role") == "user":
-                        prev_subj = _extract_query_subject(t.get("content", ""))
-                        prev_words = [w for w in re.findall(r"[a-z0-9+#]{3,}", _strip_pl(prev_subj.lower())) if w not in _STOPWORDS_PL]
-                        if prev_words and prev_subj.lower() != effective_subj.lower():
-                            lookup_subj = f"{effective_subj} {prev_words[-1]}"
+
+            # Collect bridges across graph paths, shared meaningful concepts, REM reflections & concept hints
+            bridges: list[str] = []
+            seen_br: set[str] = set()
+
+            def add_bridge(b: str) -> None:
+                bn = _strip_pl(b.strip().lower())
+                if (
+                    b
+                    and len(bn) >= 3
+                    and not re.match(r"^\d", bn)
+                    and bn not in _STOPWORDS_PL_NORM
+                    and bn not in _WEAK_BRIDGE_WORDS_NORM
+                    and bn not in seen_br
+                ):
+                    seen_br.add(bn)
+                    bridges.append(b.strip())
+
+            for p in (concept_paths or []):
+                for br in p.get("bridges", []):
+                    add_bridge(br)
+
+            # Balanced fact selection: pick top fact per grounded concept + connecting bridge facts
+            chosen_texts: list[str] = []
+            chosen_vecs: list[list[float]] = []
+            for sc in grounded_concepts:
+                for _, _, cand, cvec in facts_by_concept[sc]:
+                    if cand in chosen_texts:
                         break
-            thinking.append(f"Za mała pewność odpowiedzi dla „{lookup_subj}” — potrzebna nauka z sieci (Auto-sieć lub /ucz).")
-            return (
-                f"Nie wiem jeszcze wystarczająco dużo o „{effective_subj}”, żeby nie zmyślać. "
-                f"Wpisz `/ucz {lookup_subj}`, a chętnie się tego nauczę z internetu!",
-                lookup_subj,
-            )
+                    if any(_cosine_list(cvec, pv) > 0.88 for pv in chosen_vecs):
+                        continue
+                    chosen_texts.append(cand)
+                    chosen_vecs.append(cvec)
+                    break
 
-        relevant = [
-            item for item in ranked
-            if (item[1] >= 0.30 or item[2] >= max(0.58, top_subj_cos - 0.05))
-            and not (len(eff_words) >= 2 and item[3] < 2 and item[2] < 0.68)
-        ]
-        chosen_texts: list[str] = []
-        chosen_vecs: list[list[float]] = []
-        max_facts = 1 if any(w in low for w in ("krotko", "w skrocie")) else 3
+            # Look for a bridge fact connecting >= 2 grounded facts or covering discovered graph bridges
+            sub_norm_words = {_strip_pl(w) for sc in sub_list for w in _extract_meaningful_words(sc)}
+            for i in range(len(chosen_texts)):
+                for j in range(i + 1, len(chosen_texts)):
+                    for sh in _shared_meaningful_concepts(chosen_texts[i], chosen_texts[j]):
+                        if not any(_word_matches(_strip_pl(sh), sw) for sw in sub_norm_words):
+                            add_bridge(sh)
 
-        for _, _, _, _, cand, cvec in relevant:
-            if any(_cosine_list(cvec, pv) > 0.84 for pv in chosen_vecs):
-                continue
-            chosen_texts.append(cand)
-            chosen_vecs.append(cvec)
-            if len(chosen_texts) >= max_facts:
-                break
+            # Pull in an intermediate bridge fact if graph paths found a bridge not yet in chosen_texts
+            for br in bridges[:3]:
+                if len(chosen_texts) >= 4:
+                    break
+                if any(_stem_overlap(br, ct) >= 0.5 for ct in chosen_texts):
+                    continue
+                br_cands = [item for item in ranked if _stem_overlap(br, item[5]) >= 0.5]
+                if br_cands:
+                    _, _, _, _, _, bcand, bvec = br_cands[0]
+                    if bcand not in chosen_texts and not any(_cosine_list(bvec, pv) > 0.86 for pv in chosen_vecs):
+                        chosen_texts.append(bcand)
+                        chosen_vecs.append(bvec)
 
-        if not chosen_texts:
-            chosen_texts = [ranked[0][4]]
+            # Fill up to max_facts with highest-ranked remaining facts
+            max_facts = 1 if any(w in low for w in ("krotko", "w skrocie")) else 4
+            for _, _, _, _, _, cand, cvec in ranked:
+                if len(chosen_texts) >= max_facts:
+                    break
+                if cand in chosen_texts or any(_cosine_list(cvec, pv) > 0.84 for pv in chosen_vecs):
+                    continue
+                chosen_texts.append(cand)
+                chosen_vecs.append(cvec)
 
-        ctx_hint = f"Rozmawialiśmy o: {active_subject}." if active_subject else ""
-        lm_reply = self._try_transformer_reply(
-            mem_hint=" ".join(chosen_texts[:2]),
-            ctx_hint=ctx_hint,
-            user_msg=msg,
-            reference_texts=chosen_texts,
-        )
-        if lm_reply:
-            thinking.append(
-                f"Wygenerowano odpowiedź bezpośrednio przez Transformer LM (płynność {self.transformer_lm.fluency_score:.0f}%) "
-                f"na podstawie {len(chosen_texts)} faktów."
-            )
-            final_reply = lm_reply
-        else:
-            thinking.append(
-                f"Zsyntetyzowano naturalną odpowiedź z {len(chosen_texts)} faktów i oceniono warianty przez Transformer LM "
-                f"(płynność {self.transformer_lm.fluency_score:.0f}%)."
-            )
-            final_reply = self._compose_human_reply(
-                subj=effective_subj,
-                chosen_texts=chosen_texts,
+            # Recompute shared bridges after bridge fact insertion
+            for i in range(len(chosen_texts)):
+                for j in range(i + 1, len(chosen_texts)):
+                    for sh in _shared_meaningful_concepts(chosen_texts[i], chosen_texts[j]):
+                        if not any(_word_matches(_strip_pl(sh), sw) for sw in sub_norm_words):
+                            add_bridge(sh)
+            for i in range(len(chosen_texts)):
+                for j in range(i + 1, len(chosen_texts)):
+                    for sh in _shared_meaningful_concepts(chosen_texts[i], chosen_texts[j]):
+                        add_bridge(sh)
+
+            if concept_paths:
+                thinking.append(f"Ścieżka w grafie pojęć: {concept_paths[0]['summary']}.")
+            if bridges:
+                thinking.append(f"Wykryte mosty łączące fakty: {', '.join(bridges[:3])}.")
+            thinking.append(f"Połączono {len(chosen_texts)} faktów (pokryte pojęcia: {', '.join(grounded_concepts)}).")
+
+            final_reply = self._deliberate_best_answer(
+                msg=msg,
+                intent_info=intent_info,
+                effective_subj=effective_subj,
                 is_contextual_followup=is_contextual_followup,
                 active_subject=active_subject,
+                chosen_texts=chosen_texts[:max_facts],
+                bridges=bridges,
+                concept_paths=concept_paths or [],
                 rem_reflections=rem_reflections,
                 concept_hints=concept_hints,
+                missing_concepts=missing_concepts,
+                grounded_concepts=grounded_concepts,
+                thinking=thinking,
             )
-            if ("wskaznik" in low or "wskaźnik" in low) and ("c++" in low or "cpp" in low):
-                final_reply += (
-                    "\n```cpp\n"
-                    "int liczba = 42;\n"
-                    "int* wskaznik = &liczba; // przechowuje adres zmiennej\n"
-                    "int wartosc = *wskaznik; // dereferencja -> 42\n"
-                    "```"
+        else:
+            thinking.append(
+                f"Najlepsze dopasowanie: pokrycie słów={top_ov:.2f}, podobieństwo semantyczne={top_subj_cos:.2f}, "
+                f"trafione rdzenie={top_matched_words}."
+            )
+            no_lexical_grounding = top_ov < 0.12
+            multi_word_mismatch = len(eff_words) >= 2 and top_matched_words < 2 and top_ov < 0.45
+            if no_lexical_grounding or (top_ov < 0.25 and top_subj_cos < 0.55) or multi_word_mismatch:
+                if is_non_topic_phrase:
+                    thinking.append("Brak wystarczającego pokrycia w pamięci i fraza nie jest nazwą tematu — proszę o doprecyzowanie.")
+                    return (
+                        "Nie jestem pewien, o jaki dokładnie temat pytasz. Napisz proszę nazwę pojęcia "
+                        "albo kliknij `🎓 Szkoła Podstawowa` (`/szkola`).",
+                        None,
+                    )
+                lookup_subj = effective_subj
+                if len(eff_words) == 1 and recent_turns and not is_contextual_followup:
+                    for t in reversed(recent_turns):
+                        if t.get("role") == "user":
+                            prev_subj = _extract_query_subject(t.get("content", ""))
+                            prev_words = [w for w in re.findall(r"[a-z0-9+#]{3,}", _strip_pl(prev_subj.lower())) if w not in _STOPWORDS_PL_NORM]
+                            if prev_words and prev_subj.lower() != effective_subj.lower():
+                                lookup_subj = f"{effective_subj} {prev_words[-1]}"
+                            break
+                thinking.append(f"Za mała pewność odpowiedzi dla „{lookup_subj}” — potrzebna nauka z sieci (Auto-sieć lub /ucz).")
+                return (
+                    f"Nie wiem jeszcze wystarczająco dużo o „{effective_subj}”, żeby nie zmyślać. "
+                    f"Wpisz `/ucz {lookup_subj}`, a chętnie się tego nauczę z internetu!",
+                    lookup_subj,
                 )
+
+            relevant = [
+                item for item in ranked
+                if (item[1] >= 0.30 or item[2] >= max(0.58, top_subj_cos - 0.05))
+                and not (len(eff_words) >= 2 and item[3] < 2 and item[2] < 0.68)
+            ]
+            chosen_texts = []
+            chosen_vecs = []
+            max_facts = 1 if any(w in low for w in ("krotko", "w skrocie")) else 3
+
+            for _, _, _, _, _, cand, cvec in relevant:
+                if any(_cosine_list(cvec, pv) > 0.84 for pv in chosen_vecs):
+                    continue
+                chosen_texts.append(cand)
+                chosen_vecs.append(cvec)
+                if len(chosen_texts) >= max_facts:
+                    break
+
+            if not chosen_texts:
+                chosen_texts = [ranked[0][5]]
+
+            bridges = []
+            for p in (concept_paths or []):
+                bridges.extend(p.get("bridges", []))
+            if concept_paths:
+                thinking.append(f"Powiązania w grafie: {concept_paths[0]['summary']}.")
+
+            final_reply = self._deliberate_best_answer(
+                msg=msg,
+                intent_info=intent_info,
+                effective_subj=effective_subj,
+                is_contextual_followup=is_contextual_followup,
+                active_subject=active_subject,
+                chosen_texts=chosen_texts,
+                bridges=bridges,
+                concept_paths=concept_paths or [],
+                rem_reflections=rem_reflections,
+                concept_hints=concept_hints,
+                missing_concepts=[],
+                grounded_concepts=sub_list,
+                thinking=thinking,
+            )
+
+        if ("wskaznik" in low or "wskaźnik" in low) and ("c++" in low or "cpp" in low):
+            final_reply += (
+                "\n```cpp\n"
+                "int liczba = 42;\n"
+                "int* wskaznik = &liczba; // przechowuje adres zmiennej\n"
+                "int wartosc = *wskaznik; // dereferencja -> 42\n"
+                "```"
+            )
 
         if state_mode == "DROWSY" or energy <= self.cfg.drowsy_threshold:
             final_reply += "\n(Jestem już lekko śpiący — przyda się `/sen`, żebym utrwalił nowe rzeczy na GPU.)"
 
+        ctx_hint = f"Rozmawialiśmy o: {active_subject}." if active_subject else ""
         sample_seq = (
             f"<MEM> {' '.join(chosen_texts[:2])[:220]} "
             f"<CTX> {ctx_hint or 'początek rozmowy'} "
@@ -1573,6 +2585,7 @@ class LanguageCortex:
         user_profile: list[str] | None = None,
         episodic_memories: list[str] | None = None,
         active_subject: str = "",
+        concept_paths: list[dict[str, Any]] | None = None,
     ) -> Iterator[str]:
         reply = self.chat_reply(
             user_message=user_message,
@@ -1588,6 +2601,7 @@ class LanguageCortex:
             user_profile=user_profile,
             episodic_memories=episodic_memories,
             active_subject=active_subject,
+            concept_paths=concept_paths,
         )
         # Stream smoothly in natural word chunks
         tokens = re.findall(r"\S+\s*", reply)

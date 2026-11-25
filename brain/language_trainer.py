@@ -87,6 +87,10 @@ BASE_HUMAN_DIALOGUES: list[tuple[str, str, str, str]] = [
     ("", "", "ile to jest 7 * 8?", "7 razy 8 daje 56."),
     ("", "", "ile to 25% z 200?", "25% z 200 to dokładnie 50."),
     ("", "", "pierwiastek z 144", "Pierwiastek kwadratowy z 144 wynosi 12."),
+    ("", "", "możesz przeszukiwać pliki na komputerze?", "Nie mam bezpośredniego dostępu do plików na Twoim dysku — działam w swojej pamięci PyTorch. Możesz wkleić tekst, użyć /ucz <temat> albo zadać pytanie."),
+    ("Fotosynteza wytwarza tlen. Układ oddechowy dostarcza tlen.", "", "jaki jest związek między fotosyntezą a oddychaniem?", "Łączy je przede wszystkim tlen: fotosynteza wytwarza tlen, a układ oddechowy dostarcza go organizmowi."),
+    ("Pamięć RAM przechowuje dane tymczasowe, a dysk SSD służy do zapisu trwałego.", "", "porównaj pamięć RAM i dysk SSD", "Pamięć RAM przechowuje dane tymczasowe, natomiast dysk SSD służy do zapisu trwałego."),
+    ("Dźwięk rozchodzi się w powietrzu, ale nie rozchodzi się w próżni.", "", "czy dźwięk rozchodzi się w próżni?", "Nie. Dźwięk potrzebuje ośrodka materialnego i nie rozchodzi się w próżni."),
 ]
 
 
@@ -132,8 +136,9 @@ def build_training_dialogues(
             bn = b_name.group(1).capitalize()
             add_seq(cp, "", "jak masz na imię?", f"Mam na imię {bn} — tak mnie nazwałeś.")
 
-    # Knowledge fact -> natural human Q&A + contextual follow-up turns
+    # Knowledge fact -> varied natural Polish Q&A + cross-fact reasoning dialogues
     seen_facts: set[str] = set()
+    cleaned_subjects: list[tuple[str, str]] = []
     for raw in memories:
         clean = _humanize_statement(raw)
         if not clean or len(clean) < 18:
@@ -143,22 +148,59 @@ def build_training_dialogues(
             continue
         seen_facts.add(key)
 
-        # Extract candidate subject from the beginning of the sentence
         lower_body = clean[0].lower() + clean[1:] if len(clean) > 1 and not clean[:2].isupper() else clean
-        m_subj = re.match(r"^([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#\s„”-]{2,42}?)\s+(?:to|jest|są|oznacza|był|była|składa się|ma)\b", clean)
+        low_c = clean.lower()
+        m_subj = re.match(r"^([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#\s„”-]{2,42}?)\s+(?:to|jest|są|oznacza|był|była|składa się|ma|powoduje|wytwarza|dostarcza|przechowuje|służy)\b", clean)
         if m_subj:
             subj = m_subj.group(1).strip(" „”:-")
             if 2 <= len(subj) <= 36:
-                add_seq(clean, "", f"co to jest {subj}?", f"Najprościej mówiąc: {lower_body}")
-                add_seq(clean, "", f"co wiesz o {subj}?", f"Z tego co pamiętam, {lower_body}")
+                cleaned_subjects.append((subj, clean))
+                if any(cue in low_c for cue in ("powoduje", "wytwarza", "polega na", "służy", "dostarcza", "odpowiedzialn", "umożliwia")):
+                    add_seq(clean, "", f"jak działa {subj}?", clean)
+                    add_seq(clean, "", f"za co odpowiada {subj}?", f"{clean}")
+                elif re.search(r"\b\d{3,4}\b", clean) and any(k in low_c for k in ("odbył", "powstał", "został", "trwała", "odzyskała", "rok")):
+                    add_seq(clean, "", f"kiedy wydarzyło się: {subj}?", clean)
+                else:
+                    add_seq(clean, "", f"co wiesz o {subj}?", f"Z tego co pamiętam, {lower_body}")
+                    add_seq(clean, "", f"co to jest {subj}?", clean)
                 add_seq(clean, f"Rozmawialiśmy o: {subj}.", "powiedz coś więcej na ten temat", f"Jeśli chodzi o {subj}, to {lower_body}")
         else:
             words = re.findall(r"[A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#]{4,}", clean)
             if words:
                 hint = " ".join(words[:2])
-                add_seq(clean, "", f"wyjaśnij krótko {hint}", f"W skrócie: {lower_body}")
+                add_seq(clean, "", f"wyjaśnij krótko {hint}", clean)
 
-        if len(sequences) >= max_total - 40:
+        if len(sequences) >= max_total - 65:
+            break
+
+    # Pairwise cross-fact reasoning dialogues for shared domain concepts
+    train_stop = {
+        "jest", "oraz", "przez", "jako", "ktory", "ktora", "ktore", "moze", "tylko",
+        "wszystko", "czyli", "jednak", "bardzo", "wtedy", "polski", "polska", "można",
+        "który", "która", "które", "między", "ponieważ", "również", "także",
+    }
+    conn_added = 0
+    for i in range(min(40, len(cleaned_subjects))):
+        s1, f1 = cleaned_subjects[i]
+        w1 = {w for w in re.findall(r"[a-ząćęłńóśźż]{4,}", f1.lower()) if w not in train_stop}
+        for j in range(i + 1, min(50, len(cleaned_subjects))):
+            s2, f2 = cleaned_subjects[j]
+            if s1.lower() == s2.lower():
+                continue
+            w2 = {w for w in re.findall(r"[a-ząćęłńóśźż]{4,}", f2.lower()) if w not in train_stop}
+            shared = sorted(w for w in (w1 & w2) if w not in s1.lower() and w not in s2.lower())
+            if shared:
+                bridge = shared[0]
+                add_seq(
+                    f"{f1} {f2}",
+                    "łączenie faktów",
+                    f"jaki jest związek między {s1} a {s2}?",
+                    f"Łączy je {bridge}: {f1} Jednocześnie {f2[0].lower() + f2[1:] if len(f2) > 1 else f2}",
+                )
+                conn_added += 1
+                if conn_added >= 25 or len(sequences) >= max_total - 25:
+                    break
+        if conn_added >= 25 or len(sequences) >= max_total - 25:
             break
 
     # Episodic conversation memory dialogues

@@ -3,10 +3,43 @@ from __future__ import annotations
 import math
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field, asdict
 from typing import Any, Callable
 
 _PL_TRANS = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZZ")
+
+_STOPWORDS_PL = {
+    "jest", "sa", "to", "oraz", "lub", "albo", "czy", "jak", "jaki", "jaka",
+    "jakie", "kto", "co", "czym", "gdzie", "kiedy", "dlaczego", "czemu", "dla",
+    "przez", "przy", "nad", "pod", "przed", "bez", "jako", "jego", "jej", "ich",
+    "tego", "tym", "tej", "ten", "ta", "te", "tak", "nie", "ale", "lecz", "wiec",
+    "ze", "sie", "czyli", "jednak", "rowniez", "takze", "poniewaz", "mozna",
+    "ktory", "ktora", "ktore", "ktorych", "czesto", "bardzo", "miedzy", "zwiazek",
+    "roznica", "porownaj", "laczy", "wplyw", "zalezy", "powiedz", "opowiedz",
+    "wyjasnij", "opisz", "podaj", "zdefiniuj", "napisz", "krotko", "temat",
+    "slowo", "oznacza", "wtedy", "natomiast", "ponadto", "tylko", "jeszcze",
+}
+
+_POLISH_ROOT_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("slonc", "slonecz"),
+    ("oddychan", "oddech"),
+    ("czlowiek", "ludz"),
+    ("swiatl", "swietl"),
+    ("roslin", "roslinn"),
+    ("ziemi", "ziemsk"),
+    ("komork", "komor"),
+    ("energi", "energet"),
+    ("pamiec", "pamiet"),
+    ("dzien", "dni"),
+    ("procesor", "cpu"),
+    ("graficzn", "gpu"),
+    ("dysk", "ssd", "hdd"),
+    ("ram", "operacyjn"),
+    ("tlen", "tlenu", "tlenow"),
+    ("dwutlen", "co2"),
+    ("wod", "h2o"),
+)
 
 
 def _strip_pl(s: str) -> str:
@@ -19,32 +52,40 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return float(sum(x * y for x, y in zip(a, b)))
 
 
-def _keyword_overlap(q: str, text: str) -> float:
-    def tokenize(s: str) -> set[str]:
-        cleaned = _strip_pl(s.lower())
-        for ch in ",.!?;:\"'()[]{}—-/\n\t":
-            cleaned = cleaned.replace(ch, " ")
-        return {w for w in cleaned.split() if len(w) >= 3}
+def _words_match(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    if len(a) >= 4 and len(b) >= 4 and abs(len(a) - len(b)) <= 5:
+        a_stem = a[: max(4, min(len(a) - 2, 6))]
+        b_stem = b[: max(4, min(len(b) - 2, 6))]
+        if b.startswith(a_stem) or a.startswith(b_stem):
+            return True
+    for grp in _POLISH_ROOT_GROUPS:
+        a_hit = any((a == g or (len(g) >= 4 and a.startswith(g))) for g in grp)
+        if a_hit:
+            b_hit = any((b == g or (len(g) >= 4 and b.startswith(g))) for g in grp)
+            if b_hit:
+                return True
+    return False
 
-    q_words = tokenize(q)
-    t_words = tokenize(text)
+
+def _tokenize_words_norm(s: str, drop_stopwords: bool = True) -> list[str]:
+    cleaned = _strip_pl(s.lower())
+    for ch in ",.!?;:\"'()[]{}—-/\n\t":
+        cleaned = cleaned.replace(ch, " ")
+    raw = [w for w in cleaned.split() if len(w) >= 2]
+    if not drop_stopwords:
+        return [w for w in raw if len(w) >= 3 or w in ("pi", "o2", "ip", "si", "ai")]
+    filtered = [w for w in raw if w not in _STOPWORDS_PL and (len(w) >= 3 or w in ("pi", "o2", "ip", "si", "ai"))]
+    return filtered if filtered else [w for w in raw if len(w) >= 3]
+
+
+def _keyword_overlap(q: str, text: str) -> float:
+    q_words = set(_tokenize_words_norm(q, drop_stopwords=True))
+    t_words = set(_tokenize_words_norm(text, drop_stopwords=False))
     if not q_words or not t_words:
         return 0.0
-    inter = 0
-    for qw in q_words:
-        q_stem_len = max(4, min(len(qw) - 2, 6)) if len(qw) >= 4 else len(qw)
-        if qw in t_words or (
-            len(qw) >= 4
-            and any(
-                len(tw) >= 4
-                and (
-                    tw.startswith(qw[:q_stem_len])
-                    or qw.startswith(tw[: max(4, min(len(tw) - 2, 6))])
-                )
-                for tw in t_words
-            )
-        ):
-            inter += 1
+    inter = sum(1 for qw in q_words if any(_words_match(qw, tw) for tw in t_words))
     return inter / max(1, len(q_words))
 
 
@@ -336,6 +377,339 @@ class Hippocampus:
             "rem": rem_hits,
             "user_profile": user_profile,
             "episodic": episodic_hits,
+        }
+
+    def find_concept_paths(
+        self,
+        query_terms: list[str],
+        max_hops: int = 3,
+        max_paths: int = 6,
+    ) -> list[dict[str, Any]]:
+        """Find multi-hop connecting paths across consolidated, REM, and short-term facts."""
+        all_facts = (
+            list(self.consolidated_facts.values())
+            + list(self.short_term_facts)
+            + list(self.rem_dream_links.values())
+        )
+        if not all_facts or not query_terms:
+            return []
+
+        adj: dict[str, list[tuple[str, str, str, str, float, str | None]]] = {}
+        nodes_set: set[str] = set()
+        for f in all_facts:
+            u, rel, v = f.src.strip().lower(), f.rel.strip().lower(), f.dst.strip().lower()
+            if not u or not v or u == v:
+                continue
+            nodes_set.add(u)
+            nodes_set.add(v)
+            adj.setdefault(u, []).append((v, rel, "out", f.source, float(f.strength), f.bridge))
+            adj.setdefault(v, []).append((u, rel, "in", f.source, float(f.strength), f.bridge))
+
+        if not nodes_set:
+            return []
+
+        nodes_list = sorted(nodes_set)
+        node_norm_map = {n: _strip_pl(n) for n in nodes_list}
+        node_words_map = {n: set(_tokenize_words_norm(n, drop_stopwords=False)) for n in nodes_list}
+
+        def resolve_term(term: str) -> list[str]:
+            t_clean = term.strip().lower()
+            if not t_clean:
+                return []
+            t_norm = _strip_pl(t_clean)
+            t_words = [w for w in _tokenize_words_norm(t_clean, drop_stopwords=True)]
+            if not t_words:
+                return []
+            scored: list[tuple[float, str]] = []
+            for n in nodes_list:
+                n_norm = node_norm_map[n]
+                if n == t_clean or n_norm == t_norm:
+                    scored.append((10.0, n))
+                    continue
+                n_words = node_words_map[n]
+                if not n_words:
+                    continue
+                hits = sum(1 for tw in t_words if any(_words_match(tw, nw) for nw in n_words))
+                if hits == 0:
+                    continue
+                cov_q = hits / len(t_words)
+                cov_n = hits / len(n_words)
+                substr_bonus = 0.4 if (len(t_norm) >= 4 and (t_norm in n_norm or n_norm in t_norm)) else 0.0
+                score = 2.0 * cov_q + 1.2 * cov_n + substr_bonus
+                if score >= 1.1:
+                    scored.append((score, n))
+            scored.sort(key=lambda x: (-x[0], len(x[1])))
+            return [n for _, n in scored[:2]]
+
+        resolved_groups: list[list[str]] = []
+        seen_resolved: set[str] = set()
+        for term in query_terms:
+            matches = resolve_term(term)
+            fresh = [m for m in matches if m not in seen_resolved]
+            if fresh:
+                resolved_groups.append(fresh)
+                seen_resolved.update(fresh)
+
+        all_resolved = [n for grp in resolved_groups for n in grp]
+        if not all_resolved:
+            return []
+
+        def format_summary(steps: list[dict[str, Any]]) -> str:
+            if not steps:
+                return ""
+            parts: list[str] = []
+            first = steps[0]
+            if first["direction"] == "out":
+                parts.append(f"{first['src']} —({first['rel']})→ {first['dst']}")
+            else:
+                parts.append(f"{first['dst']} ←({first['rel']})— {first['src']}")
+            for st in steps[1:]:
+                if st["direction"] == "out":
+                    parts.append(f"—({st['rel']})→ {st['dst']}")
+                else:
+                    parts.append(f"←({st['rel']})— {st['src']}")
+            return " ".join(parts)
+
+        results: list[dict[str, Any]] = []
+        seen_summaries: set[str] = set()
+
+        if len(resolved_groups) >= 2:
+            # Find shortest connecting paths across distinct resolved concept groups
+            candidate_paths: list[tuple[float, dict[str, Any]]] = []
+            for i in range(len(resolved_groups)):
+                for j in range(i + 1, len(resolved_groups)):
+                    for start in resolved_groups[i]:
+                        for end in resolved_groups[j]:
+                            if start == end:
+                                continue
+                            # BFS up to max_hops
+                            queue: deque[tuple[str, list[dict[str, Any]]]] = deque([(start, [])])
+                            visited_depth: dict[str, int] = {start: 0}
+                            found_for_pair: list[tuple[float, dict[str, Any]]] = []
+                            while queue:
+                                cur, path_steps = queue.popleft()
+                                if len(path_steps) >= max_hops:
+                                    continue
+                                edges = sorted(
+                                    adj.get(cur, []),
+                                    key=lambda e: (e[3] == "REM_DREAM", -e[4]),
+                                )
+                                for nxt, rel, direction, source, strength, _bridge in edges:
+                                    if any(
+                                        (s["src"] == nxt or s["dst"] == nxt)
+                                        for s in path_steps
+                                    ):
+                                        continue
+                                    step_dict = {
+                                        "src": cur if direction == "out" else nxt,
+                                        "rel": rel,
+                                        "dst": nxt if direction == "out" else cur,
+                                        "direction": direction,
+                                        "source": source,
+                                    }
+                                    new_steps = path_steps + [step_dict]
+                                    if nxt == end:
+                                        bridges = []
+                                        cur_node = start
+                                        for st in new_steps[:-1]:
+                                            cur_node = st["dst"] if st["direction"] == "out" else st["src"]
+                                            if cur_node not in (start, end) and cur_node not in bridges:
+                                                bridges.append(cur_node)
+                                        rem_penalty = sum(0.6 for st in new_steps if st["source"] == "REM_DREAM")
+                                        hub_penalty = sum(
+                                            0.35 for b in bridges if len(adj.get(b, [])) > 12
+                                        )
+                                        rank_cost = len(new_steps) + rem_penalty + hub_penalty
+                                        candidate_paths.append(
+                                            (
+                                                rank_cost,
+                                                {
+                                                    "start": start,
+                                                    "end": end,
+                                                    "hops": len(new_steps),
+                                                    "steps": new_steps,
+                                                    "bridges": bridges,
+                                                    "summary": format_summary(new_steps),
+                                                },
+                                            )
+                                        )
+                                        found_for_pair.append(candidate_paths[-1])
+                                        if len(found_for_pair) >= 2:
+                                            break
+                                    elif len(new_steps) < max_hops:
+                                        prev_d = visited_depth.get(nxt)
+                                        if prev_d is None or len(new_steps) <= prev_d:
+                                            visited_depth[nxt] = len(new_steps)
+                                            queue.append((nxt, new_steps))
+                                if len(found_for_pair) >= 2:
+                                    break
+
+            candidate_paths.sort(key=lambda x: (x[0], x[1]["hops"], x[1]["summary"]))
+            for _, p in candidate_paths:
+                if p["summary"] in seen_summaries:
+                    continue
+                seen_summaries.add(p["summary"])
+                results.append(p)
+                if len(results) >= max_paths:
+                    break
+
+        if not results and all_resolved:
+            # Single-concept fallback: return top 1-hop and 2-hop chains
+            anchor = all_resolved[0]
+            seen_pairs: set[tuple[str, str]] = set()
+            one_hop = sorted(
+                adj.get(anchor, []),
+                key=lambda e: (e[3] == "REM_DREAM", -e[4]),
+            )
+            for nxt, rel, direction, source, strength, _ in one_hop[:4]:
+                if (anchor, nxt) in seen_pairs:
+                    continue
+                seen_pairs.add((anchor, nxt))
+                st1 = {
+                    "src": anchor if direction == "out" else nxt,
+                    "rel": rel,
+                    "dst": nxt if direction == "out" else anchor,
+                    "direction": direction,
+                    "source": source,
+                }
+                # Try extending 1 more hop if informative
+                ext_edges = [
+                    e for e in sorted(adj.get(nxt, []), key=lambda e: (e[3] == "REM_DREAM", -e[4]))
+                    if e[0] != anchor and (anchor, e[0]) not in seen_pairs
+                ]
+                if ext_edges and len(results) < 2:
+                    nxt2, rel2, dir2, src2, _, _ = ext_edges[0]
+                    st2 = {
+                        "src": nxt if dir2 == "out" else nxt2,
+                        "rel": rel2,
+                        "dst": nxt2 if dir2 == "out" else nxt,
+                        "direction": dir2,
+                        "source": src2,
+                    }
+                    steps = [st1, st2]
+                    summ = format_summary(steps)
+                    if summ not in seen_summaries:
+                        seen_summaries.add(summ)
+                        results.append(
+                            {
+                                "start": anchor,
+                                "end": nxt2,
+                                "hops": 2,
+                                "steps": steps,
+                                "bridges": [nxt],
+                                "summary": summ,
+                            }
+                        )
+                        continue
+                steps = [st1]
+                summ = format_summary(steps)
+                if summ not in seen_summaries:
+                    seen_summaries.add(summ)
+                    results.append(
+                        {
+                            "start": anchor,
+                            "end": nxt,
+                            "hops": 1,
+                            "steps": steps,
+                            "bridges": [],
+                            "summary": summ,
+                        }
+                    )
+                if len(results) >= min(4, max_paths):
+                    break
+
+        return results[:max_paths]
+
+    def search_memories_multihop(
+        self,
+        query_vec: list[float],
+        query_text: str,
+        sub_queries: list[str],
+        sub_vecs: list[list[float]],
+        bridge_terms: list[str],
+        current_day: int,
+        top_hippo: int = 14,
+        top_semantic: int = 18,
+        top_rem: int = 8,
+    ) -> dict[str, list[MemoryTrace]]:
+        base = self.search_memories(
+            query_vec=query_vec,
+            query_text=query_text,
+            current_day=current_day,
+            top_hippo=top_hippo,
+            top_semantic=top_semantic,
+            top_rem=top_rem,
+        )
+        if not sub_queries or (len(sub_queries) < 2 and not bridge_terms):
+            return base
+
+        hippo_hits = list(base["hippocampus"])
+        sem_hits = list(base["semantic"])
+        rem_hits = list(base["rem"])
+        seen_hippo = {m.id for m in hippo_hits}
+        seen_sem = {m.id for m in sem_hits}
+        seen_rem = {m.id for m in rem_hits}
+        active_sem = [m for m in self.semantic_memories if not m.superseded]
+
+        def score_sub(m: MemoryTrace, sq: str, sv: list[float]) -> float:
+            if m.superseded:
+                return -999.0
+            cos = _cosine(sv, m.embedding) if (sv and m.embedding) else 0.0
+            kw_text = _keyword_overlap(sq, m.text)
+            kw_topic = _keyword_overlap(sq, m.topic or "")
+            if kw_text == 0.0 and kw_topic == 0.0 and cos < 0.45:
+                return 0.0
+            return 0.42 * cos + 0.52 * kw_text + 0.35 * kw_topic + (0.08 if m.importance >= 5 else 0.0)
+
+        for sq, sv in zip(sub_queries[:5], sub_vecs[:5]):
+            for pool, seen_set, out_list, is_sem in (
+                (self.short_term_memories, seen_hippo, hippo_hits, False),
+                (active_sem, seen_sem, sem_hits, True),
+                (self.rem_reflections, seen_rem, rem_hits, False),
+            ):
+                scored = sorted(pool, key=lambda m: score_sub(m, sq, sv), reverse=True)
+                added = 0
+                for m in scored:
+                    if m.id in seen_set:
+                        continue
+                    if score_sub(m, sq, sv) < 0.25:
+                        break
+                    out_list.append(m)
+                    seen_set.add(m.id)
+                    if is_sem:
+                        m.recall_count += 1
+                        m.last_recalled_day = current_day
+                        m.strength = min(6.0, m.strength + 0.12)
+                    added += 1
+                    if added >= 4:
+                        break
+
+        for bt in bridge_terms[:4]:
+            if not bt or len(bt.strip()) < 3:
+                continue
+            for pool, seen_set, out_list, is_sem in (
+                (self.short_term_memories, seen_hippo, hippo_hits, False),
+                (active_sem, seen_sem, sem_hits, True),
+            ):
+                matches = [
+                    m for m in pool
+                    if m.id not in seen_set
+                    and (_keyword_overlap(bt, m.text) > 0.0 or _keyword_overlap(bt, m.topic or "") > 0.0)
+                ]
+                matches.sort(key=lambda m: (_keyword_overlap(bt, m.text), m.importance, m.strength), reverse=True)
+                for m in matches[:2]:
+                    out_list.append(m)
+                    seen_set.add(m.id)
+                    if is_sem:
+                        m.recall_count += 1
+                        m.last_recalled_day = current_day
+
+        return {
+            "hippocampus": hippo_hits[: top_hippo + 6],
+            "semantic": sem_hits[: top_semantic + 8],
+            "rem": rem_hits[: top_rem + 4],
+            "user_profile": base["user_profile"],
+            "episodic": base["episodic"],
         }
 
     def consolidate_declarative_memories(
