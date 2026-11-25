@@ -1183,8 +1183,15 @@ class SleepingBrain:
         search_q = ctx["search_query"]
         active_subject = ctx["active_subject"]
         intent_info = self.language_cortex.analyze_query_intent(search_q)
-        sub_concepts = [sc for sc in intent_info.get("sub_concepts", []) if sc.strip()][:5]
-        use_multihop_ctx = intent_info["intent"] != "self_capability" and bool(sub_concepts)
+        if intent_info["intent"] == "code_request":
+            code_q = intent_info.get("code_task") or active_subject
+            if code_q:
+                search_q = code_q
+            sub_concepts = [code_q] if code_q else []
+            use_multihop_ctx = False
+        else:
+            sub_concepts = [sc for sc in intent_info.get("sub_concepts", []) if sc.strip()][:5]
+            use_multihop_ctx = intent_info["intent"] != "self_capability" and bool(sub_concepts)
 
         if use_multihop_ctx:
             vecs = self.language_cortex.encode_texts([search_q] + sub_concepts)

@@ -318,6 +318,39 @@ class TestHippocampusAndCortex(unittest.TestCase):
             self.assertNotIn("czasowniki przechodnie", cap_low)
             self.assertTrue("plik" in cap_low or "dostępu" in cap_low)
 
+    def test_code_request_and_followup_context(self):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cfg = BrainConfig(nrem_concept_epochs=15, cortex_sleep_epochs=2, language_bootstrap_epochs=2)
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
+            brain.auto_web = False
+            prime_fact = "Liczba pierwsza to liczba naturalna większa od 1, która ma dokładnie dwa dzielniki: 1 oraz samą siebie."
+            win_noise = "Wybierz Wyszukaj na pasku zadań lub naciśnij klawisz Windows na klawiaturze i wpisz nazwę aplikacji lub programu."
+            embs = brain.language_cortex.encode_texts([prime_fact, win_noise])
+            brain.hippocampus.record_memory(prime_fact, "wiedza", 5, day=1, embedding=embs[0])
+            brain.hippocampus.record_memory(win_noise, "nauka_z_sieci", 4, day=1, embedding=embs[1])
+
+            res1 = brain.chat("napisz program w cpp ktory liczy liczby pierwsze")
+            r1 = res1["reply"]
+            self.assertIn("```cpp", r1)
+            self.assertIn("czyPierwsza", r1)
+            self.assertIn("int main()", r1)
+            self.assertIn("dzielniki", r1.lower())
+            self.assertNotIn("pasku zadań", r1.lower())
+
+            res2 = brain.chat("napisz program w cpp który to robi")
+            r2 = res2["reply"]
+            self.assertIn("```cpp", r2)
+            self.assertIn("czyPierwsza", r2)
+            self.assertNotIn("/ucz", r2.lower())
+            self.assertNotIn("pasku zadań", r2.lower())
+
+            res3 = brain.chat("napisz program w pythonie do sterowania rakietą na Marsa")
+            r3 = res3["reply"].lower()
+            self.assertNotIn("pasku zadań", r3)
+            self.assertNotIn("/ucz", r3)
+            self.assertIn("pytorch", r3)
+
 
 class TestWebLearner(unittest.TestCase):
     def test_query_cleaning_relevance_and_direct_url(self):

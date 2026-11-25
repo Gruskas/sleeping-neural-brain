@@ -222,6 +222,10 @@ def _is_noisy_memory(text: str) -> bool:
         "słownik ortograficzny",
         "odmienność tak",
         "rejestr wyraz",
+        "wybierz wyszukaj na pasku zadań",
+        "naciśnij klawisz windows",
+        "znajdowanie aplikacji lub programu",
+        "microsoft365.com",
     )
     return any(m in low for m in noise_markers)
 
@@ -1301,6 +1305,47 @@ class LanguageCortex:
                 "is_compound": False,
             }
 
+        # 1b) Code generation / programming task requests
+        is_code_req = bool(
+            re.search(
+                r"\b(?:napisz|stworz|zrob|pokaz|daj|wygeneruj)\s+(?:mi\s+)?(?:prosty\s+|krotki\s+|przykladowy\s+|jakis\s+)?(?:program|kod|skrypt|funkcj[aei]|algorytm|petl[aei]|klase|przyklad\s+kodu)\b"
+                r"|\b(?:program|kod|skrypt|funkcj[aei])\s+(?:w|na)\s+(?:cpp|c\+\+|python\w*|js|javascript|java|c#)\b",
+                low,
+            )
+        )
+        if is_code_req:
+            if re.search(r"\b(?:cpp|c\+\+)\b", low) or "wskaznik" in low:
+                code_lang = "cpp"
+            elif re.search(r"\b(?:javascript|js)\b", low):
+                code_lang = "javascript"
+            else:
+                code_lang = "python"
+
+            task = msg.strip(" ?!.")
+            task_strip_pats = [
+                r"^(?:napisz|stwórz|stworz|zrób|zrob|pokaż|pokaz|daj|wygeneruj)\s+(?:mi\s+)?(?:prosty\s+|krótki\s+|krotki\s+|przykładowy\s+|przykladowy\s+)?(?:program|kod|skrypt|funkcję|funkcje|algorytm|pętlę|petle|klasę|klase|przykład\s+kodu)\s*",
+                r"^(?:w|na)\s+(?:języku\s+|jezyku\s+)?(?:cpp|c\+\+|pythonie|pythona|python|py|javascript|js|java|c#)\s*",
+                r"^(?:który|ktory|która|ktora|które|ktore|co|do|żeby|zeby|aby)?\s*(?:liczy|oblicza|wylicza|wyznacza|sprawdza|wypisuje|znajduje|zwraca|sortuje|pokazuje|robi|policzy|wyliczy|wypisze|sprawdzi)\s*",
+            ]
+            for _ in range(3):
+                prev_t = task
+                for tp in task_strip_pats:
+                    task = re.sub(tp, "", task, flags=re.I).strip(" ?!.,;:-")
+                if task == prev_t:
+                    break
+            task_norm = _strip_pl(task.lower())
+            if task_norm in ("to", "to robi", "robi", "tego", "nim", "niej", "go", "je", "cos", "cos takiego", "takie cos"):
+                task = ""
+            return {
+                "intent": "code_request",
+                "detail_kind": None,
+                "sub_intents": [],
+                "sub_concepts": [task] if task else [],
+                "is_compound": False,
+                "code_lang": code_lang,
+                "code_task": task,
+            }
+
         sub_intents: list[str] = []
         if re.search(r"\bkiedy\b|\bw\s+ktorym\s+roku\b|\bjak\s+dlugo\b", low):
             sub_intents.append("when")
@@ -1836,15 +1881,399 @@ class LanguageCortex:
         best_score, best_lbl, best_reply = scored_cands[0]
 
         if missing_concepts and grounded_concepts:
-            missing_str = ", ".join(missing_concepts[:2])
-            best_reply += (
-                f"\n\n*(Brakuje mi jeszcze pewnych danych o: „{missing_str}” — "
-                f"możesz użyć `/ucz {missing_concepts[0]}`, żebym uzupełnił lukę.)*"
-            )
+            skip_missing_verbs = {"robi", "robic", "cpp robi", "dziala", "liczy", "liczyc", "to robi"}
+            filtered_missing = [
+                mc for mc in missing_concepts
+                if _strip_pl(mc.lower()).strip() not in skip_missing_verbs
+                and any(len(w) >= 3 for w in _extract_meaningful_words(mc))
+            ]
+            if filtered_missing:
+                missing_str = ", ".join(filtered_missing[:2])
+                best_reply += (
+                    f"\n\n*(Brakuje mi jeszcze pewnych danych o: „{missing_str}” — "
+                    f"możesz użyć `/ucz {filtered_missing[0]}`, żebym uzupełnił lukę.)*"
+                )
 
         summary_scores = ", ".join(f"{lbl}={sc:.2f}" for sc, lbl, _ in scored_cands[:3])
         thinking.append(f"Porównanie wariantów odpowiedzi ({summary_scores}) → wybrano: „{best_lbl}”.")
         return best_reply.strip()
+
+    def _try_synthesize_code(
+        self,
+        code_task: str,
+        code_lang: str,
+        recalled_facts: list[str],
+        recent_turns: list[dict[str, str]],
+        active_subject: str,
+        thinking: list[str],
+    ) -> str:
+        """Synthesize grounded C++/Python/JS code for algorithmic/programming requests."""
+        task = (code_task or "").strip()
+        task_norm = _strip_pl(task.lower())
+
+        # Resolve contextual follow-up ("napisz program w cpp który to robi")
+        if not task or task_norm in ("to", "to robi", "robi", "tego", "nim", "niej", "go", "je", "cos takiego"):
+            for turn in reversed(recent_turns[-8:]):
+                if turn.get("role") != "user":
+                    continue
+                t_txt = turn.get("content", "").strip()
+                if not t_txt:
+                    continue
+                t_info = self.analyze_query_intent(t_txt)
+                if t_info["intent"] == "code_request" and t_info.get("code_task"):
+                    task = t_info["code_task"]
+                    break
+                cand_subj = _extract_query_subject(t_txt)
+                cand_norm = _strip_pl(cand_subj.lower())
+                if cand_subj and cand_norm not in ("to", "to robi", "robi", "ale co") and not any(
+                    w in cand_norm for w in ("napisz program", "ktory to robi", "pisalismy")
+                ):
+                    task = cand_subj
+                    break
+            if not task and active_subject:
+                task = active_subject
+
+        task_norm = _strip_pl(task.lower())
+        thinking.append(
+            f"Intencja: code_request (język: {code_lang}) · zadanie: „{task or 'nieokreślone'}”."
+        )
+
+        # Find best clean remembered fact matching the algorithmic task
+        clean_facts = [_clean_fact_text(f) for f in recalled_facts if f and not _is_noisy_memory(f)]
+        grounded_fact = ""
+        if task and clean_facts:
+            scored_f = sorted(clean_facts, key=lambda f: _stem_overlap(task, f), reverse=True)
+            if _stem_overlap(task, scored_f[0]) >= 0.35:
+                grounded_fact = _trim_sentence_clean(scored_f[0], 175)
+                thinking.append(f"Powiązano z faktem z pamięci: „{grounded_fact[:90]}”.")
+
+        def pick_lang(cpp_code: str, py_code: str, js_code: str) -> tuple[str, str]:
+            if code_lang == "cpp":
+                return ("cpp", cpp_code)
+            if code_lang == "javascript":
+                return ("javascript", js_code)
+            return ("python", py_code)
+
+        # Grounded algorithm synthesis catalog
+        algo_name = ""
+        lang_tag = code_lang
+        code = ""
+
+        if any(k in task_norm for k in ("pierwsz", "prime", "eratosten")):
+            algo_name = "wyznaczanie i sprawdzanie liczb pierwszych"
+            lang_tag, code = pick_lang(
+                (
+                    "#include <iostream>\n\n"
+                    "bool czyPierwsza(int n) {\n"
+                    "    if (n < 2) return false;\n"
+                    "    for (int d = 2; d * d <= n; ++d) {\n"
+                    "        if (n % d == 0) return false;\n"
+                    "    }\n"
+                    "    return true;\n"
+                    "}\n\n"
+                    "int main() {\n"
+                    "    int limit = 50;\n"
+                    "    std::cout << \"Liczby pierwsze do \" << limit << \": \";\n"
+                    "    for (int i = 2; i <= limit; ++i) {\n"
+                    "        if (czyPierwsza(i)) std::cout << i << \" \";\n"
+                    "    }\n"
+                    "    std::cout << \"\\n\";\n"
+                    "    return 0;\n"
+                    "}"
+                ),
+                (
+                    "def czy_pierwsza(n: int) -> bool:\n"
+                    "    if n < 2:\n"
+                    "        return False\n"
+                    "    d = 2\n"
+                    "    while d * d <= n:\n"
+                    "        if n % d == 0:\n"
+                    "            return False\n"
+                    "        d += 1\n"
+                    "    return True\n\n"
+                    "pierwsze = [i for i in range(2, 51) if czy_pierwsza(i)]\n"
+                    "print(\"Liczby pierwsze:\", pierwsze)"
+                ),
+                (
+                    "function czyPierwsza(n) {\n"
+                    "  if (n < 2) return false;\n"
+                    "  for (let d = 2; d * d <= n; d++) {\n"
+                    "    if (n % d === 0) return false;\n"
+                    "  }\n"
+                    "  return true;\n"
+                    "}\n\n"
+                    "const pierwsze = [];\n"
+                    "for (let i = 2; i <= 50; i++) if (czyPierwsza(i)) pierwsze.push(i);\n"
+                    "console.log(pierwsze);"
+                ),
+            )
+        elif "fibonacc" in task_norm:
+            algo_name = "ciąg Fibonacciego"
+            lang_tag, code = pick_lang(
+                (
+                    "#include <iostream>\n\n"
+                    "int main() {\n"
+                    "    int n = 10;\n"
+                    "    long long a = 0, b = 1;\n"
+                    "    for (int i = 0; i < n; ++i) {\n"
+                    "        std::cout << a << \" \";\n"
+                    "        long long next = a + b;\n"
+                    "        a = b;\n"
+                    "        b = next;\n"
+                    "    }\n"
+                    "    return 0;\n"
+                    "}"
+                ),
+                (
+                    "def fibonacci(n: int) -> list[int]:\n"
+                    "    a, b = 0, 1\n"
+                    "    wynik = []\n"
+                    "    for _ in range(n):\n"
+                    "        wynik.append(a)\n"
+                    "        a, b = b, a + b\n"
+                    "    return wynik\n\n"
+                    "print(fibonacci(10))"
+                ),
+                (
+                    "function fibonacci(n) {\n"
+                    "  let a = 0, b = 1, wynik = [];\n"
+                    "  for (let i = 0; i < n; i++) {\n"
+                    "    wynik.push(a);\n"
+                    "    [a, b] = [b, a + b];\n"
+                    "  }\n"
+                    "  return wynik;\n"
+                    "}\n"
+                    "console.log(fibonacci(10));"
+                ),
+            )
+        elif any(k in task_norm for k in ("silni", "factorial")):
+            algo_name = "obliczanie silni (n!)"
+            lang_tag, code = pick_lang(
+                (
+                    "#include <iostream>\n\n"
+                    "long long silnia(int n) {\n"
+                    "    long long res = 1;\n"
+                    "    for (int i = 2; i <= n; ++i) res *= i;\n"
+                    "    return res;\n"
+                    "}\n\n"
+                    "int main() {\n"
+                    "    std::cout << \"5! = \" << silnia(5) << \"\\n\";\n"
+                    "    return 0;\n"
+                    "}"
+                ),
+                (
+                    "def silnia(n: int) -> int:\n"
+                    "    res = 1\n"
+                    "    for i in range(2, n + 1):\n"
+                    "        res *= i\n"
+                    "    return res\n\n"
+                    "print(\"5! =\", silnia(5))"
+                ),
+                (
+                    "function silnia(n) {\n"
+                    "  let res = 1;\n"
+                    "  for (let i = 2; i <= n; i++) res *= i;\n"
+                    "  return res;\n"
+                    "}\n"
+                    "console.log(\"5! =\", silnia(5));"
+                ),
+            )
+        elif any(k in task_norm for k in ("sortow", "posortuj")):
+            algo_name = "sortowanie tablicy / listy"
+            lang_tag, code = pick_lang(
+                (
+                    "#include <algorithm>\n"
+                    "#include <iostream>\n"
+                    "#include <vector>\n\n"
+                    "int main() {\n"
+                    "    std::vector<int> liczby = {7, 2, 9, 1, 5};\n"
+                    "    std::sort(liczby.begin(), liczby.end());\n"
+                    "    for (int x : liczby) std::cout << x << \" \";\n"
+                    "    return 0;\n"
+                    "}"
+                ),
+                (
+                    "liczby = [7, 2, 9, 1, 5]\n"
+                    "liczby.sort()\n"
+                    "print(\"Posortowane:\", liczby)"
+                ),
+                (
+                    "const liczby = [7, 2, 9, 1, 5];\n"
+                    "liczby.sort((a, b) => a - b);\n"
+                    "console.log(liczby);"
+                ),
+            )
+        elif "wskaznik" in task_norm:
+            algo_name = "wskaźniki i adresy w pamięci"
+            lang_tag = "cpp"
+            code = (
+                "#include <iostream>\n\n"
+                "int main() {\n"
+                "    int liczba = 42;\n"
+                "    int* wskaznik = &liczba; // adres zmiennej\n"
+                "    std::cout << \"Wartosc: \" << *wskaznik << \", adres: \" << wskaznik << \"\\n\";\n"
+                "    return 0;\n"
+                "}"
+            )
+        elif any(k in task_norm for k in ("pitagoras", "pole kol", "obwod kol")):
+            algo_name = "obliczenia geometryczne (Pitagoras / koło)"
+            lang_tag, code = pick_lang(
+                (
+                    "#include <cmath>\n"
+                    "#include <iostream>\n\n"
+                    "int main() {\n"
+                    "    double a = 3.0, b = 4.0;\n"
+                    "    double c = std::sqrt(a * a + b * b);\n"
+                    "    std::cout << \"Przeciwprostokatna c = \" << c << \"\\n\";\n"
+                    "    return 0;\n"
+                    "}"
+                ),
+                (
+                    "import math\n\n"
+                    "a, b = 3.0, 4.0\n"
+                    "c = math.hypot(a, b)\n"
+                    "print(f\"Przeciwprostokątna c = {c}\")"
+                ),
+                (
+                    "const a = 3, b = 4;\n"
+                    "const c = Math.hypot(a, b);\n"
+                    "console.log(\"Przeciwprostokątna c =\", c);"
+                ),
+            )
+        elif any(k in task_norm for k in ("nwd", "euklides", "dzielnik")):
+            algo_name = "największy wspólny dzielnik (algorytm Euklidesa)"
+            lang_tag, code = pick_lang(
+                (
+                    "#include <iostream>\n\n"
+                    "int nwd(int a, int b) {\n"
+                    "    while (b != 0) {\n"
+                    "        int t = a % b;\n"
+                    "        a = b;\n"
+                    "        b = t;\n"
+                    "    }\n"
+                    "    return a;\n"
+                    "}\n\n"
+                    "int main() {\n"
+                    "    std::cout << \"NWD(48, 18) = \" << nwd(48, 18) << \"\\n\";\n"
+                    "    return 0;\n"
+                    "}"
+                ),
+                (
+                    "def nwd(a: int, b: int) -> int:\n"
+                    "    while b:\n"
+                    "        a, b = b, a % b\n"
+                    "    return a\n\n"
+                    "print(\"NWD(48, 18) =\", nwd(48, 18))"
+                ),
+                (
+                    "function nwd(a, b) {\n"
+                    "  while (b !== 0) [a, b] = [b, a % b];\n"
+                    "  return a;\n"
+                    "}\n"
+                    "console.log(\"NWD(48, 18) =\", nwd(48, 18));"
+                ),
+            )
+        elif "palindrom" in task_norm:
+            algo_name = "sprawdzanie palindromu"
+            lang_tag, code = pick_lang(
+                (
+                    "#include <iostream>\n"
+                    "#include <string>\n\n"
+                    "bool czyPalindrom(const std::string& s) {\n"
+                    "    for (size_t i = 0, j = s.size(); i < j; ++i) {\n"
+                    "        if (s[i] != s[--j]) return false;\n"
+                    "    }\n"
+                    "    return true;\n"
+                    "}\n\n"
+                    "int main() {\n"
+                    "    std::cout << (czyPalindrom(\"kajak\") ? \"TAK\" : \"NIE\") << \"\\n\";\n"
+                    "    return 0;\n"
+                    "}"
+                ),
+                (
+                    "def czy_palindrom(s: str) -> bool:\n"
+                    "    s = s.lower().replace(\" \", \"\")\n"
+                    "    return s == s[::-1]\n\n"
+                    "print(czy_palindrom(\"kajak\"))"
+                ),
+                (
+                    "const czyPalindrom = (s) => s === [...s].reverse().join(\"\");\n"
+                    "console.log(czyPalindrom(\"kajak\"));"
+                ),
+            )
+        elif any(k in task_norm for k in ("binarn", "binary search")):
+            algo_name = "wyszukiwanie binarne"
+            lang_tag, code = pick_lang(
+                (
+                    "#include <iostream>\n"
+                    "#include <vector>\n\n"
+                    "int szukajBinarnie(const std::vector<int>& arr, int cel) {\n"
+                    "    int l = 0, p = (int)arr.size() - 1;\n"
+                    "    while (l <= p) {\n"
+                    "        int sr = l + (p - l) / 2;\n"
+                    "        if (arr[sr] == cel) return sr;\n"
+                    "        if (arr[sr] < cel) l = sr + 1;\n"
+                    "        else p = sr - 1;\n"
+                    "    }\n"
+                    "    return -1;\n"
+                    "}\n\n"
+                    "int main() {\n"
+                    "    std::vector<int> v = {1, 3, 5, 7, 9, 11};\n"
+                    "    std::cout << \"Indeks 7: \" << szukajBinarnie(v, 7) << \"\\n\";\n"
+                    "    return 0;\n"
+                    "}"
+                ),
+                (
+                    "def szukaj_binarnie(arr: list[int], cel: int) -> int:\n"
+                    "    l, p = 0, len(arr) - 1\n"
+                    "    while l <= p:\n"
+                    "        sr = (l + p) // 2\n"
+                    "        if arr[sr] == cel:\n"
+                    "            return sr\n"
+                    "        if arr[sr] < cel:\n"
+                    "            l = sr + 1\n"
+                    "        else:\n"
+                    "            p = sr - 1\n"
+                    "    return -1\n\n"
+                    "print(\"Indeks 7:\", szukaj_binarnie([1, 3, 5, 7, 9, 11], 7))"
+                ),
+                (
+                    "function szukajBinarnie(arr, cel) {\n"
+                    "  let l = 0, p = arr.length - 1;\n"
+                    "  while (l <= p) {\n"
+                    "    const sr = Math.floor((l + p) / 2);\n"
+                    "    if (arr[sr] === cel) return sr;\n"
+                    "    if (arr[sr] < cel) l = sr + 1;\n"
+                    "    else p = sr - 1;\n"
+                    "  }\n"
+                    "  return -1;\n"
+                    "}\n"
+                    "console.log(szukajBinarnie([1, 3, 5, 7, 9, 11], 7));"
+                ),
+            )
+        elif any(k in task_norm for k in ("hello world", "witaj swiecie")):
+            algo_name = "prosty program startowy (Hello World)"
+            lang_tag, code = pick_lang(
+                "#include <iostream>\n\nint main() {\n    std::cout << \"Witaj swiecie!\\n\";\n    return 0;\n}",
+                "print(\"Witaj świecie!\")",
+                "console.log(\"Witaj świecie!\");",
+            )
+
+        if code:
+            thinking.append(f"Zsyntetyzowano działający kod w języku {lang_tag} ({algo_name}).")
+            lead = f"Oto działający kod ({lang_tag}) realizujący **{algo_name}**"
+            if grounded_fact:
+                lead += f" (w oparciu o fakt z pamięci: *{grounded_fact}*)"
+            return f"{lead}:\n```{lang_tag}\n{code}\n```"
+
+        thinking.append("Brak gotowego schematu algorytmicznego dla tego zadania — odpowiadam uczciwie o ograniczeniu.")
+        fact_note = f"\n\nZ pamięci wiem na ten temat tyle: {grounded_fact}" if grounded_fact else ""
+        return (
+            f"Ten lokalny mózg PyTorch (bez zewnętrznego dużego modelu kodującego) nie potrafi jeszcze "
+            f"samodzielnie napisać dowolnego programu dla zadania „{task or 'złożony kod'}”. "
+            f"Mogę natomiast wygenerować klasyczne algorytmy (np. liczby pierwsze, ciąg Fibonacciego, silnia, NWD, sortowanie, "
+            f"wyszukiwanie binarne, palindrom, wskaźniki C++) albo wyjaśnić pojęcia z pamięci.{fact_note}"
+        )
 
     def _compose_human_reply(
         self,
@@ -2140,6 +2569,18 @@ class LanguageCortex:
                 f"liczyć zadania matematyczne oraz uczyć się nowych tematów z sieci przez `/ucz <temat>` (lub Auto-sieć){name_part}.",
                 None,
             )
+
+        # 4c) Code generation / algorithm synthesis request
+        if intent_info["intent"] == "code_request":
+            code_reply = self._try_synthesize_code(
+                code_task=intent_info.get("code_task", ""),
+                code_lang=intent_info.get("code_lang", "python"),
+                recalled_facts=hippocampus_memories + semantic_memories,
+                recent_turns=recent_turns,
+                active_subject=active_subject,
+                thinking=thinking,
+            )
+            return (code_reply, None)
 
         # 5) Short conversational follow-ups / confusion without a specific subject
         follow_up_phrases = (
