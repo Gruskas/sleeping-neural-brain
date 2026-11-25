@@ -30,9 +30,9 @@ class SleepingBrain:
     Pure Conversational & Autonomous Web-Learning Neural Brain on GPU (PyTorch + CUDA):
       - Natural Polish chat with expanded working memory (24 turns) & high-capacity Hippocampus (5,000+)
       - Autonomous Web Study: searches Wikipedia & the web iteratively, analyzes pages on GPU,
-        self-quizzes for gaps until mastery, sleeps to train LoRA weights if tired, and keeps learning!
-      - 3-stage Biological Sleep on GPU:
-          NREM Light (contradictions + forgetting) -> NREM Deep (Concept EWC + LoRA Replay) -> REM Dreaming
+        self-quizzes for gaps until mastery, and uses sleep strictly to connect & consolidate information!
+      - 3-stage Informational Sleep on GPU:
+          NREM Light (contradictions + forgetting) -> NREM Deep (Concept EWC + LoRA Replay) -> REM Dreaming (creative links & analogies)
     """
 
     def __init__(
@@ -70,9 +70,10 @@ class SleepingBrain:
             language_cortex=self.language_cortex,
         )
 
-        # Homeostatic & lifecycle state
-        self.state_mode: str = "AWAKE"  # AWAKE | DROWSY | STUDYING | NREM_LIGHT | NREM_DEEP | REM_DREAMING
+        # Lifecycle & creativity state (no fatigue; sleep is purely for information linking & consolidation)
+        self.state_mode: str = "AWAKE"  # AWAKE | STUDYING | NREM_LIGHT | NREM_DEEP | REM_DREAMING
         self.energy: float = self.cfg.max_energy
+        self.creativity_level: float = float(self.cfg.creativity_level)
         self.day: int = 1
         self.total_sleeps: int = 0
         self.auto_sleep: bool = True
@@ -315,7 +316,7 @@ class SleepingBrain:
         except Exception:
             with self.lock:
                 self.study_state["active"] = False
-                self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
+                self.state_mode = "AWAKE"
             self._release_op("study")
             raise
         return {"started": True, "topics": topics_count}
@@ -405,12 +406,6 @@ class SleepingBrain:
                                 self.study_state["facts_learned"] = total_facts
                             for s, r, d in ext.get("triples", []):
                                 self.hippocampus.record_fact(s, r, d, day=self.day, source="WEB_STUDY")
-                    with self.lock:
-                        self.energy = max(0.0, self.energy - self.cfg.study_page_energy_drain)
-                    if self.auto_sleep and self.energy <= self.cfg.sleep_threshold:
-                        self.sleep_now(visual_pacing=False, _from_nested=True)
-                        with self.lock:
-                            self.state_mode = "STUDYING"
 
                 if topic_facts:
                     assess = self.language_cortex.assess_study_mastery(topic, topic_facts, round_num=1)
@@ -444,7 +439,7 @@ class SleepingBrain:
                 self.study_state["active"] = False
                 self.study_state["current_action"] = ""
                 if self.state_mode == "STUDYING":
-                    self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
+                    self.state_mode = "AWAKE"
             self._release_op("study")
 
     def start_turbo_learn_async(self, topics_count: int = 200) -> dict[str, Any]:
@@ -476,7 +471,7 @@ class SleepingBrain:
         except Exception:
             with self.lock:
                 self.study_state["active"] = False
-                self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
+                self.state_mode = "AWAKE"
             self._release_op("study")
             raise
         return {"started": True, "topics": count}
@@ -622,7 +617,7 @@ class SleepingBrain:
                 self.study_state["active"] = False
                 self.study_state["current_action"] = ""
                 if self.state_mode == "STUDYING":
-                    self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
+                    self.state_mode = "AWAKE"
             self._release_op("study")
 
     def start_continuous_learning_async(self, duration_minutes: int = 60) -> dict[str, Any]:
@@ -654,7 +649,7 @@ class SleepingBrain:
         except Exception:
             with self.lock:
                 self.study_state["active"] = False
-                self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
+                self.state_mode = "AWAKE"
             self._release_op("study")
             raise
         return {"started": True, "duration_minutes": mins}
@@ -776,8 +771,11 @@ class SleepingBrain:
                     self.study_state["mastery"] = round(elapsed_pct, 1)
 
                 since_last_sleep += 1
-                if since_last_sleep >= 4 or self.energy <= self.cfg.sleep_threshold:
-                    self.study_state["current_action"] = "Konsolidacja zdobytej wiedzy we śnie (NREM + REM na GPU)..."
+                if self.auto_sleep and (
+                    since_last_sleep >= 4
+                    or len(self.hippocampus.short_term_memories) >= self.cfg.auto_sleep_pending_threshold
+                ):
+                    self.study_state["current_action"] = "Sen informacyjny: łączenie zdobytej wiedzy (NREM + REM na GPU)..."
                     self.sleep_now(visual_pacing=False, _from_nested=True)
                     sleeps_done += 1
                     since_last_sleep = 0
@@ -803,7 +801,7 @@ class SleepingBrain:
                 self.study_state["active"] = False
                 self.study_state["current_action"] = ""
                 if self.state_mode == "STUDYING":
-                    self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
+                    self.state_mode = "AWAKE"
             self._release_op("study")
 
     # ── Detect natural Polish "study from the web" intent ─────────────────────
@@ -864,7 +862,7 @@ class SleepingBrain:
         except Exception:
             with self.lock:
                 self.study_state["active"] = False
-                self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
+                self.state_mode = "AWAKE"
             self._release_op("study")
             raise
         return {"started": True, "topic": clean, "max_rounds": rounds}
@@ -923,7 +921,7 @@ class SleepingBrain:
             self._append_chat(
                 "assistant",
                 f"🌐 Rozpoczynam badanie tematu „{clean_topic}” w sieci! Szukam źródeł, analizuję treść na GPU "
-                f"i sprawdzam braki wiedzy aż opanuję ten temat (a po zakończeniu lub zmęczeniu prześpię się i skonsoliduję wiedzę).",
+                f"i sprawdzam braki wiedzy aż opanuję ten temat (a po zebraniu wiedzy sen połączy nowe fakty w grafie i pamięci trwałej).",
                 meta={"kind": "study_start", "topic": clean_topic},
                 add_to_working=False,
             )
@@ -1023,20 +1021,6 @@ class SleepingBrain:
                             for s, rel, d in extracted.get("triples", []):
                                 self.hippocampus.record_fact(s, rel, d, day=self.day, source="WEB_STUDY")
 
-                    # Drain mental energy per analyzed page
-                    with self.lock:
-                        self.energy = max(0.0, self.energy - self.cfg.study_page_energy_drain)
-
-                    # If tired during heavy study -> biological sleep on GPU, wake refreshed, keep studying!
-                    if self.auto_sleep and self.energy <= self.cfg.sleep_threshold:
-                        self.study_state["current_action"] = "Energia 0% — śpię i konsoliduję wiedzę na GPU..."
-                        with self.lock:
-                            self._log("SLEEP", f"Zmęczenie podczas nauki '{clean_topic}' — sen konsolidujący na GPU!")
-                        self.sleep_now(visual_pacing=False, _from_nested=True)
-                        sleeps_during_study += 1
-                        with self.lock:
-                            self.state_mode = "STUDYING"
-
                 # Self-quiz / metacognition at the end of each round
                 self.study_state["current_action"] = f"Runda {r_idx}/{rounds}: sprawdzam poziom opanowania i luki wiedzy..."
                 assessment = self.language_cortex.assess_study_mastery(clean_topic, learned_texts, round_num=r_idx)
@@ -1132,7 +1116,7 @@ class SleepingBrain:
                 self.study_state["active"] = False
                 self.study_state["current_action"] = ""
                 if self.state_mode == "STUDYING":
-                    self.state_mode = "DROWSY" if self.energy <= self.cfg.drowsy_threshold else "AWAKE"
+                    self.state_mode = "AWAKE"
             self._release_op("study")
 
     def train_language_now(self, epochs: int | None = None) -> dict[str, Any]:
@@ -1343,10 +1327,8 @@ class SleepingBrain:
                 },
             )
 
-            drain = self.cfg.chat_energy_drain + min(8.0, len(learned_memories) * 1.1)
-            self.energy = max(0.0, self.energy - drain)
-            if self.energy <= self.cfg.drowsy_threshold:
-                self.state_mode = "DROWSY"
+            self.energy = self.cfg.max_energy
+            self.state_mode = "AWAKE"
 
             if learned_memories:
                 self._log(
@@ -1354,13 +1336,17 @@ class SleepingBrain:
                     f"Hipokamp zapamiętał z rozmowy ({len(learned_memories)}): "
                     + "; ".join(m["text"] for m in learned_memories[:2]),
                 )
-            should_auto_sleep = self.auto_sleep and self.energy <= self.cfg.sleep_threshold
+            pending_count = len(self.hippocampus.short_term_memories)
+            should_auto_sleep = self.auto_sleep and pending_count >= self.cfg.auto_sleep_pending_threshold
 
         slept = False
         sleep_report_dict = None
         if should_auto_sleep:
             with self.lock:
-                self._log("SLEEP", "Energia 0% — mózg automatycznie zasypia, żeby skonsolidować pamięć!")
+                self._log(
+                    "SLEEP",
+                    f"Bufor hipokampu osiągnął {pending_count} nowych informacji — sen łączy je z wiedzą na GPU!",
+                )
             rep = self.sleep_now(visual_pacing=False, _from_nested=True)
             slept = True
             sleep_report_dict = rep.to_dict()
@@ -1854,7 +1840,8 @@ class SleepingBrain:
             meta = {
                 "embedding_version": "standalone_pytorch_v1",
                 "day": self.day,
-                "energy": self.energy,
+                "energy": self.cfg.max_energy,
+                "creativity_level": self.creativity_level,
                 "total_sleeps": self.total_sleeps,
                 "auto_sleep": self.auto_sleep,
                 "auto_web": self.auto_web,
@@ -1882,7 +1869,9 @@ class SleepingBrain:
                 self.language_cortex.import_state(weights["language_cortex"])
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             self.day = int(meta.get("day", 1))
-            self.energy = float(meta.get("energy", self.cfg.max_energy))
+            self.energy = self.cfg.max_energy
+            self.creativity_level = max(0.0, min(1.0, float(meta.get("creativity_level", self.cfg.creativity_level))))
+            self.cfg.creativity_level = self.creativity_level
             self.total_sleeps = int(meta.get("total_sleeps", 0))
             self.auto_sleep = bool(meta.get("auto_sleep", True))
             self.auto_web = bool(meta.get("auto_web", True))
@@ -1992,15 +1981,32 @@ class SleepingBrain:
             )
         return {"nodes": nodes, "edges": edges}
 
+    def creativity_score(self) -> float:
+        with self.lock:
+            base = max(0.0, min(1.0, float(self.creativity_level))) * 55.0
+            rem_links_bonus = min(20.0, len(self.hippocampus.rem_dream_links) * 1.2)
+            rem_refl_bonus = min(15.0, len(self.hippocampus.rem_reflections) * 1.5)
+            graph_bonus = min(10.0, len(self.concept_cortex.id_to_concept) * 0.15)
+            return round(min(100.0, base + rem_links_bonus + rem_refl_bonus + graph_bonus), 1)
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             active_sem = [x for x in self.hippocampus.semantic_memories if not x.superseded]
             active_sem.sort(key=lambda x: (x.last_recalled_day, x.strength, x.importance), reverse=True)
+            pending_info = len(self.hippocampus.short_term_memories)
+            info_pressure = round(
+                min(100.0, (pending_info / max(1, self.cfg.auto_sleep_pending_threshold)) * 100.0),
+                1,
+            )
             return {
                 "state_mode": self.state_mode,
                 "energy": round(self.energy, 1),
                 "max_energy": self.cfg.max_energy,
-                "sleep_pressure": round(100.0 - (self.energy / self.cfg.max_energy) * 100.0, 1),
+                "sleep_pressure": info_pressure,
+                "pending_info_to_link": pending_info,
+                "pending_sleep_threshold": self.cfg.auto_sleep_pending_threshold,
+                "creativity_level": round(self.creativity_level, 2),
+                "creativity_score": self.creativity_score(),
                 "day": self.day,
                 "total_sleeps": self.total_sleeps,
                 "auto_sleep": self.auto_sleep,

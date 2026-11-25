@@ -185,7 +185,17 @@ class BrainServer:
                             brain.auto_sleep = bool(body["auto_sleep"])
                         if "auto_web" in body:
                             brain.auto_web = bool(body["auto_web"])
-                        self._send_json({"ok": True, "auto_sleep": brain.auto_sleep, "auto_web": brain.auto_web})
+                        if "creativity_level" in body:
+                            lvl = max(0.0, min(1.0, float(body["creativity_level"])))
+                            brain.creativity_level = lvl
+                            brain.cfg.creativity_level = lvl
+                        self._send_json({
+                            "ok": True,
+                            "auto_sleep": brain.auto_sleep,
+                            "auto_web": brain.auto_web,
+                            "creativity_level": brain.creativity_level,
+                            "creativity_score": brain.creativity_score(),
+                        })
                         return
 
                     if parsed.path == "/api/save":

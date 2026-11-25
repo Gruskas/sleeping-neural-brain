@@ -9,13 +9,15 @@ class BrainConfig:
     concept_dim: int = 64
     relation_dim: int = 32
 
-    # Energy / Sleep Pressure Homeostasis (pure chat + study driven)
+    # Informational Sleep & Creativity (no artificial fatigue / energy drain)
     max_energy: float = 100.0
-    teach_energy_drain: float = 2.0
-    chat_energy_drain: float = 3.2
-    study_page_energy_drain: float = 4.5
-    drowsy_threshold: float = 20.0
+    teach_energy_drain: float = 0.0
+    chat_energy_drain: float = 0.0
+    study_page_energy_drain: float = 0.0
+    drowsy_threshold: float = 0.0
     sleep_threshold: float = 0.0
+    auto_sleep_pending_threshold: int = 24
+    creativity_level: float = 0.80
 
     # Expanded Memory Limits (Short-Term Hippocampus & Long-Term Cortex)
     max_short_term_memories: int = 5000
@@ -37,6 +39,7 @@ class BrainConfig:
     ewc_lambda_concept: float = 8.0
     rem_similarity_threshold: float = 0.56
     rem_max_new_links_per_night: int = 20
+    rem_creative_sparks_per_night: int = 4
 
     # Self-Contained PyTorch Neural Language & Semantic Cortex (100% local on GPU)
     language_model_id: str = "Autonomiczna-Kora-PyTorch-v2"

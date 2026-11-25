@@ -903,6 +903,7 @@ class LanguageCortex:
             for link in rem_links[:6]:
                 src = str(link.get("src", "")).strip()
                 dst = str(link.get("dst", "")).strip()
+                rel_kind = str(link.get("rel", "")).strip()
                 bridge_raw = str(link.get("bridge", "")).strip()
                 if not src or not dst or src == dst:
                     continue
@@ -940,11 +941,19 @@ class LanguageCortex:
                 if m_src and m_dst:
                     c1 = _trim_sentence_clean(m_src, 130)
                     c2 = _trim_sentence_clean(m_dst, 130)
-                    b_label = bridge_node or "wspólny kontekst"
-                    refl = (
-                        f"Połączenie faktów ({src} ↔ {dst} przez „{b_label}”): "
-                        f"{c1} Z kolei {_lc_first(c2)}"
-                    )
+                    if rel_kind == "kreatywna_analogia":
+                        refl = (
+                            f"Kreatywna analogia REM ({src} ↔ {dst}): "
+                            f"{c1} Można to twórczo zestawić z tym, że {_lc_first(c2)}"
+                        )
+                    else:
+                        b_label = bridge_node or "wspólny kontekst"
+                        refl = (
+                            f"Połączenie faktów ({src} ↔ {dst} przez „{b_label}”): "
+                            f"{c1} Z kolei {_lc_first(c2)}"
+                        )
+                elif rel_kind == "kreatywna_analogia":
+                    refl = f"Twórcza analogia REM: „{src}” może inspirować skojarzenia z „{dst}” na poziomie ukrytych cech."
                 elif bridge_node:
                     refl = f"Skojarzenie REM: pojęcia „{src}” i „{dst}” łączą się poprzez „{bridge_node}” ({bridge_raw})."
                 else:
@@ -959,7 +968,7 @@ class LanguageCortex:
                         used_texts.add(m_src)
                     if m_dst:
                         used_texts.add(m_dst)
-                if len(reflections) >= 2:
+                if len(reflections) >= 3:
                     break
 
         # Pass 2: Cross-topic semantic & conceptual bridges across memories
@@ -992,7 +1001,7 @@ class LanguageCortex:
                     continue
                 if shared:
                     bridge = ", ".join(shared[:2])
-                    refl = f"Wniosek REM (most: {bridge}): {c1} Wiąże się to z tym, że {_lc_first(c2)}"
+                    refl = f"Kreatywna synteza REM (most: {bridge}): {c1} Wiąże się to twórczo z tym, że {_lc_first(c2)}"
                 else:
                     refl = f"Wniosek REM: {c1} Uzupełnia to fakt, że {_lc_first(c2)}"
                 r_vec = self.encode_text(refl)
@@ -1003,10 +1012,10 @@ class LanguageCortex:
                 reflections.append(refl)
                 existing_clean.append(refl)
                 existing_vecs.append(r_vec)
-                if len(reflections) >= 4:
+                if len(reflections) >= 5:
                     break
 
-        return reflections[:4]
+        return reflections[:5]
 
     def check_memory_update(self, new_fact: str, candidate_old_facts: list[str]) -> int | None:
         if not candidate_old_facts:
@@ -1325,7 +1334,7 @@ class LanguageCortex:
             task_strip_pats = [
                 r"^(?:napisz|stwórz|stworz|zrób|zrob|pokaż|pokaz|daj|wygeneruj)\s+(?:mi\s+)?(?:prosty\s+|krótki\s+|krotki\s+|przykładowy\s+|przykladowy\s+)?(?:program|kod|skrypt|funkcję|funkcje|algorytm|pętlę|petle|klasę|klase|przykład\s+kodu)\s*",
                 r"^(?:w|na)\s+(?:języku\s+|jezyku\s+)?(?:cpp|c\+\+|pythonie|pythona|python|py|javascript|js|java|c#)\s*",
-                r"^(?:który|ktory|która|ktora|które|ktore|co|do|żeby|zeby|aby)?\s*(?:liczy|oblicza|wylicza|wyznacza|sprawdza|wypisuje|znajduje|zwraca|sortuje|pokazuje|robi|policzy|wyliczy|wypisze|sprawdzi)\s*",
+                r"^(?:(?:który|ktory|która|ktora|które|ktore|co|do|żeby|zeby|aby)\s+)?(?:to\s+)?(?:liczy|oblicza|wylicza|wyznacza|sprawdza|wypisuje|znajduje|zwraca|sortuje|pokazuje|robi|policzy|wyliczy|wypisze|sprawdzi)\s*",
             ]
             for _ in range(3):
                 prev_t = task
@@ -1334,7 +1343,7 @@ class LanguageCortex:
                 if task == prev_t:
                     break
             task_norm = _strip_pl(task.lower())
-            if task_norm in ("to", "to robi", "robi", "tego", "nim", "niej", "go", "je", "cos", "cos takiego", "takie cos"):
+            if task_norm in ("to", "to robi", "ktory to robi", "robi", "tego", "nim", "niej", "go", "je", "cos", "cos takiego", "takie cos"):
                 task = ""
             return {
                 "intent": "code_request",
@@ -1357,6 +1366,12 @@ class LanguageCortex:
             sub_intents.append("who")
 
         # 2) Detect primary intent
+        is_creative = bool(
+            re.search(
+                r"\b(?:wymysl|kreatywn\w*|tworcz\w*|metafor\w*|analogi\w*|burz\w*\s+mozg\w*|zaproponuj\s+(?:pomysl|cos)|co\s+by\s+bylo\s+gdyby|polacz\s+kreatywnie|skojarz\w*|zainspiruj)\b",
+                low,
+            )
+        )
         is_connection = bool(
             re.search(
                 r"\b(?:zwiazek|zwiazki|laczy|lacza|powiazan\w*|wspoln\w*|relacj\w*|zaleznosc\w*|jak\s+ma\s+sie|wplyw\w*\s+na|zalezy\s+od)\b",
@@ -1381,7 +1396,7 @@ class LanguageCortex:
                 low,
             )
         )
-        is_yes_no = low.startswith("czy ") and not is_comparison and not is_connection
+        is_yes_no = low.startswith("czy ") and not is_comparison and not is_connection and not is_creative
         is_explicit_def = bool(
             re.match(
                 r"^(?:no\s+to\s+|a\s+)?(?:co\s+to\s+(?:jest|sa)|czym\s+(?:jest|sa)|kim\s+(?:jest|byl)|kto\s+to\s+(?:jest|byl)|zdefiniuj|co\s+oznacza|znaczenie\s+slowa)\b",
@@ -1393,6 +1408,8 @@ class LanguageCortex:
         raw_clean = msg.strip(" ?!.")
         # Strip leading framing phrases
         framing_patterns = [
+            r"^(?:wymyśl|wymysl|zaproponuj|stwórz|stworz|podaj|znajdź|znajdz)\s+(?:kreatywn[aąey]|twórcz[aąey]|ciekaw[aąey])?\s*(?:analogię|analogie|metaforę|metafory|pomysł|pomysl|skojarzenie|połączenie|polaczenie)?\s*(?:między|miedzy|pomiędzy|pomiedzy|dla|na\s+temat|o|do)?\s*",
+            r"^(?:połącz\s+kreatywnie|polacz\s+kreatywnie|skojarz\s+kreatywnie|co\s+by\s+było\s+gdyby|co\s+by\s+bylo\s+gdyby)\s+",
             r"^(?:powiedz\s+mi|wyjaśnij(?:\s+krótko)?|wyjasnij(?:\s+krotko)?|wytłumacz|wytlumacz|opowiedz(?:\s+o)?|opisz|podaj|porównaj|porownaj)\s+",
             r"^(?:jaki\s+jest\s+związek\s+(?:między|pomiedzy|pomiędzy)|jaki\s+jest\s+zwiazek\s+(?:miedzy|pomiedzy)|co\s+łączy|co\s+laczy|jaka\s+jest\s+różnica\s+(?:między|pomiędzy)|jaka\s+jest\s+roznica\s+(?:miedzy|pomiedzy)|czym\s+się\s+różni|czym\s+sie\s+rozni)\s+",
             r"^(?:dlaczego\s+bez|dlaczego|czemu|czy|jak\s+działa|jak\s+dziala|na\s+czym\s+polega|w\s+jaki\s+sposób|w\s+jaki\s+sposob)\s+",
@@ -1449,11 +1466,13 @@ class LanguageCortex:
 
         is_multi_part = (
             len(sub_intents) >= 2
-            or (len(sub_concepts) >= 2 and not is_explicit_def and not is_connection and not is_comparison and not is_causal and not is_how and not is_yes_no)
+            or (len(sub_concepts) >= 2 and not is_explicit_def and not is_connection and not is_comparison and not is_causal and not is_how and not is_yes_no and not is_creative)
             or (" i kiedy " in low or " i kto " in low or " i gdzie " in low or " i ile " in low)
         )
 
-        if is_connection:
+        if is_creative:
+            intent = "creative"
+        elif is_connection:
             intent = "connection"
         elif is_comparison:
             intent = "comparison"
@@ -1578,6 +1597,54 @@ class LanguageCortex:
             return res if res.endswith((".", "!", "?")) else res + "."
         return clean if clean.endswith((".", "!", "?")) else clean + "."
 
+    def _synthesize_creative_insight(
+        self,
+        sub_concepts: list[str],
+        cleaned: list[str],
+        bridges: list[str],
+        concept_paths: list[dict[str, Any]],
+        matching_rem: list[str],
+        concept_hints: list[str],
+    ) -> str:
+        """Build a grounded creative analogy, cross-concept hypothesis, or idea synthesis."""
+        if not cleaned:
+            return ""
+        f1 = _trim_sentence_clean(cleaned[0], 145)
+        f2 = _trim_sentence_clean(cleaned[1], 145) if len(cleaned) > 1 else ""
+        top_bridge = bridges[0] if bridges else ""
+        path_sum = concept_paths[0]["summary"] if concept_paths and concept_paths[0].get("summary") else ""
+
+        if len(sub_concepts) >= 2 and f2:
+            a_lbl = sub_concepts[0]
+            b_lbl = sub_concepts[1]
+            if top_bridge:
+                res = (
+                    f"Kreatywna analogia (**{a_lbl} ↔ {b_lbl}** przez wspólny mechanizm **{top_bridge}**): "
+                    f"{f1} Z kolei {_lc_first(f2)} "
+                    f"Można więc spojrzeć na **{a_lbl}** jak na lustrzane odbicie **{b_lbl}** w obszarze pojęcia **{top_bridge}**."
+                )
+            else:
+                res = (
+                    f"Twórcze połączenie (**{a_lbl} + {b_lbl}**): {f1} "
+                    f"Gdy zestawimy to z tym, że {_lc_first(f2)} powstaje wspólny pomost między tymi dwiema ideami."
+                )
+        elif f2:
+            bridge_note = f" (wspólny wątek: **{top_bridge}**)" if top_bridge else ""
+            res = (
+                f"Kreatywne spojrzenie{bridge_note}: wychodząc od tego, że {_lc_first(f1)} "
+                f"i łącząc to z faktem, że {_lc_first(f2)} można zauważyć szerszy wzorzec między tymi zjawiskami."
+            )
+        else:
+            res = f"Twórcza hipoteza na bazie pamięci: {f1}"
+            if concept_hints:
+                res += f" W mojej sieci skojarzeń łączy się to z: {concept_hints[0]}."
+
+        if path_sum and path_sum.lower() not in res.lower():
+            res += f" (Ścieżka skojarzeń: {path_sum}.)"
+        elif matching_rem and matching_rem[0].lower() not in res.lower():
+            res += f" Inspiracja ze snu REM: {matching_rem[0]}"
+        return res
+
     def _deliberate_best_answer(
         self,
         msg: str,
@@ -1612,13 +1679,13 @@ class LanguageCortex:
             if not rc:
                 continue
             rc_body = re.sub(
-                r"^(?:Wniosek\s+REM(?:\s*\([^)]*\))?|Połączenie\s+faktów(?:\s*\([^)]*\))?|Skojarzenie\s+REM(?:\s*\([^)]*\))?):\s*",
+                r"^(?:Wniosek\s+REM(?:\s*\([^)]*\))?|Kreatywna\s+(?:synteza|analogia)\s+REM(?:\s*\([^)]*\))?|Twórcza\s+analogia\s+REM(?:\s*\([^)]*\))?|Połączenie\s+faktów(?:\s*\([^)]*\))?|Skojarzenie\s+REM(?:\s*\([^)]*\))?):\s*",
                 "",
                 rc,
                 flags=re.I,
             ).strip()
             rc_for_match = re.sub(
-                r"\b(?:uzupełnia\s+pamięć\s+o:|wiąże\s+się\s+to\s+z\s+tym,\s+że|z\s+kolei)\b",
+                r"\b(?:uzupełnia\s+pamięć\s+o:|wiąże\s+się\s+to\s+(?:twórczo\s+)?z\s+tym,\s+że|z\s+kolei)\b",
                 " ",
                 rc_body,
                 flags=re.I,
@@ -1634,7 +1701,25 @@ class LanguageCortex:
 
         candidates: list[tuple[str, str]] = []
 
-        if intent == "connection":
+        if intent == "creative":
+            creative_ans = self._synthesize_creative_insight(
+                sub_concepts=sub_concepts,
+                cleaned=cleaned,
+                bridges=bridges,
+                concept_paths=concept_paths,
+                matching_rem=matching_rem,
+                concept_hints=concept_hints,
+            )
+            if creative_ans:
+                candidates.append(("kreatywna synteza i analogia", creative_ans))
+            if len(cleaned) >= 2:
+                f1 = _trim_sentence_clean(cleaned[0], 145)
+                f2 = _trim_sentence_clean(cleaned[1], 145)
+                candidates.append(("twórcze zestawienie faktów", f"Zestawiając wiedzę z pamięci: {f1} Jednocześnie {_lc_first(f2)}"))
+            elif cleaned:
+                candidates.append(("inspiracja z pamięci", cleaned[0]))
+
+        elif intent == "connection":
             # Strategy A: Lead with discovered bridge / chain, then connect supporting facts
             f1 = _trim_sentence_clean(cleaned[0], 150)
             f2 = _trim_sentence_clean(cleaned[1], 150) if len(cleaned) > 1 else ""
@@ -1787,10 +1872,22 @@ class LanguageCortex:
                 candidates.append(("synteza wiedzy", synth))
                 candidates.append(("odpowiedź z pamięci", f"Z tego co pamiętam, {_lc_first(cleaned[0])}"))
 
-        # Add matching REM insight or graph path if helpful and not already included
+        # Add matching REM insight or creative synthesis if helpful
+        creativity_lvl = float(getattr(self.cfg, "creativity_level", 0.80))
+        if creativity_lvl >= 0.45 and intent in ("connection", "open_question") and (bridges or matching_rem or path_summaries):
+            cr_cand = self._synthesize_creative_insight(
+                sub_concepts=sub_concepts,
+                cleaned=cleaned,
+                bridges=bridges,
+                concept_paths=concept_paths,
+                matching_rem=matching_rem,
+                concept_hints=concept_hints,
+            )
+            if cr_cand and intent == "open_question" and len(cleaned) >= 2:
+                candidates.append(("kreatywna synteza skojarzeń", cr_cand))
         if matching_rem and candidates:
             base_lbl, base_txt = candidates[0]
-            if matching_rem[0].lower() not in base_txt.lower() and intent not in ("yes_no", "definition"):
+            if matching_rem[0].lower() not in base_txt.lower() and intent not in ("yes_no", "definition", "creative"):
                 candidates.append((f"{base_lbl} + REM", f"{base_txt} Patrząc szerzej: {matching_rem[0]}"))
 
         # Optional neural Transformer LM candidate (only if genuinely fluent & grounded)
@@ -1828,7 +1925,7 @@ class LanguageCortex:
         target_concepts = grounded_concepts or sub_concepts
         for (lbl, txt), lms in zip(uniq_cands, lm_scores):
             t_low = txt.lower()
-            # 1) Intent fit (0..0.38)
+            # 1) Intent fit (0..0.44)
             intent_fit = 0.24
             is_def_style = t_low.startswith(("najprościej mówiąc:", "słowo „", "znaczenie słowa"))
             if intent == "definition":
@@ -1836,6 +1933,13 @@ class LanguageCortex:
             else:
                 if is_def_style:
                     intent_fit = 0.08  # penalize definition boilerplate on non-definition questions
+                elif intent == "creative":
+                    if lbl.startswith("kreatywna synteza"):
+                        intent_fit = 0.44
+                    elif any(k in t_low for k in ("analogia", "twórcz", "pomost", "hipoteza", "zestawiając")):
+                        intent_fit = 0.36
+                    else:
+                        intent_fit = 0.20
                 elif intent == "connection" and any(k in t_low for k in ("łączy", "łańcuch", "jednocześnie", "z kolei", "most")):
                     intent_fit = 0.37
                 elif intent == "comparison":
@@ -1852,7 +1956,7 @@ class LanguageCortex:
                 elif intent in ("multi_part", "factual_detail"):
                     intent_fit = 0.34
                 elif intent == "open_question":
-                    intent_fit = 0.33
+                    intent_fit = 0.33 + (0.04 * creativity_lvl if lbl.startswith("kreatywna") else 0.0)
 
             # 2) Concept coverage (0..0.28)
             if target_concepts:
@@ -1912,7 +2016,7 @@ class LanguageCortex:
         task_norm = _strip_pl(task.lower())
 
         # Resolve contextual follow-up ("napisz program w cpp który to robi")
-        if not task or task_norm in ("to", "to robi", "robi", "tego", "nim", "niej", "go", "je", "cos takiego"):
+        if not task or task_norm in ("to", "to robi", "ktory to robi", "robi", "tego", "nim", "niej", "go", "je", "cos takiego"):
             for turn in reversed(recent_turns[-8:]):
                 if turn.get("role") != "user":
                     continue
@@ -2499,22 +2603,24 @@ class LanguageCortex:
 
         # 2c) Small talk / mood / jokes
         if any(p in low for p in ("jak sie masz", "co slychac", "co u ciebie", "wszystko ok", "jak leci", "co tam")):
+            creativity_pct = int(round(getattr(self.cfg, "creativity_level", 0.80) * 100))
             return (
-                f"U mnie wszystko w porządku{name_part}! Energia na poziomie {energy:.0f}% "
-                f"(Dzień #{day}, przespanych nocy: {sleeps}). W czym mogę Ci pomóc albo o czym porozmawiamy?",
+                f"U mnie wszystko w porządku{name_part}! Pracuję pełną parą — bez zmęczenia "
+                f"(kreatywność {creativity_pct}%, Dzień #{day}, cykli łączenia wiedzy we śnie: {sleeps}). "
+                f"W czym mogę Ci pomóc albo o czym porozmawiamy?",
                 None,
             )
 
         if any(p in low for p in ("nudzi mi sie", "pogadajmy", "porozmawiajmy")):
             return (
-                f"Chętnie porozmawiam{name_part}! Możesz zapytać mnie o dowolną ciekawostkę "
-                f"(z włączonym `🌐 Auto-sieć` od razu ją sprawdzę w internecie), możemy policzyć jakieś zadanie albo po prostu pogadać.",
+                f"Chętnie porozmawiam{name_part}! Możesz zapytać mnie o dowolną ciekawostkę, poprosić o kreatywną analogię "
+                f"(z włączonym `🌐 Auto-sieć` od razu sprawdzę temat w internecie), możemy policzyć zadanie albo po prostu pogadać.",
                 None,
             )
 
         if any(p in low for p in ("zart", "kawal")):
             return (
-                "Dlaczego sieć neuronowa poszła spać? Bo bez fazy REM w ogóle nie kojarzyła faktów! 😄",
+                "Dlaczego sieć neuronowa poszła spać? Nie ze zmęczenia — tylko żeby w fazie REM połączyć odległe fakty w genialny pomysł! 😄",
                 None,
             )
 
@@ -2534,7 +2640,7 @@ class LanguageCortex:
 
         # 3) Farewell
         if low in ("dobranoc", "do zobaczenia", "pa", "nara", "czesc na dzis"):
-            sleep_note = " Masz w hipokampie świeże wspomnienia — możesz wpisać `/sen`, abym je utrwalił na GPU." if hippocampus_memories else ""
+            sleep_note = " Masz w hipokampie świeże informacje — możesz wpisać `/sen`, abym połączył je ze zdobytą wiedzą na GPU." if hippocampus_memories else ""
             return (f"Do zobaczenia{name_part}!{sleep_note}", None)
 
         # 4) Conversational capability / "o czym mogę z tobą rozmawiać" (tolerant of Polish typos)
@@ -2606,10 +2712,9 @@ class LanguageCortex:
         )
         if is_greeting:
             me = f"Mam na imię {brain_name}. " if brain_name else ""
-            sleep_hint = " Jestem już trochę zmęczony — przyda się `/sen`, żebym utrwalił dzisiejsze rozmowy." if energy <= self.cfg.drowsy_threshold else ""
             return (
-                f"Cześć{name_part}! {me}Dzisiaj jest mój {day}. dzień pracy (energia {energy:.0f}%), "
-                f"wszystko działa lokalnie na moim własnym modelu GPU. O czym dzisiaj pogadamy?{sleep_hint}",
+                f"Cześć{name_part}! {me}Dzisiaj jest mój {day}. dzień pracy "
+                f"(tryb twórczy, wszystko działa lokalnie na moim własnym modelu GPU). O czym dzisiaj pogadamy?",
                 None,
             )
 
@@ -2995,9 +3100,6 @@ class LanguageCortex:
                 "int wartosc = *wskaznik; // dereferencja -> 42\n"
                 "```"
             )
-
-        if state_mode == "DROWSY" or energy <= self.cfg.drowsy_threshold:
-            final_reply += "\n(Jestem już lekko śpiący — przyda się `/sen`, żebym utrwalił nowe rzeczy na GPU.)"
 
         ctx_hint = f"Rozmawialiśmy o: {active_subject}." if active_subject else ""
         sample_seq = (

@@ -458,10 +458,47 @@ class SleepEngine:
                         bridge_desc = f"wspólne źródło: {b} ({r1} / {r2})"[:120]
                         candidates.append((score, a, "skojarzenie_rem", c, bridge_desc))
 
+        # 4) Creative cross-domain analogies via latent dream projection
+        creative_candidates: list[tuple[float, str, str, str, str]] = []
+        creativity_level = float(getattr(self.cfg, "creativity_level", 0.80))
+        creative_sparks_limit = int(getattr(self.cfg, "rem_creative_sparks_per_night", 4))
+        if creativity_level >= 0.25 and creative_sparks_limit > 0:
+            info_nodes = [
+                n for n in self.concept_cortex.id_to_concept
+                if is_informative_node(n) and deg.get(n, 0) >= 1
+            ][:60]
+            if len(info_nodes) >= 4:
+                node_ids = [self.concept_cortex.concept_to_id[n] for n in info_nodes]
+                node_vecs = all_emb[node_ids]
+                dream_vecs = self.concept_cortex.predict_dream_vec(node_vecs)
+                dream_sim_mat = dream_vecs @ node_vecs.T
+                direct_sim_mat = node_vecs @ node_vecs.T
+                min_creative_sim = max(0.32, self.cfg.rem_similarity_threshold - 0.14 * creativity_level)
+
+                for idx_i, a in enumerate(info_nodes):
+                    for idx_j in range(idx_i + 1, len(info_nodes)):
+                        c = info_nodes[idx_j]
+                        if (a, c) in known_pairs:
+                            continue
+                        d_sim = float(dream_sim_mat[idx_i, idx_j].item())
+                        r_sim = float(dream_sim_mat[idx_j, idx_i].item())
+                        dir_sim = float(direct_sim_mat[idx_i, idx_j].item())
+                        # Favor surprising cross-domain associations (high dream projection, moderate direct distance)
+                        novelty_bonus = 0.10 * creativity_level if 0.10 <= dir_sim <= 0.72 else 0.0
+                        c_score = 0.5 * (d_sim + r_sim) + novelty_bonus
+                        if c_score >= min_creative_sim:
+                            bridge_desc = f"kreatywna analogia: {a} ↔ {c}"[:120]
+                            creative_candidates.append((c_score, a, "kreatywna_analogia", c, bridge_desc))
+
+        creative_candidates.sort(key=lambda x: x[0], reverse=True)
         candidates.sort(key=lambda x: x[0], reverse=True)
         discovered: list[dict[str, Any]] = []
         used_pairs: set[tuple[str, str]] = set()
-        for score, a, rel, c, bridge in candidates:
+
+        # Reserve up to `creative_sparks_limit` slots for creative cross-domain analogies
+        for score, a, rel, c, bridge in creative_candidates:
+            if len(discovered) >= creative_sparks_limit or len(discovered) >= self.cfg.rem_max_new_links_per_night:
+                break
             if (a, c) in used_pairs or (c, a) in used_pairs:
                 continue
             used_pairs.add((a, c))
@@ -477,6 +514,23 @@ class SleepEngine:
             )
             self.hippocampus.rem_dream_links[dream_fact.key()] = dream_fact
             discovered.append({"src": a, "rel": rel, "dst": c, "score": round(score, 3), "bridge": bridge})
+
+        for score, a, rel, c, bridge in candidates:
             if len(discovered) >= self.cfg.rem_max_new_links_per_night:
                 break
+            if (a, c) in used_pairs or (c, a) in used_pairs:
+                continue
+            used_pairs.add((a, c))
+            dream_fact = ConceptFact(
+                src=a,
+                rel=rel,
+                dst=c,
+                strength=round(score, 3),
+                day=day,
+                source="REM_DREAM",
+                bridge=bridge,
+                consolidated=True,
+            )
+            self.hippocampus.rem_dream_links[dream_fact.key()] = dream_fact
+            discovered.append({"src": a, "rel": rel, "dst": c, "score": round(score, 3), "bridge": bridge})
         return discovered

@@ -351,6 +351,75 @@ class TestHippocampusAndCortex(unittest.TestCase):
             self.assertNotIn("/ucz", r3)
             self.assertIn("pytorch", r3)
 
+    def test_creativity_and_informational_sleep_without_fatigue(self):
+        cfg = BrainConfig(
+            nrem_concept_epochs=25,
+            cortex_sleep_epochs=4,
+            language_bootstrap_epochs=2,
+            rem_similarity_threshold=-1.0,
+            auto_sleep_pending_threshold=4,
+            creativity_level=0.85,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
+            brain.auto_web = False
+
+            # 1) Chatting & teaching facts must NOT drain energy or enter DROWSY
+            for fact in (
+                "Fotosynteza to proces wykorzystujący światło słoneczne do wytwarzania glukozy oraz tlenu w roślinach.",
+                "Układ oddechowy to układ pobierający tlen i dostarczający go do komórek organizmu.",
+                "Komputer to maszyna przetwarzająca informacje w procesorze i zapisująca je w pamięci.",
+            ):
+                res = brain.chat(fact)
+                self.assertEqual(brain.energy, 100.0)
+                self.assertEqual(brain.state_mode, "AWAKE")
+                self.assertFalse(res["slept"])
+                self.assertNotIn("śpiący", res["reply"].lower())
+                self.assertNotIn("zmęczony", res["reply"].lower())
+
+            brain.hippocampus.record_fact("fotosynteza", "wytwarza", "tlen", day=1)
+            brain.hippocampus.record_fact("układ oddechowy", "pobiera", "tlen", day=1)
+            brain.hippocampus.record_fact("komputer", "przetwarza", "informacje", day=1)
+            brain.hippocampus.record_fact("rośliny", "przeprowadzają", "fotosynteza", day=1)
+
+            snap_before = brain.snapshot()
+            score_before = snap_before["creativity_score"]
+            self.assertEqual(snap_before["energy"], 100.0)
+            self.assertGreaterEqual(snap_before["pending_info_to_link"], 3)
+
+            # 2) Sleep is strictly for linking & consolidating information (NREM + REM + creative analogies)
+            rep = brain.sleep_now(visual_pacing=False)
+            self.assertEqual(brain.energy, 100.0)
+            self.assertEqual(brain.state_mode, "AWAKE")
+            self.assertGreaterEqual(len(rep.rem_new_links), 1)
+            self.assertTrue(any(l.get("rel") == "kreatywna_analogia" for l in rep.rem_new_links))
+
+            snap_after = brain.snapshot()
+            self.assertGreater(snap_after["creativity_score"], score_before)
+
+            # 3) Creative query triggers 'creative' intent and produces grounded creative analogy
+            intent_info = brain.language_cortex.analyze_query_intent(
+                "Wymyśl kreatywną analogię między fotosyntezą a oddychaniem"
+            )
+            self.assertEqual(intent_info["intent"], "creative")
+            creative_res = brain.chat("Wymyśl kreatywną analogię między fotosyntezą a oddychaniem")
+            cr_low = creative_res["reply"].lower()
+            self.assertTrue(
+                any(w in cr_low for w in ("analogia", "twórcz", "kreatywn", "pomost", "tlen")),
+                f"Expected creative grounded answer, got: {creative_res['reply']}",
+            )
+            self.assertNotIn("śpiący", cr_low)
+
+            # 4) Auto-sleep triggers only when pending info reaches auto_sleep_pending_threshold
+            auto_res = brain.chat("Gwiazdy to ciała niebieskie świecące dzięki reakcjom termojądrowym w swoim wnętrzu.")
+            self.assertFalse(auto_res["slept"])
+            brain.chat("Księżyc to naturalny satelita krążący wokół Ziemi i wywołujący pływy morskie.")
+            brain.chat("Ocean to wielki zbiornik wodny regulujący klimat na powierzchni Ziemi.")
+            trig_res = brain.chat("Wulkan to miejsce na powierzchni Ziemi wydobywające magmę z głębi płaszcza.")
+            self.assertTrue(trig_res["slept"])
+            self.assertEqual(brain.energy, 100.0)
+            self.assertEqual(brain.state_mode, "AWAKE")
+
 
 class TestWebLearner(unittest.TestCase):
     def test_query_cleaning_relevance_and_direct_url(self):
