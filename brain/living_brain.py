@@ -424,7 +424,7 @@ class LivingBrainEngine:
         for _ in range(16):
             if self.budget_utilization_ratio() <= 0.92:
                 break
-            # 1) First prune weakest/oldest M2 episodes
+            # 1) First prune weakest unpinned M2 episodes
             ep_n = self._prune_weak_episodes(fraction=0.35)
             pruned_ep += ep_n
             # 2) Prune weak M1 synapses
@@ -481,8 +481,8 @@ class LivingBrainEngine:
         keep_unpinned_n = max(min_unpinned, u_count - drop_n)
         if keep_unpinned_n >= u_count:
             return 0
-        recency = (self.m2_last_used.float() - float(max(1, self.tick_count))) * 0.002
-        priority = self.m2_strengths + 0.6 * self.m2_surprises + 0.3 * self.m2_valences + recency
+        # Retention depends on strength, surprise, and valence — never on age/recency
+        priority = self.m2_strengths + 0.6 * self.m2_surprises + 0.3 * self.m2_valences
         if keep_unpinned_n > 0:
             u_prio = priority.index_select(0, unpinned_idx)
             top_rel = torch.topk(u_prio, k=keep_unpinned_n, largest=True, sorted=False).indices

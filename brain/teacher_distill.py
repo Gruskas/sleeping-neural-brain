@@ -88,6 +88,142 @@ TEACHER_PROMPT_POOL: list[str] = [
     "możesz krócej?", "powiedz coś więcej", "a co jeszcze?",
 ]
 
+# Rich topic bank + natural Polish templates so requesting 250, 500, or 1000 dialogues
+# always produces genuinely diverse, unseen Polish conversational prompts (1,500+ unique).
+TEACHER_DYNAMIC_TOPICS: list[str] = [
+    # Nauka, fizyka, kosmos, chemia
+    "prędkość światła", "grawitacja na Księżycu", "fale dźwiękowe", "magnetyzm", "elektryczność statyczna",
+    "rozszczepienie światła i tęcza", "efekt cieplarniany", "ciśnienie atmosferyczne", "stany skupienia materii",
+    "energia kinetyczna", "energia odnawialna", "elektrownia jądrowa", "panele fotowoltaiczne", "supernowa",
+    "galaktyka Droga Mleczna", "układ słoneczny", "planeta Mars", "pierścienie Saturna", "komety i asteroidy",
+    "teleskop Kosmiczny Jamesa Webba", "ciemna materia", "próżnia w kosmosie", "zorza polarna", "zaćmienie Słońca",
+    "tablica Mendelejewa", "reakcje chemiczne", "utlenianie i rdza", "kwasy i zasady pH", "katalizator",
+    "izotopy promieniotwórcze", "nanotechnologia", "nadprzewodniki", "laser", "promieniowanie rentgenowskie",
+    # Biologia, człowiek, zdrowie, natura
+    "fotosynteza", "ewolucja Darwina", "mikrobiom jelitowy", "układ nerwowy", "neuroplastyczność mózgu",
+    "dopamina i motywacja", "serotonina i nastrój", "kortyzol i stres", "rytm dobowy", "faza snu REM",
+    "pamięć krótkotrwała i długotrwała", "szczepionki", "antybiotyki", "krążenie krwi", "oddychanie komórkowe",
+    "geny dominujące i recesywne", "mutacje genetyczne", "ekosystem leśny", "pszczoły i zapylanie",
+    "migracje ptaków", "hibernacja zwierząt", "rafy koralowe", "rowy oceaniczne", "wulkany i magma",
+    "trzęsienia ziemi", "tektonika płyt", "powstawanie chmur i deszczu", "prądy morskie", "lodowce",
+    # Technologia, IT, AI, programowanie
+    "sztuczna inteligencja", "uczenie maszynowe", "uczenie ze wzmocnieniem", "transformer w sieciach neuronowych",
+    "komputery kwantowe", "kryptografia i szyfrowanie", "blockchain", "chmura obliczeniowa", "bazy danych SQL",
+    "protokół HTTP i HTTPS", "adres IP i DNS", "VPN i prywatność w sieci", "cyberbezpieczeństwo i phishing",
+    "system operacyjny", "procesor CPU", "pamięć podręczna cache", "tranzystory i mikroprocesory",
+    "druk 3D", "robotyka przemysłowa", "samochody autonomiczne", "drony", "rzeczywistość wirtualna VR",
+    "silnik gier komputerowych", "ray tracing w grafice", "kompilator a interpreter", "rekurencja w programowaniu",
+    "struktury danych", "testowanie oprogramowania", "kontenery Docker", "sieci 5G", "GPS i satelity",
+    # Historia, kultura, społeczeństwo, ekonomia
+    "starożytna Grecja i demokracja", "starożytny Egipt i piramidy", "wynalezienie druku przez Gutenberga",
+    "rewolucja przemysłowa", "odkrycia geograficzne", "renesans w sztuce", "oświecenie", "zimna wojna",
+    "wyścig kosmiczny i lądowanie na Księżycu", "historia internetu", "historia Polski i chrzest w 966",
+    "Konstytucja 3 maja", "Unia Europejska", "prawo podaży i popytu", "procent składany", "kredyt i odsetki",
+    "podatki i budżet państwa", "bank centralny i stopy procentowe", "PKB", "kryptowaluty", "startup i inwestorzy",
+    # Psychologia, filozofia, logika, codzienność
+    "efekt placebo", "błędy poznawcze", "efekt potwierdzenia", "efekt Dunninga-Krugera", "prokrastynacja",
+    "nawyki i pętla nawyku", "inteligencja emocjonalna", "asertywność", "wypalenie zawodowe", "flow i skupienie",
+    "paradoks wyboru", "brzytwa Ockhama", "eksperyment myślowy kota Schrödingera", "etyka sztucznej inteligencji",
+    "minimalizm życiowy", "zarządzanie czasem", "technika Pomodoro", "aktywne słuchanie", "negocjacje",
+    "zdrowe odżywianie", "białko i regeneracja mięśni", "trening siłowy a kardio", "nawodnienie organizmu",
+    "kofeina i jej działanie", "ergonomia pracy przy komputerze", "nauka języków obcych", "czytanie książek",
+    "film i montaż kinowy", "teoria muzyki i rytm", "fotografia i kompozycja", "architektura współczesna",
+    "gotowanie i reakcja Maillarda", "fermentacja żywności", "podróże i planowanie budżetu", "ekologia w domu",
+]
+
+TEACHER_TOPIC_TEMPLATES: list[str] = [
+    "wyjaśnij prosto co to jest {topic}?",
+    "jak w praktyce działa {topic}?",
+    "podaj ciekawy fakt na temat: {topic}",
+    "dlaczego {topic} ma znaczenie w codziennym życiu?",
+    "jak wytłumaczyć dziecku czym jest {topic}?",
+    "co najważniejszego warto wiedzieć o: {topic}?",
+    "jakie są najczęstsze mity związane z tematem: {topic}?",
+    "co by się stało, gdyby nagle zniknęło: {topic}?",
+    "opowiedz krótko i ciekawie o: {topic}",
+    "jakim prostym porównaniem najlepiej wyjaśnić {topic}?",
+]
+
+_REASK_PREFIXES: tuple[str, ...] = (
+    "odpowiedz krótko z innej perspektywy: ",
+    "wytłumacz jeszcze prościej: ",
+    "podaj inny przykład do pytania: ",
+    "powiedz w jednym zdaniu: ",
+)
+
+
+def build_teacher_prompt_queue(
+    target_n: int,
+    existing_qs: set[str],
+    extra_topics: list[str] | None = None,
+    rng: random.Random | None = None,
+) -> list[str]:
+    """
+    Build a diverse Polish prompt queue of EXACTLY `target_n` items (up to 1000+):
+      1. Unseen curated conversational prompts from `TEACHER_PROMPT_POOL` + `extra_topics`.
+      2. Unseen dynamic prompts generated from `TEACHER_DYNAMIC_TOPICS x TEACHER_TOPIC_TEMPLATES`.
+      3. If the user has already generated >1,500 dialogues, cycles through `seen_fallback`
+         with natural re-ask variations so `target_n` (e.g. 250 / 500) is ALWAYS honored.
+    """
+    rnd = rng or random.Random()
+    seen_norm: set[str] = set()
+    primary_unseen: list[str] = []
+    dynamic_unseen: list[str] = []
+    seen_fallback: list[str] = []
+
+    def _add_candidate(prompt: str, bucket_unseen: list[str]) -> None:
+        p = prompt.strip()
+        key = p.lower()
+        if not p or key in seen_norm:
+            return
+        seen_norm.add(key)
+        if key not in existing_qs:
+            bucket_unseen.append(p)
+        else:
+            seen_fallback.append(p)
+
+    for p in TEACHER_PROMPT_POOL:
+        _add_candidate(p, primary_unseen)
+
+    for topic in (extra_topics or []):
+        t_clean = (topic or "").strip()
+        if len(t_clean) >= 3:
+            _add_candidate(f"wyjaśnij prosto co to jest {t_clean}", primary_unseen)
+            _add_candidate(f"opowiedz krótko i ciekawie o: {t_clean}", primary_unseen)
+
+    # Generate dynamic topic x template combinations in randomized order
+    dyn_pairs = [(t, tmpl) for t in TEACHER_DYNAMIC_TOPICS for tmpl in TEACHER_TOPIC_TEMPLATES]
+    rnd.shuffle(dyn_pairs)
+    for topic, tmpl in dyn_pairs:
+        _add_candidate(tmpl.format(topic=topic), dynamic_unseen)
+
+    rnd.shuffle(primary_unseen)
+    rnd.shuffle(dynamic_unseen)
+    rnd.shuffle(seen_fallback)
+
+    queue: list[str] = []
+    for src in (primary_unseen, dynamic_unseen, seen_fallback):
+        if len(queue) >= target_n:
+            break
+        need = target_n - len(queue)
+        queue.extend(src[:need])
+
+    # Safety net for very large multi-session histories (>1,500 already saved dialogues):
+    # cycle through re-ask variations until exact `target_n` is reached.
+    base_pool = seen_fallback or list(TEACHER_PROMPT_POOL)
+    round_idx = 0
+    while len(queue) < target_n and base_pool:
+        prefix = _REASK_PREFIXES[round_idx % len(_REASK_PREFIXES)]
+        shuffled = list(base_pool)
+        rnd.shuffle(shuffled)
+        for p in shuffled:
+            if len(queue) >= target_n:
+                break
+            queue.append(f"{prefix}{p}")
+        round_idx += 1
+
+    return queue[:target_n]
+
 
 def teacher_dialogues_path(state_dir: Path | str) -> Path:
     return Path(state_dir) / "teacher_dialogues.jsonl"
@@ -170,30 +306,24 @@ def generate_bielik_teacher_dialogues(
 
     existing = load_teacher_dialogues(state_dir)
     existing_qs = {q.lower() for q, _ in existing}
-
-    # Build fresh prompt queue: prioritize unseen prompts from TEACHER_PROMPT_POOL + extra_topics
-    candidates: list[str] = list(TEACHER_PROMPT_POOL)
-    for topic in (extra_topics or []):
-        t_clean = (topic or "").strip()
-        if len(t_clean) >= 3:
-            candidates.append(f"wyjaśnij prosto co to jest {t_clean}")
-            candidates.append(f"opowiedz krótko i ciekawie o: {t_clean}")
-
-    unseen = [p for p in candidates if p.lower() not in existing_qs]
-    seen_fallback = [p for p in candidates if p.lower() in existing_qs]
     rng = random.Random(int(time.time()) ^ len(existing))
-    rng.shuffle(unseen)
-    rng.shuffle(seen_fallback)
 
     target_n = max(5, min(1000, int(num_dialogues)))
-    prompt_queue = (unseen + seen_fallback)[:target_n]
+    # Add a small reserve buffer so filtered short replies (<8 chars) don't leave us short of target_n
+    reserve_n = min(120, max(16, target_n // 10))
+    prompt_queue = build_teacher_prompt_queue(
+        target_n=target_n + reserve_n,
+        existing_qs=existing_qs,
+        extra_topics=extra_topics,
+        rng=rng,
+    )
 
     if progress_callback:
         progress_callback(
             {
                 "phase": "loading_teacher",
                 "done": 0,
-                "total": len(prompt_queue),
+                "total": target_n,
                 "message": f"Ładuję nauczyciela {model_id.split('/')[-1]} z lokalnego cache na GPU (bfloat16)...",
             }
         )
@@ -248,10 +378,12 @@ def generate_bielik_teacher_dialogues(
 
         with out_path.open("a", encoding="utf-8") as fh:
             start = 0
-            while start < len(prompt_queue):
+            while start < len(prompt_queue) and len(generated_pairs) < target_n:
                 if stop_event is not None and stop_event.is_set():
                     break
-                batch_qs = prompt_queue[start : start + batch_size]
+                remaining_needed = target_n - len(generated_pairs)
+                cur_batch_n = min(batch_size, remaining_needed)
+                batch_qs = prompt_queue[start : start + cur_batch_n]
                 prompt_texts: list[str] = []
                 for q in batch_qs:
                     msgs = [
@@ -290,6 +422,8 @@ def generate_bielik_teacher_dialogues(
 
                 batch_generated: list[dict[str, str]] = []
                 for i, q in enumerate(batch_qs):
+                    if len(generated_pairs) >= target_n:
+                        break
                     gen_tokens = out_ids[i, in_len:]
                     raw_ans = tok.decode(gen_tokens, skip_special_tokens=True)
                     clean_ans = _clean_teacher_reply(raw_ans, max_chars=230)
@@ -305,11 +439,11 @@ def generate_bielik_teacher_dialogues(
                     progress_callback(
                         {
                             "phase": "generating",
-                            "done": min(len(prompt_queue), start),
-                            "total": len(prompt_queue),
+                            "done": min(target_n, len(generated_pairs)),
+                            "total": target_n,
                             "generated": len(generated_pairs),
                             "new_pairs": batch_generated,
-                            "message": f"Nauczyciel Bielik generuje dialogi ({len(generated_pairs)}/{len(prompt_queue)}) · {last_preview}",
+                            "message": f"Nauczyciel Bielik generuje dialogi ({len(generated_pairs)}/{target_n}) · {last_preview}",
                         }
                     )
     finally:
@@ -360,7 +494,7 @@ def run_bielik_teacher_subprocess(
         str(int(num_dialogues)),
     ]
     if extra_topics:
-        cmd.extend(["--extra-topics", json.dumps(extra_topics[:20], ensure_ascii=False)])
+        cmd.extend(["--extra-topics", json.dumps(extra_topics[:60], ensure_ascii=False)])
 
     proc = subprocess.Popen(
         cmd,

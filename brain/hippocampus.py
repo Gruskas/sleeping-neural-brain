@@ -148,8 +148,8 @@ class TensorEngramBank:
         rem_slots = self.max_capacity - int(pinned_idx.numel())
         if int(unpinned_idx.numel()) <= rem_slots:
             return
-        # Retain all pinned engrams + highest-priority unpinned engrams (importance, strength, recency)
-        priority = self.importances * 2.0 + self.strengths + self.last_recalled_days.float() * 0.05
+        # Retain all pinned engrams + highest-priority unpinned engrams by importance & strength (age-independent)
+        priority = self.importances * 2.0 + self.strengths
         unpinned_prio = priority.index_select(0, unpinned_idx)
         top_rel = torch.topk(unpinned_prio, k=rem_slots, largest=True, sorted=False).indices
         keep_unpinned = unpinned_idx.index_select(0, top_rel)
@@ -390,13 +390,15 @@ class Hippocampus:
         source_url: str | None = None,
         pinned: bool = False,
     ) -> dict[str, Any]:
+        cat_norm = (category or "wiedza").strip().lower()
+        is_pinned = bool(pinned) or (cat_norm in {"zasada", "tożsamość", "tozsamosc", "fundament"})
         meta = EngramMeta(
             category=category,
             preview_label=(preview_label or "")[:200],
             sparsity_pct=sparsity_pct,
             topic=topic,
             source_url=source_url,
-            pinned=bool(pinned),
+            pinned=is_pinned,
         )
         self.short_term.add_batch(
             sdrs=sdr.unsqueeze(0) if sdr.ndim == 1 else sdr[:1],
@@ -416,7 +418,7 @@ class Hippocampus:
             "day_created": day,
             "topic": topic,
             "source_url": source_url,
-            "pinned": bool(pinned),
+            "pinned": is_pinned,
         }
 
     @torch.no_grad()
@@ -607,17 +609,17 @@ class Hippocampus:
                 new_count = int(cand_engrams.shape[0])
 
         # 3) Biological forgetting curve on long-term semantic bank (vectorized GPU)
-        #    Core pinned memories (pinned=True) are strictly immune to decay and forgetting!
+        #    Pinned memories (pinned=True) and key knowledge (importance >= 4.0) are strictly immune to decay & forgetting!
         forgotten_count = 0
         if len(self.semantic) > 0:
-            not_pinned = ~self.semantic.pinned
-            decay_mask = not_pinned & (self.semantic.importances < 4.0) & (self.semantic.last_recalled_days < int(current_day))
+            protected = self.semantic.pinned | (self.semantic.importances >= 4.0)
+            decay_mask = (~protected) & (self.semantic.last_recalled_days < int(current_day))
             self.semantic.strengths = torch.where(
                 decay_mask,
                 self.semantic.strengths * float(decay),
                 self.semantic.strengths,
             )
-            forget_mask = not_pinned & (self.semantic.strengths < float(prune_threshold)) & (self.semantic.importances <= 2.0)
+            forget_mask = (~protected) & (self.semantic.strengths < float(prune_threshold)) & (self.semantic.importances <= 2.0)
             forgotten_count = int(forget_mask.sum().item())
             if forgotten_count > 0:
                 keep_idx = torch.nonzero(~forget_mask, as_tuple=False).squeeze(-1)

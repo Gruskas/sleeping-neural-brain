@@ -214,8 +214,8 @@ class SleepingBrain:
                 "brain_reply": b_txt,
             }
         )
-        if len(self.training_dialogue_feed) > 160:
-            self.training_dialogue_feed = self.training_dialogue_feed[-160:]
+        if len(self.training_dialogue_feed) > 500:
+            self.training_dialogue_feed = self.training_dialogue_feed[-500:]
 
     def clear_training_dialogue_feed(self) -> None:
         with self.lock:
@@ -426,6 +426,8 @@ class SleepingBrain:
         importances: list[int] | None = None,
         topic: str | None = None,
         source_url: str | None = None,
+        pinned: bool = False,
+        pinned_flags: list[bool] | None = None,
     ) -> list[str]:
         clean_texts = [t.strip() for t in texts if t and len(t.strip()) >= 8]
         if not clean_texts:
@@ -441,6 +443,8 @@ class SleepingBrain:
                 sparsity_pct=w_out.sparsity_pct,
                 topic=topic,
                 source_url=source_url,
+                pinned=pinned,
+                pinned_flags=pinned_flags,
             )
             self._buffer_wake_stimulus(clean_texts)
         return ids
@@ -462,6 +466,7 @@ class SleepingBrain:
                     category="wiedza",
                     importances=imps,
                     topic="Szkoła podstawowa — fundamenty",
+                    pinned_flags=[imp >= 4 for imp in imps],
                 )
                 added_count = len(ids)
                 with self.lock:
@@ -1854,7 +1859,7 @@ class SleepingBrain:
                         meta={"kind": "study_start", "topic": "Nauczyciel Bielik"},
                         add_to_working=False,
                     )
-                    extra_topics = [m.preview_label[:60] for m in self.hippocampus.semantic.meta[-20:] if m.preview_label]
+                    extra_topics = [m.preview_label[:60] for m in self.hippocampus.semantic.meta[-60:] if m.preview_label]
 
                 # Temporarily move our large biological brain to CPU RAM so Bielik gets clean 16 GB VRAM
                 moved_to_cpu = False
@@ -1979,7 +1984,10 @@ class SleepingBrain:
                     "Zapisuję zdobytą wiedzę do Hipokampu (pamięć krótkotrwała), synaps W_rec i Living Brain..."
                 )
             knowledge_source = session_new_pairs if session_new_pairs else all_teacher_pairs
-            st_ingest = self._ingest_teacher_pairs_to_short_term(knowledge_source, max_items=80)
+            st_ingest = self._ingest_teacher_pairs_to_short_term(
+                knowledge_source,
+                max_items=max(80, min(500, len(knowledge_source))),
+            )
             self.save_state()
 
             st_note = (
@@ -2533,6 +2541,7 @@ class SleepingBrain:
                     day=self.day,
                     strength=1.35,
                     sparsity_pct=w_out.sparsity_pct,
+                    pinned=True,
                 )
                 learned_engrams.append({"id": engram_info["id"], "sparsity_pct": engram_info["sparsity_pct"]})
                 self._buffer_wake_stimulus([msg])
@@ -2899,7 +2908,9 @@ class SleepingBrain:
             raise ValueError("Treść bodźca musi mieć co najmniej 3 znaki.")
         cat = (category or "wiedza").strip().lower()
         imp = int(max(1, min(5, int(importance))))
-        is_pinned = bool(pinned) if pinned is not None else (cat == "zasada")
+        is_pinned = bool(pinned) if pinned is not None else (
+            cat in {"zasada", "tożsamość", "tozsamosc", "fundament"} or imp >= 4
+        )
         w_out = self.language_cortex.perceive_one(clean)
         with self.lock:
             info = self.hippocampus.record_engram(

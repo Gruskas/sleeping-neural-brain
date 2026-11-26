@@ -1104,6 +1104,90 @@ class TestHTTPServerSSEAndPretrainScript(unittest.TestCase):
         lb._prune_weak_episodes(fraction=0.80)
         self.assertEqual(int(lb.m2_pinned.sum().item()), pinned_before, "m2_pinned episodes must survive compaction & pruning!")
 
+    def test_teacher_prompt_queue_scales_to_500_and_1000(self) -> None:
+        from brain.teacher_distill import TEACHER_PROMPT_POOL, build_teacher_prompt_queue
+
+        # Even when all base TEACHER_PROMPT_POOL prompts are already seen, 500 must return 500 unique prompts!
+        existing_qs = {p.lower() for p in TEACHER_PROMPT_POOL}
+        q500 = build_teacher_prompt_queue(target_n=500, existing_qs=existing_qs)
+        self.assertEqual(len(q500), 500)
+        self.assertEqual(len({p.lower() for p in q500}), 500)
+
+        q1000 = build_teacher_prompt_queue(target_n=1000, existing_qs=set())
+        self.assertEqual(len(q1000), 1000)
+        self.assertEqual(len({p.lower() for p in q1000}), 1000)
+
+    def test_age_independent_survival_and_no_decay_for_important_or_pinned(self) -> None:
+        from brain.hippocampus import EngramMeta, Hippocampus
+        from brain.living_brain import LivingBrainEngine
+
+        # 1) Hippocampus _enforce_capacity: older important fact must beat newer weaker fact
+        hippo = Hippocampus(num_neurons=128, sdr_k=8, max_short_term_memories=20, max_semantic_memories=2, device=torch.device("cpu"))
+        v1 = torch.zeros(128); v1[0:8] = 1.0
+        v2 = torch.zeros(128); v2[16:24] = 1.0
+        v3 = torch.zeros(128); v3[32:40] = 1.0
+        hippo.semantic.add_batch(
+            sdrs=v1.unsqueeze(0),
+            metas=[EngramMeta(id="old_fact", category="wiedza", preview_label="Prawo fizyki", pinned=False)],
+            strengths=[2.0],
+            importances=[4.0],
+            day=1,  # very old (day 1)
+        )
+        hippo.semantic.add_batch(
+            sdrs=v2.unsqueeze(0),
+            metas=[EngramMeta(id="new_weak", category="wiedza", preview_label="Błahostka", pinned=False)],
+            strengths=[1.0],
+            importances=[2.0],
+            day=500,  # brand new (day 500)
+        )
+        hippo.semantic.add_batch(
+            sdrs=v3.unsqueeze(0),
+            metas=[EngramMeta(id="new_strong", category="wiedza", preview_label="Ważny fakt", pinned=False)],
+            strengths=[2.5],
+            importances=[4.0],
+            day=500,
+        )
+        kept_ids = [m.id for m in hippo.semantic.meta]
+        self.assertIn("old_fact", kept_ids, "Old important fact must survive _enforce_capacity regardless of age!")
+        self.assertNotIn("new_weak", kept_ids, "New weak fact must be evicted before older important fact!")
+
+        # 2) NREM decay immunity for importance >= 4.0 and pinned=True
+        hippo2 = Hippocampus(num_neurons=128, sdr_k=8, max_short_term_memories=20, max_semantic_memories=10, device=torch.device("cpu"))
+        hippo2.semantic.add_batch(
+            sdrs=torch.stack([v1, v2, v3], dim=0),
+            metas=[
+                EngramMeta(id="imp4", category="wiedza", preview_label="Kluczowa wiedza", pinned=False),
+                EngramMeta(id="pin_low", category="zasada", preview_label="Tożsamość", pinned=True),
+                EngramMeta(id="weak_unpin", category="wiedza", preview_label="Drobiazg", pinned=False),
+            ],
+            strengths=[2.0, 2.0, 2.0],
+            importances=[4.0, 2.0, 2.0],
+            day=1,
+        )
+        hippo2.consolidate_nrem_light_gpu(decay=0.5, prune_threshold=0.1, current_day=20)
+        by_id = {m.id: float(hippo2.semantic.strengths[i].item()) for i, m in enumerate(hippo2.semantic.meta)}
+        self.assertAlmostEqual(by_id["imp4"], 2.0, places=4, msg="importance >= 4 must not decay!")
+        self.assertAlmostEqual(by_id["pin_low"], 2.0, places=4, msg="pinned=True must not decay!")
+        self.assertAlmostEqual(by_id["weak_unpin"], 1.0, places=4, msg="low-importance unpinned should still decay!")
+
+        # 3) LivingBrainEngine _prune_weak_episodes: older strong episode must beat newer weak episode
+        lb = LivingBrainEngine(sensory_dim=256, target_device="ram", memory_budget_mb=2048.0, start_background_clock=False)
+        for _ in range(12):
+            lb.cognitive_step(sensory_vec=torch.randn(256), external_valence=0.1, allow_growth=False, pinned=False)
+        # Make episode 0 very old (tick 1) but strong, and episode -1 brand new (tick 100000) but weak
+        lb.tick_count = 100000
+        lb.m2_last_used[:] = 100000
+        lb.m2_strengths[:] = 0.5
+        lb.m2_surprises[:] = 0.1
+        lb.m2_valences[:] = 0.0
+        lb.m2_last_used[0] = 1
+        lb.m2_strengths[0] = 5.0
+        marker_vec = lb.m2_assoc_traces[0].clone()
+        lb._prune_weak_episodes(fraction=0.50)
+        # Verify the old strong episode survived
+        sims = torch.mv(lb.m2_assoc_traces.float(), marker_vec.float())
+        self.assertGreater(float(sims.max().item()), 0.99, "Old strong M2 episode must survive _prune_weak_episodes!")
+
 
 if __name__ == "__main__":
     unittest.main()
