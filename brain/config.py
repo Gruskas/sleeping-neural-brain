@@ -1,63 +1,98 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 
 @dataclass
 class BrainConfig:
-    # Associative Concept Cortex (expanded capacity)
-    max_concepts: int = 16384
-    max_relations: int = 512
-    concept_dim: int = 64
-    relation_dim: int = 32
+    # ── Tokenless UTF-8 Byte Architecture (Wernicke -> Hopfield Cortex -> Broca) ──
+    language_model_id: str = "Wernicke-Hopfield-Broca-UTF8"
+    architecture_label: str = "Bajty UTF-8 · Modern Hopfield · SDR k-WTA"
 
-    # Informational Sleep & Creativity (no artificial fatigue / energy drain)
+    # Raw UTF-8 bytes (0..255) + 4 control bytes (<PAD>=256, <BOS>=257, <EOS>=258, <MASK>=259)
+    byte_vocab_size: int = 260
+    patch_size: int = 4
+    patch_stride: int = 4
+    byte_embed_dim: int = 64
+    max_input_bytes: int = 4096
+
+    # Shared Cortical Columns S, Z* in R^{16 x D} (Self-Sufficient ~490M Brain on RTX 5080)
+    num_columns: int = 16
+    column_dim: int = 768
+    wernicke_layers: int = 6
+    wernicke_heads: int = 12
+    wernicke_ff_dim: int = 2304
+
+    # Biological Associative Cortex (Modern Continuous Hopfield + k-WTA SDR + Local Plasticity)
+    num_neurons: int = 12288
+    sdr_k: int = 492  # ~4.00% sparsity (within 3-5% biological k-WTA range)
+    hopfield_beta: float = 12.0
+    attractor_steps: int = 4  # 3-6 iterations
+    pc_lr: float = 0.035
+    hebb_lr: float = 0.018
+    hebb_decay: float = 0.004
+    homeostasis_lr: float = 0.02
+    shy_downscale: float = 0.94
+    shy_prune_eps: float = 0.008
+    nrem_sleep_steps: int = 20
+    nrem_replay_batch_size: int = 48
+    rem_batch_size: int = 6
+    rem_noise_std: float = 0.12
+    engram_merge_threshold: float = 0.92
+
+    # Broca Byte-Patching Transformer Decoder (Cross-Attention ONLY on Z*, head_dim=64 Tensor-Core optimal)
+    broca_dim: int = 768
+    broca_layers: int = 10
+    broca_heads: int = 12
+    broca_ff_dim: int = 2304
+    broca_dropout: float = 0.2
+    broca_max_seq_len: int = 1024
+    broca_lr: float = 1.2e-3
+    broca_weight_decay: float = 0.05
+    broca_label_smoothing: float = 0.1
+    broca_dialogue_lr: float = 9e-4
+    broca_dialogue_label_smoothing: float = 0.05
+    broca_dialogue_early_stop_loss: float = 0.53
+    broca_decoder_byte_dropout: float = 0.15
+    broca_early_stop_loss: float = 0.90
+    broca_z_noise_std: float = 0.03
+    broca_z_dropout: float = 0.05
+    broca_temperature: float = 0.55
+    broca_top_p: float = 0.85
+    broca_repetition_penalty: float = 1.18
+    broca_max_new_bytes: int = 1024
+
+    # Training epochs & GPU optimization (RTX 5080 / CUDA 12.8)
+    language_bootstrap_epochs: int = 5
+    language_train_epochs: int = 180
+    cortex_sleep_epochs: int = 2
+    broca_batch_size: int = 24
+    embed_batch_size: int = 32
+    enable_torch_compile: bool = False
+
+    # Informational Sleep & Creativity (no artificial fatigue)
     max_energy: float = 100.0
-    teach_energy_drain: float = 0.0
-    chat_energy_drain: float = 0.0
-    study_page_energy_drain: float = 0.0
-    drowsy_threshold: float = 0.0
-    sleep_threshold: float = 0.0
     auto_sleep_pending_threshold: int = 24
     creativity_level: float = 0.80
 
-    # Expanded Memory Limits (Short-Term Hippocampus & Long-Term Cortex)
-    max_short_term_memories: int = 5000
-    max_short_term_facts: int = 5000
-    max_semantic_memories: int = 50000
-    max_rem_reflections: int = 500
-    working_chat_window: int = 24
-    working_chat_buffer: int = 48
-    chat_log_limit: int = 500
+    # Memory Limits (Expanded Prefrontal Working Memory + Tensor Engram Banks on GPU)
+    max_short_term_memories: int = 50000
+    max_semantic_memories: int = 200000
+    max_rem_reflections: int = 2000
+    working_sdr_capacity: int = 64
+    working_chat_window: int = 128
+    working_chat_buffer: int = 256
+    chat_log_limit: int = 2000
+    self_critique_candidates: int = 3
+    self_correction_enabled: bool = True
+    self_correction_threshold: float = 0.78
 
-    # Retrieval depths during conversation
-    recall_top_hippo: int = 14
-    recall_top_semantic: int = 16
+    # Recall top-k depths (tensor similarity)
+    recall_top_hippo: int = 16
+    recall_top_semantic: int = 24
     recall_top_rem: int = 8
 
-    # Sleep Consolidation (NREM + REM) on GPU
-    nrem_concept_epochs: int = 120
-    concept_lr: float = 5e-3
-    ewc_lambda_concept: float = 8.0
-    rem_similarity_threshold: float = 0.56
-    rem_max_new_links_per_night: int = 20
-    rem_creative_sparks_per_night: int = 4
-
-    # Self-Contained PyTorch Neural Language & Semantic Cortex (100% local on GPU)
-    language_model_id: str = "Autonomiczna-Kora-PyTorch-v2"
-    vocab_size: int = 32768
-    ngram_buckets: int = 2048
-    embed_dim: int = 256
-    cortex_dim: int = 384
-    cortex_layers: int = 6
-    cortex_heads: int = 8
-    cortex_ff_dim: int = 1536
-    cortex_max_seq_len: int = 320
-    cortex_sleep_epochs: int = 14
-    language_bootstrap_epochs: int = 8
-    language_train_epochs: int = 22
-    cortex_lr: float = 9e-4
-    lora_max_replay_samples: int = 80
-    embed_batch_size: int = 32
-    max_new_tokens: int = 2400
+    # Biological forgetting curve
     memory_decay_per_night: float = 0.96
     memory_prune_threshold: float = 0.18
 
@@ -67,6 +102,17 @@ class BrainConfig:
     study_target_mastery: float = 85.0
     study_http_timeout: int = 12
     study_fetch_workers: int = 3
+
+    # Optional Teacher / Hybrid LLM (Default OFF in chat -> 100% self-sufficient brain; Bielik used on-demand as Teacher)
+    use_local_llm_broca: bool = False
+    teacher_model_id: str = "MassivDash/Bielik-4.5B-v3-heretic"
+    broca_llm_model_id: str = "MassivDash/Bielik-4.5B-v3-heretic"
+    broca_llm_fallback_model_id: str = "MassivDash/Bielik-4.5B-v3-heretic"
+    broca_llm_max_new_tokens: int = 2048
+    broca_llm_lora_r: int = 16
+    broca_llm_lora_alpha: int = 32
+    broca_llm_lora_lr: float = 1.5e-4
+    broca_llm_sleep_epochs: int = 2
 
     # Persistence
     state_dir: str = "brain_state"

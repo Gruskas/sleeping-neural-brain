@@ -52,27 +52,34 @@ def run_cli(brain: SleepingBrain) -> None:
                 snap = brain.snapshot()
                 lc = snap["language_cortex"]
                 print(
-                    f"Sieć: {lc['model_id']} ({lc['total_params']/1e6:.2f}M param., słownik {lc['vocab_used']}/{lc['vocab_size']}) | "
-                    f"GPU: {snap['gpu']['device_name']} (VRAM: {snap['gpu']['vram_allocated_mb']} MB)"
+                    f"Sieć: {lc['model_id']} ({lc['architecture']}) | "
+                    f"{lc['total_params']/1e6:.2f}M param. "
+                    f"(Wernicke {lc['wernicke_params']/1e6:.2f}M + Kora {lc['cortex_params']/1e6:.2f}M + Broca {lc['broca_params']/1e6:.2f}M)"
                 )
-                print(f"Dzień: {snap['day']} | Noce: {snap['total_sleeps']} | Treningi snu NREM: {lc['lora_updates']}")
                 print(
-                    f"Pamięć: Hipokamp {snap['memory']['short_term_memory_count']}/{snap['limits']['short_term_memories']} | "
-                    f"Kora {snap['memory']['semantic_memory_count']}/{snap['limits']['semantic_memories']} | "
+                    f"SDR k-WTA: {lc['sdr_k']}/{lc['num_neurons']} ({lc['sdr_sparsity_pct']}%) | "
+                    f"Kolumny: {lc['num_columns']}×{lc['column_dim']} | "
+                    f"Synapsy W_rec: {lc['active_synapses']} | Płynność Broki: {lc['fluency']:.0f}% | "
+                    f"GPU: {snap['gpu']['device_name']} ({snap['gpu']['vram_allocated_mb']} MB VRAM)"
+                )
+                print(f"Dzień: {snap['day']} | Noce: {snap['total_sleeps']} | Cykle Broki: {lc['lora_updates']}")
+                print(
+                    f"Engramy: Hipokamp {snap['memory']['short_term_memory_count']}/{snap['limits']['short_term_memories']} | "
+                    f"Pamięć trwała {snap['memory']['semantic_memory_count']}/{snap['limits']['semantic_memories']} | "
                     f"REM {snap['memory']['rem_reflection_count']}"
                 )
                 continue
             if low == "/rdzen":
                 core = brain.language_cortex.core_knowledge_summary
-                print("\n--- RDZEŃ WIEDZY NREM ---")
-                print(core if core else "(Pusty — powstaje podczas snu po zgromadzeniu nowych wspomnień.)")
+                print("\n--- RDZEŃ KONSOLIDACJI NREM/SHY ---")
+                print(core if core else "(Pusty — powstaje podczas snu po zgromadzeniu nowych engramów SDR.)")
                 continue
             if low.startswith("/dodaj "):
                 fact_text = raw[7:].strip()
                 if fact_text:
                     try:
                         mem = brain.add_manual_memory(fact_text)
-                        print(f"  [Hipokamp +1]: {mem['text']} (id={mem['id']})")
+                        print(f"  [Hipokamp SDR +1]: {mem['preview_label']} (id={mem['id']}, SDR {mem['sparsity_pct']}%)")
                     except Exception as exc:
                         print(f"[BŁĄD] {exc}")
                 continue
@@ -82,35 +89,35 @@ def run_cli(brain: SleepingBrain) -> None:
                     json.dumps(brain.export_knowledge(), ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
-                print(f"Wyeksportowano wiedzę do: {out_path}")
+                print(f"Wyeksportowano engramy i metadane do: {out_path}")
                 continue
             if low == "/pamiec":
                 snap = brain.snapshot()
                 m = snap["memory"]
-                print(f"\n--- HIPOKAMP ({m['short_term_memory_count']} wspomnień przed snem) ---")
+                print(f"\n--- HIPOKAMP ({m['short_term_memory_count']} engramów przed snem) ---")
                 for x in m["short_term_memories"][-15:]:
-                    print(f"  • [{x['category']}] {x['text']}")
-                print(f"--- KORA SEMANTYCZNA ({m['semantic_memory_count']} trwałych) ---")
+                    print(f"  • [{x['category']}] {x.get('preview_label', '')} (siła {x['strength']}, SDR {x.get('sparsity_pct', 4.0)}%)")
+                print(f"--- PAMIĘĆ TRWAŁA ({m['semantic_memory_count']} engramów) ---")
                 for x in m["semantic_memories"][:20]:
-                    print(f"  • [{x['category']}] {x['text']} (siła {x['strength']})")
-                print(f"--- REFLEKSJE REM ({m['rem_reflection_count']}) ---")
+                    print(f"  • [{x['category']}] {x.get('preview_label', '')} (siła {x['strength']}, SDR {x.get('sparsity_pct', 4.0)}%)")
+                print(f"--- REM ({m['rem_reflection_count']} stanów hybrydowych) ---")
                 for r in m["rem_reflections"][-10:]:
-                    print(f"  ✨ {r['text']}")
+                    print(f"  ✨ {r.get('preview_label', '')} (siła {r['strength']})")
                 continue
             if low in ("/szkola", "/szkoła", "/podstawy"):
-                print("\n[🎓 SZKOŁA PODSTAWOWA] Wgrywam fundamenty 9 przedmiotów i trenuję na GPU...")
+                print("\n[🎓 SZKOŁA PODSTAWOWA] Koduję bodźce przez Wernickego i konsoliduję korę na GPU...")
                 res = brain.learn_elementary_foundation(consolidate=True)
-                print(f"[GOTOWE] Dodano {res['added_facts']} faktów, {res['added_triples']} relacji. Pamięć trwała: {res['total_semantic']}.")
+                print(f"[GOTOWE] Zakodowano {res['added_facts']} engramów SDR. Pamięć trwała: {res['total_semantic']}.")
                 continue
             if low in ("/szkola siec", "/szkoła sieć", "/szkola web"):
-                print("\n[📚 KURS SZKOLNY Z SIECI] Rozpoczynam badanie tematów szkolnych w Wikipedii...")
+                print("\n[📚 KURS SZKOLNY Z SIECI] Pobieram bodźce z Wikipedii...")
                 res = brain.run_curriculum_online(max_topics=12)
-                print(f"[GOTOWE] Przeczytano {res['pages_read']} stron, zapisano {res['facts_learned']} faktów.")
+                print(f"[GOTOWE] Przeczytano {res['pages_read']} stron, zakodowano {res['facts_learned']} engramów SDR.")
                 continue
             if low in ("/wyksztalc", "/wykształć", "/trenuj"):
-                print("\n[🗣️ SAMOKSZTAŁCENIE JĘZYKOWE] Trenuję model językowy PyTorch na GPU...")
+                print("\n[🗣️ PRE-TRAINING BROKI] Trenuję Wernicke+Broca (denoising SDR w bfloat16)...")
                 res = brain.train_language_now()
-                print(f"[GOTOWE] Dialogów: {res['dialogues']} | Loss: {res['loss_start']}→{res['loss_end']} | Płynność: {res['fluency']:.0f}%")
+                print(f"[GOTOWE] Próbek: {res['samples']} | Loss: {res['loss_start']}→{res['loss_end']} | Płynność: {res['fluency']:.0f}%")
                 continue
             if low.startswith("/ucz "):
                 topic = raw[5:].strip()
@@ -149,7 +156,7 @@ def run_cli(brain: SleepingBrain) -> None:
                         learned_memories = list(ev.get("learned_memories", learned_memories))
                 print()
                 if learned_memories:
-                    print("  [Hipokamp zapamiętał]:", " | ".join(str(m["text"]) for m in learned_memories))
+                    print("  [Hipokamp zapamiętał SDR]:", ", ".join(str(m.get("id", "")) for m in learned_memories))
             except Exception as exc:
                 print(f"[BŁĄD] {exc}")
     finally:
@@ -161,10 +168,34 @@ def main() -> None:
     parser.add_argument("--cli", action="store_true", help="Uruchom czat w terminalu (CLI)")
     parser.add_argument("--port", type=int, default=8765, help="Port lokalnego dashboardu (domyślnie 8765)")
     parser.add_argument("--no-browser", action="store_true", help="Nie otwieraj automatycznie przeglądarki")
+    parser.add_argument(
+        "--llm-model",
+        type=str,
+        default="MassivDash/Bielik-4.5B-v3-heretic",
+        help="Model nauczyciela / opcjonalnej hybrydy (domyślnie MassivDash/Bielik-4.5B-v3-heretic)",
+    )
+    parser.add_argument(
+        "--use-bielik-chat",
+        action="store_true",
+        help="Opcjonalnie użyj lokalnego Bielika w czacie zamiast czystego, samowystarczalnego mózgu",
+    )
+    parser.add_argument(
+        "--tokenless-only",
+        action="store_true",
+        help="Tryb samowystarczalny (teraz domyślny — zachowane dla kompatybilności)",
+    )
     args = parser.parse_args()
 
+    from brain.config import BrainConfig
+
     base_dir = Path(__file__).resolve().parent
-    brain = SleepingBrain(base_dir=base_dir, load_language_mode="none" if args.cli else "async")
+    use_llm = bool(args.use_bielik_chat) and not bool(args.tokenless_only)
+    cfg = BrainConfig(
+        use_local_llm_broca=use_llm,
+        teacher_model_id=args.llm_model,
+        broca_llm_model_id=args.llm_model,
+    )
+    brain = SleepingBrain(cfg=cfg, base_dir=base_dir, load_language_mode="sync" if args.cli else "async")
 
     if args.cli:
         run_cli(brain)

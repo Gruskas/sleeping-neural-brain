@@ -60,8 +60,32 @@ class _ReadableHTMLParser(HTMLParser):
     def get_text(self) -> str:
         raw = html.unescape("".join(self._chunks))
         lines = [re.sub(r"\s+", " ", line).strip() for line in raw.splitlines()]
-        lines = [ln for ln in lines if len(ln) >= 30]
+        lines = [ln for ln in lines if len(ln) >= 30 and not is_web_boilerplate(ln)]
         return "\n".join(lines)
+
+
+_WEB_BOILERPLATE_RE = re.compile(
+    r"(?:polityk[aęi]\s+prywatno|pliki\s+cookie|\bcookies?\b|"
+    r"korzystaj[aą]c\s+z\s+(?:tego|niego|strony|serwisu|witryny)|"
+    r"zgadzasz\s+si[eę]\s+na|wyra[zż]asz\s+zgod[eę]\s+na|"
+    r"warunki\s+(?:korzystania|u[zż]ytkowania|i\s+polityk)|"
+    r"akceptuj\s+wszystk|zarz[aą]dzaj\s+zgod|\brodo\b|\bgdpr\b|"
+    r"zaloguj\s+si[eę]|zarejestruj\s+si[eę]|utw[oó]rz\s+konto|"
+    r"wszelkie\s+prawa\s+zastrze[zż]one|all\s+rights\s+reserved|"
+    r"privacy\s+policy|terms\s+of\s+(?:service|use)|accept\s+all\s+cookies|"
+    r"zapisz\s+si[eę]\s+do\s+newsletter)",
+    flags=re.IGNORECASE,
+)
+
+
+def is_web_boilerplate(text: str) -> bool:
+    """Detect cookie banners, privacy notices, login prompts, and non-content web chrome."""
+    s = (text or "").strip()
+    if not s:
+        return True
+    if _WEB_BOILERPLATE_RE.search(s):
+        return True
+    return False
 
 
 @dataclass
@@ -234,6 +258,26 @@ def search_wikipedia(query: str, lang: str = "pl", limit: int = 3, timeout: int 
         return []
 
 
+def fetch_random_wikipedia_titles(lang: str = "pl", limit: int = 15, timeout: int = 10) -> list[str]:
+    """Fetch fresh random main-namespace Wikipedia article titles so Auto-nauka has infinite topics."""
+    lim = max(1, min(30, int(limit)))
+    try:
+        url = (
+            f"https://{lang}.wikipedia.org/w/api.php?"
+            f"action=query&list=random&rnnamespace=0&rnlimit={lim}&format=json&utf8=1"
+        )
+        data = json.loads(_http_get(url, timeout=timeout))
+        items = data.get("query", {}).get("random", [])
+        out: list[str] = []
+        for it in items:
+            t = str(it.get("title") or "").strip()
+            if len(t) >= 3 and ":" not in t and "(ujednoznacznienie)" not in t.lower():
+                out.append(t)
+        return out
+    except Exception:
+        return []
+
+
 def search_duckduckgo_urls(query: str, limit: int = 4, timeout: int = 12) -> list[tuple[str, str]]:
     results: list[tuple[str, str]] = []
     clean = clean_search_query(query)
@@ -369,6 +413,7 @@ def gather_web_sources(
     max_docs: int = 3,
     timeout: int = 12,
     max_workers: int = 3,
+    encyclopedic_only: bool = False,
 ) -> list[WebDocument]:
     """
     Gather high-signal, relevance-checked Polish & English web documents:
@@ -411,14 +456,14 @@ def gather_web_sources(
         if add_doc(d):
             return collected
 
-    # 3) English Wikipedia (great for programming/science/C++ topics)
-    if len(collected) < max_docs:
+    # 3) English Wikipedia (great for programming/science/C++ topics; skipped in strict Polish live Auto-sieć)
+    if not encyclopedic_only and len(collected) < max_docs:
         for d in search_wikipedia(clean, lang="en", limit=2, timeout=timeout):
             if add_doc(d):
                 return collected
 
-    # 4) General web search via DuckDuckGo Lite/HTML (concurrent page fetch)
-    if len(collected) < max_docs:
+    # 4) General web search via DuckDuckGo Lite/HTML (ONLY for explicit /ucz study, never live chat Auto-sieć!)
+    if not encyclopedic_only and len(collected) < max_docs:
         candidates = [
             (title, url)
             for title, url in search_duckduckgo_urls(clean, limit=max_docs + 2, timeout=timeout)

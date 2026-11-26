@@ -1,327 +1,613 @@
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import BrainConfig
-
-_PL_TRANS = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZZ")
-
-
-def _strip_pl(text: str) -> str:
-    return text.translate(_PL_TRANS)
+from .sensory_wernicke import k_wta
 
 
-class AssociativeConceptCortex(nn.Module):
+@dataclass
+class CortexThought:
+    z_star: torch.Tensor  # [B, N] stable attractor SDR after k-WTA
+    columns_star: torch.Tensor  # [B, 16, D] active cortical columns for Broca
+    hopfield_weights: torch.Tensor | None  # [B, M] softmax attention over engrams
+    hopfield_energy: float
+    attractor_steps: int
+    sparsity_pct: float
+    max_hopfield_sim: float = 0.0
+
+
+class BiologicalAssociativeCortex(nn.Module):
     """
-    GPU-accelerated Associative Semantic Cortex trained from scratch in PyTorch.
-    - Learns dense 64D concept & 32D relation embeddings on the unit hypersphere.
-    - Protected by Elastic Weight Consolidation (EWC) across sleep cycles.
-    - During REM sleep, performs 2-hop neural dreaming in latent space to discover
-      indirect/hidden associations (e.g., A->B and B->C => A~>C).
+    Purely tensor-based Biological Associative Cortex (ZERO strings, ZERO concept dictionaries):
+      - Modern Continuous Hopfield Network dynamics over stored engram bank E in R^{M x N}:
+            z_{t+1} = E^T softmax(beta * E z_t)  (exponential capacity, no 0.14N Hebb ceiling)
+      - Combined with local recurrent synaptic matrix W_rec (strictly zero diagonal),
+        sensory projection W_in (Predictive Coding), and homeostatic thresholds.
+      - Projected via lateral inhibition k-WTA onto stable sparse attractor z* and expanded to
+        16 active cortical columns Z* in R^{16 x D} for BrocaByteTransformer.
+      - ALL cortical weight updates (W_in, W_rec, threshold) run 100% locally in @torch.no_grad()
+        with ZERO global loss.backward() through the cortex.
     """
 
     def __init__(self, cfg: BrainConfig, device: torch.device) -> None:
         super().__init__()
         self.cfg = cfg
         self.device = device
+        self.num_neurons = cfg.num_neurons
+        self.num_columns = cfg.num_columns
+        self.column_dim = cfg.column_dim
+        self.sensory_dim = cfg.num_columns * cfg.column_dim
+        self.sdr_k = cfg.sdr_k
+        self.target_sparsity = float(cfg.sdr_k) / float(cfg.num_neurons)
 
-        self.concept_to_id: dict[str, int] = {}
-        self.id_to_concept: list[str] = []
-        self.relation_to_id: dict[str, int] = {}
-        self.id_to_relation: list[str] = []
-
-        self.concept_emb = nn.Embedding(cfg.max_concepts, cfg.concept_dim)
-        self.relation_emb = nn.Embedding(cfg.max_relations, cfg.relation_dim)
-        nn.init.normal_(self.concept_emb.weight, mean=0.0, std=0.25)
-        nn.init.normal_(self.relation_emb.weight, mean=0.0, std=0.25)
-
-        self.assoc_net = nn.Sequential(
-            nn.Linear(cfg.concept_dim + cfg.relation_dim, 128),
-            nn.LayerNorm(128),
-            nn.SiLU(),
-            nn.Linear(128, 128),
-            nn.LayerNorm(128),
-            nn.SiLU(),
-            nn.Linear(128, cfg.concept_dim),
+        # Store large W_in / W_rec in bfloat16 on CUDA (2x less VRAM: 576 MB vs 1152 MB, and ~8-12x faster
+        # Tensor Core matmuls in perceive_and_think!) while learn_local accumulates updates in float32.
+        self.weight_dtype = (
+            torch.bfloat16
+            if (device.type == "cuda" and torch.cuda.is_bf16_supported())
+            else torch.float32
         )
 
-        # Free-association dream projector (relation-agnostic latent drift)
-        self.dream_net = nn.Sequential(
-            nn.Linear(cfg.concept_dim, 128),
-            nn.LayerNorm(128),
-            nn.SiLU(),
-            nn.Linear(128, cfg.concept_dim),
+        # Register as non-grad buffers so PyTorch NEVER backpropagates through cortical weights
+        w_in = torch.randn(self.num_neurons, self.sensory_dim, device=device, dtype=torch.float32)
+        w_in = F.normalize(w_in, dim=-1) * 0.25
+        self.register_buffer("W_in", w_in.to(dtype=self.weight_dtype))
+
+        # Sparse initial recurrent connectivity with strictly zero diagonal
+        w_rec = torch.randn(self.num_neurons, self.num_neurons, device=device, dtype=torch.float32) * 0.02
+        sparse_mask = (torch.rand_like(w_rec) < 0.08).float()
+        w_rec = w_rec * sparse_mask
+        w_rec.fill_diagonal_(0.0)
+        self.register_buffer("W_rec", w_rec.to(dtype=self.weight_dtype))
+
+        self.register_buffer("threshold", torch.zeros(self.num_neurons, device=device, dtype=torch.float32))
+        self.register_buffer(
+            "avg_activity",
+            torch.full((self.num_neurons,), self.target_sparsity, device=device, dtype=torch.float32),
+        )
+        self.register_buffer("last_active_sdr", torch.zeros(self.num_neurons, device=device, dtype=torch.float32))
+
+        # Deterministic size-independent Fourier basis for projecting variable-size
+        # LivingBrainEngine.state_assoc (+ top-3 M2 traces) directly into 16 cortical columns Z*.
+        gen = torch.Generator(device="cpu").manual_seed(133742)
+        self.register_buffer(
+            "living_freq_col",
+            (torch.rand(self.num_columns, generator=gen, dtype=torch.float32) * 0.45 + 0.05).to(device),
+        )
+        self.register_buffer(
+            "living_phase_col",
+            (torch.rand(self.num_columns, generator=gen, dtype=torch.float32) * 6.2831853).to(device),
+        )
+        self.register_buffer(
+            "living_freq_dim",
+            (torch.rand(self.column_dim, generator=gen, dtype=torch.float32) * 0.65 + 0.03).to(device),
+        )
+        self.register_buffer(
+            "living_phase_dim",
+            (torch.rand(self.column_dim, generator=gen, dtype=torch.float32) * 6.2831853).to(device),
         )
 
-        self.to(device)
-        self.optimizer = torch.optim.AdamW(self.parameters(), lr=cfg.concept_lr, weight_decay=1e-4)
+        self.last_sparsity_pct: float = round(100.0 * self.target_sparsity, 2)
+        self.last_attractor_steps: int = cfg.attractor_steps
+        self.last_prediction_error: float = 0.0
+        self.total_local_updates: int = 0
 
-        self.fisher: dict[str, torch.Tensor] = {}
-        self.anchor_params: dict[str, torch.Tensor] = {}
+    def total_parameters(self) -> int:
+        return int(self.W_in.numel() + self.W_rec.numel() + self.threshold.numel())
 
-    def ensure_concept(self, name: str) -> int:
-        key = name.strip().lower()[:60]
-        if key not in self.concept_to_id:
-            if len(self.id_to_concept) >= self.cfg.max_concepts:
-                return 0
-            idx = len(self.id_to_concept)
-            self.concept_to_id[key] = idx
-            self.id_to_concept.append(key)
-        return self.concept_to_id[key]
-
-    def ensure_relation(self, name: str) -> int:
-        key = name.strip().lower()[:40]
-        if key not in self.relation_to_id:
-            if len(self.id_to_relation) >= self.cfg.max_relations:
-                return 0
-            idx = len(self.id_to_relation)
-            self.relation_to_id[key] = idx
-            self.id_to_relation.append(key)
-        return self.relation_to_id[key]
-
-    def normalized_concept_matrix(self) -> torch.Tensor:
-        n = len(self.id_to_concept)
-        if n == 0:
-            return torch.empty((0, self.cfg.concept_dim), device=self.device)
-        idx = torch.arange(n, device=self.device)
-        return F.normalize(self.concept_emb(idx), dim=-1)
-
-    def predict_target_vec(self, src_vec: torch.Tensor, rel_ids: torch.Tensor) -> torch.Tensor:
-        r_vec = F.normalize(self.relation_emb(rel_ids), dim=-1)
-        delta = self.assoc_net(torch.cat([src_vec, r_vec], dim=-1))
-        return F.normalize(src_vec * 0.35 + delta, dim=-1)
-
-    def predict_dream_vec(self, src_vec: torch.Tensor) -> torch.Tensor:
-        delta = self.dream_net(src_vec)
-        return F.normalize(src_vec * 0.4 + delta, dim=-1)
-
-    def ewc_penalty(self) -> torch.Tensor:
-        if not self.fisher:
-            return torch.tensor(0.0, device=self.device)
-        penalty = torch.tensor(0.0, device=self.device)
-        total_elems = 0
-        for name, param in self.named_parameters():
-            if name in self.fisher and param.requires_grad:
-                penalty = penalty + (self.fisher[name] * (param - self.anchor_params[name]).pow(2)).sum()
-                total_elems += param.numel()
-        return 0.5 * self.cfg.ewc_lambda_concept * (penalty / max(1, total_elems))
-
-    def update_fisher(self, src_ids: torch.Tensor, rel_ids: torch.Tensor, dst_ids: torch.Tensor) -> None:
-        if len(src_ids) == 0 or len(self.id_to_concept) < 2:
-            return
-        self.train()
-        self.optimizer.zero_grad(set_to_none=True)
-        all_emb = self.normalized_concept_matrix()
-        src_v = all_emb[src_ids]
-        pred_v = self.predict_target_vec(src_v, rel_ids)
-        logits = (pred_v @ all_emb.T) * 8.0
-        loss = F.cross_entropy(logits, dst_ids)
-        loss.backward()
-
-        raw_sq: dict[str, torch.Tensor] = {}
-        g_sum = 0.0
-        g_cnt = 0
-        with torch.no_grad():
-            for name, param in self.named_parameters():
-                if param.grad is None:
-                    continue
-                g2 = param.grad.detach().pow(2)
-                raw_sq[name] = g2
-                g_sum += float(g2.sum().item())
-                g_cnt += g2.numel()
-            mean_g2 = max(1e-10, g_sum / max(1, g_cnt))
-            for name, param in self.named_parameters():
-                if name not in raw_sq:
-                    continue
-                norm_g2 = (raw_sq[name] / mean_g2).clamp(max=25.0)
-                if name in self.fisher:
-                    self.fisher[name] = 0.65 * self.fisher[name] + 0.35 * norm_g2
-                else:
-                    self.fisher[name] = norm_g2.clone()
-                self.anchor_params[name] = param.detach().clone()
-        self.optimizer.zero_grad(set_to_none=True)
-
-    def resolve_concept(self, query_word: str) -> str | None:
-        key = query_word.strip().lower()[:60]
-        if not key:
-            return None
-        if key in self.concept_to_id:
-            return key
-        key_norm = _strip_pl(key)
-        if len(key_norm) >= 4:
-            for cand in self.id_to_concept:
-                if _strip_pl(cand) == key_norm:
-                    return cand
-        if len(key_norm) < 5:
-            return None
-        key_stem = key_norm[: max(4, len(key_norm) - 2)]
-        best_cand: str | None = None
-        best_rank: tuple[int, int] | None = None
-        for cand in self.id_to_concept:
-            if abs(len(cand) - len(key)) > 4:
-                continue
-            cand_norm = _strip_pl(cand)
-            cand_stem = cand_norm[: max(4, len(cand_norm) - 2)] if len(cand_norm) >= 4 else cand_norm
-            if cand_norm.startswith(key_stem) or (len(cand_norm) >= 4 and key_norm.startswith(cand_stem)):
-                rank = (abs(len(cand) - len(key)), len(cand))
-                if best_rank is None or rank < best_rank:
-                    best_rank = rank
-                    best_cand = cand
-        return best_cand
+    def active_synapses_count(self) -> int:
+        return int((self.W_rec.abs() > 0).sum().item())
 
     @torch.no_grad()
-    def query_associations(self, concept: str, top_k: int = 8) -> list[dict[str, Any]]:
-        resolved = self.resolve_concept(concept)
-        if resolved is None or len(self.id_to_concept) < 2:
-            return []
-        self.eval()
-        all_emb = self.normalized_concept_matrix()
-        cid = self.concept_to_id[resolved]
-        src_v = all_emb[cid : cid + 1]
+    def reset_synaptic_weights(self) -> None:
+        """
+        Reset stale local cortical weights (W_in, W_rec, threshold) after heavy Wernicke
+        pre-training so the associative cortex re-aligns cleanly with the new Wernicke SDR space.
+        """
+        w_in = torch.randn(self.num_neurons, self.sensory_dim, device=self.device, dtype=torch.float32)
+        self.W_in.copy_((F.normalize(w_in, dim=-1) * 0.25).to(dtype=self.W_in.dtype))
+        w_rec = torch.randn(self.num_neurons, self.num_neurons, device=self.device, dtype=torch.float32) * 0.02
+        sparse_mask = (torch.rand_like(w_rec) < 0.08).float()
+        w_rec.mul_(sparse_mask)
+        w_rec.fill_diagonal_(0.0)
+        self.W_rec.copy_(w_rec.to(dtype=self.W_rec.dtype))
+        self.threshold.zero_()
+        self.avg_activity.fill_(self.target_sparsity)
+        self.last_active_sdr.zero_()
+        self.last_prediction_error = 0.0
 
-        sim_direct = (src_v @ all_emb.T).squeeze(0)
-        dream_v = self.predict_dream_vec(src_v)
-        sim_dream = (dream_v @ all_emb.T).squeeze(0)
+    @torch.no_grad()
+    def project_living_to_columns(
+        self,
+        living_assoc_vec: torch.Tensor,
+        batch_size: int = 1,
+    ) -> torch.Tensor:
+        """
+        Adaptive, size-independent projector from LivingBrainEngine's dynamically growing
+        associative state vector (length L = n_assoc) into cortical column space [B, 16, D].
+        Existing neuron coordinates [0..old_L-1] keep identical projection vectors across
+        grow_structure() calls while newly born neurons [old_L..new_L-1] add fresh expressive signal.
+        """
+        v = living_assoc_vec.to(device=self.device, dtype=torch.float32)
+        if v.ndim == 1:
+            v = v.unsqueeze(0)
+        elif v.ndim > 2:
+            v = v.reshape(v.shape[0], -1)
+        if v.shape[0] == 1 and batch_size > 1:
+            v = v.expand(batch_size, -1)
+        v = F.normalize(v, dim=-1, eps=1e-6)
+        l_dim = int(v.shape[-1])
+        idx = torch.arange(l_dim, device=self.device, dtype=torch.float32)
+        col_basis = torch.cos(idx.unsqueeze(1) * self.living_freq_col.unsqueeze(0) + self.living_phase_col.unsqueeze(0))
+        dim_basis = torch.sin(idx.unsqueeze(1) * self.living_freq_dim.unsqueeze(0) + self.living_phase_dim.unsqueeze(0))
+        # [B, L, 16] -> [B, 16, L] @ [L, D] -> [B, 16, D]
+        weighted = (v.unsqueeze(2) * col_basis.unsqueeze(0)).transpose(1, 2)
+        cols = torch.matmul(weighted, dim_basis)
+        if hasattr(F, "rms_norm"):
+            return F.rms_norm(cols, (self.column_dim,), eps=1e-6)
+        return cols * torch.rsqrt(cols.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
 
-        best_rel_sim = torch.full_like(sim_direct, -1.0)
-        best_rel_id = torch.zeros(len(self.id_to_concept), dtype=torch.long, device=self.device)
-        for rid in range(len(self.id_to_relation)):
-            r_t = torch.tensor([rid], dtype=torch.long, device=self.device)
-            pv = self.predict_target_vec(src_v, r_t)
-            s_r = (pv @ all_emb.T).squeeze(0)
-            better = s_r > best_rel_sim
-            best_rel_sim = torch.where(better, s_r, best_rel_sim)
-            best_rel_id = torch.where(better, torch.full_like(best_rel_id, rid), best_rel_id)
+    @torch.no_grad()
+    def perceive_and_think(
+        self,
+        sensory_columns: torch.Tensor,
+        sensory_sdr: torch.Tensor,
+        engram_bank: torch.Tensor | None = None,
+        sdr_to_columns_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        steps: int | None = None,
+        noise_std: float = 0.0,
+        update_last_active: bool = True,
+        force_hopfield: bool = False,
+        hopfield_min_sim: float = 0.82,
+        working_memory_sdr: torch.Tensor | None = None,
+        working_memory_weight: float = 0.0,
+        living_assoc_vec: torch.Tensor | None = None,
+        living_blend: float = 0.08,
+        neuromod: Any | None = None,
+        living_telemetry: Any | None = None,
+    ) -> CortexThought:
+        """
+        Execute 3-6 attractor iterations combining:
+          - Modern Continuous Hopfield Network retrieval over engram bank E [M, N], gated
+            proportionally to match confidence (>= 0.62) so weak/unrelated memories NEVER hijack
+            the user's question (unless force_hopfield=True during REM dreaming).
+          - Prefrontal Working Memory SDR trace (tokenless short-term conversation context)
+          - Local recurrent cortical synapses W_rec (zero diagonal) & homeostatic thresholds
+          - Lateral inhibition k-WTA
+          - Direct adaptive projection from LivingBrainEngine's growing associative state + top-3 M2 traces
+          - Neuromodulatory control (high NA / PE extends attractor deliberation from 3 up to 6 steps)
+        Returns stable attractor z* [B, N] and RMS-normalized 16 cortical columns Z* [B, 16, D]
+        with identical scale/distribution to Wernicke.sdr_to_columns().
+        """
+        n_steps = max(3, min(6, int(steps if steps is not None else self.cfg.attractor_steps)))
+        na_val = 0.35
+        pe_val = 0.0
+        cur_val = 0.0
+        if neuromod is not None:
+            if isinstance(neuromod, dict):
+                na_val = float(neuromod.get("noradrenaline", 0.35))
+            else:
+                na_val = float(getattr(neuromod, "noradrenaline", 0.35))
+        if living_telemetry is not None:
+            pe_val = float(getattr(living_telemetry, "surprise", 0.0))
+            cur_val = float(getattr(living_telemetry, "intrinsic_curiosity", 0.0))
+            if neuromod is None:
+                nm_dict = getattr(living_telemetry, "neuromodulators", None) or {}
+                if isinstance(nm_dict, dict):
+                    na_val = float(nm_dict.get("noradrenaline", na_val))
+        if neuromod is not None or living_telemetry is not None:
+            na_intensity = max(0.0, min(1.0, max((na_val - 0.85) / 1.15, (pe_val - 0.30) / 0.45)))
+            na_steps = 3 + int(round(3.0 * na_intensity))
+            n_steps = max(n_steps, min(6, na_steps))
 
-        combined = 0.45 * best_rel_sim + 0.35 * sim_dream + 0.20 * sim_direct
-        combined[cid] = -999.0
+        u = F.normalize(sensory_sdr.to(device=self.device, dtype=torch.float32), dim=-1, eps=1e-6)
+        b = u.shape[0]
+        s_flat = F.normalize(
+            sensory_columns.to(device=self.device, dtype=torch.float32).reshape(b, self.sensory_dim),
+            dim=-1,
+            eps=1e-6,
+        )
 
-        k = min(top_k, len(self.id_to_concept) - 1)
-        vals, idxs = torch.topk(combined, k=k)
-        results = []
-        for score, idx_t in zip(vals.cpu().tolist(), idxs.cpu().tolist()):
-            if score < 0.15:
-                continue
-            rid = int(best_rel_id[idx_t].item())
-            rel_name = self.id_to_relation[rid] if rid < len(self.id_to_relation) else "skojarzenie"
-            results.append(
+        wm_vec: torch.Tensor | None = None
+        wm_w = max(0.0, min(0.45, float(working_memory_weight)))
+        if working_memory_sdr is not None and working_memory_sdr.numel() == self.num_neurons and wm_w > 0.0:
+            wm_vec = F.normalize(
+                working_memory_sdr.to(device=self.device, dtype=torch.float32).reshape(1, self.num_neurons),
+                dim=-1,
+                eps=1e-6,
+            ).expand(b, -1)
+
+        # Bottom-up sensory drive via local W_in in native weight_dtype (bfloat16 Tensor Cores on GPU!)
+        w_dt = self.W_in.dtype
+        drive_in = F.normalize((s_flat.to(dtype=w_dt) @ self.W_in.T).float(), dim=-1, eps=1e-6)
+        init_act = (0.90 - wm_w) * u + 0.10 * drive_in - self.threshold.unsqueeze(0)
+        if wm_vec is not None:
+            init_act = init_act + wm_w * wm_vec
+        z, _, _ = k_wta(init_act, k=self.sdr_k, normalize=True)
+
+        has_bank = engram_bank is not None and engram_bank.numel() > 0 and engram_bank.shape[0] > 0
+        e_mat = (
+            F.normalize(engram_bank.to(device=self.device, dtype=torch.float32), dim=-1, eps=1e-6).to(dtype=w_dt)
+            if has_bank
+            else None
+        )
+
+        beta = float(self.cfg.hopfield_beta)
+        attn_weights: torch.Tensor | None = None
+        energy_t: torch.Tensor | None = None
+        best_sim_t: torch.Tensor | None = None
+
+        for step_i in range(n_steps):
+            # Native bfloat16 Tensor Core matmul + zero CPU-GPU .item() sync inside loop!
+            h_rec = F.normalize((z.to(dtype=w_dt) @ self.W_rec.T).float(), dim=-1, eps=1e-6)
+
+            if e_mat is not None:
+                raw_sims = (z.to(dtype=w_dt) @ e_mat.T).float()  # [B, M]
+                logits = beta * raw_sims
+                attn_weights = F.softmax(logits, dim=-1)  # [B, M]
+                h_hop = F.normalize((attn_weights.to(dtype=w_dt) @ e_mat).float(), dim=-1, eps=1e-6)
+                lse_t = torch.logsumexp(logits, dim=-1).mean()
+                energy_t = -(lse_t / max(1e-6, beta)) + 0.5
+
+                max_sim = raw_sims.max(dim=-1, keepdim=True).values
+                if step_i == 0:
+                    best_sim_t = max_sim.mean()
+
+                if force_hopfield:
+                    hop_gate = torch.ones((b, 1), device=self.device, dtype=torch.float32)
+                    w_hop = 0.45 * hop_gate
+                else:
+                    hop_gate = torch.clamp((max_sim - hopfield_min_sim) / 0.16, min=0.0, max=1.0)
+                    w_hop = 0.22 * hop_gate
+
+                w_u = (0.90 - wm_w) - w_hop
+                pre_act = w_u * u + w_hop * h_hop + 0.10 * h_rec - self.threshold.unsqueeze(0)
+            else:
+                pre_act = (0.90 - wm_w) * u + 0.10 * h_rec - self.threshold.unsqueeze(0)
+
+            if wm_vec is not None:
+                pre_act = pre_act + wm_w * wm_vec
+            if noise_std > 0.0:
+                pre_act = pre_act + torch.randn_like(pre_act) * noise_std
+
+            z, _, _ = k_wta(pre_act, k=self.sdr_k, normalize=True)
+
+        energy = float(energy_t.item()) if energy_t is not None else 0.0
+        best_sim_val = float(best_sim_t.item()) if best_sim_t is not None else 0.0
+
+        sparsity_pct = round(100.0 * (self.sdr_k / float(self.num_neurons)), 2)
+        if update_last_active and b > 0:
+            self.last_active_sdr.copy_(z[-1].detach())
+            self.last_sparsity_pct = sparsity_pct
+            self.last_attractor_steps = n_steps
+
+        # Expand stable attractor z* [B, N] to 16 active cortical columns Z* [B, 16, D]
+        z_pc_cols = F.normalize(
+            (z.to(dtype=w_dt) @ self.W_in).float().view(b, self.num_columns, self.column_dim),
+            dim=-1,
+            eps=1e-6,
+        )
+        if sdr_to_columns_fn is not None:
+            z_aligned = sdr_to_columns_fn(z.to(dtype=next_param_dtype(sdr_to_columns_fn, torch.float32))).float()
+            raw_cols = z_aligned + 0.05 * z_pc_cols
+        else:
+            raw_cols = z_pc_cols
+
+        # Direct adaptive projection from LivingBrainEngine (state_assoc + top-3 M2 traces) into Z*
+        if living_assoc_vec is not None and living_assoc_vec.numel() > 0 and living_blend > 0.0:
+            if float(living_assoc_vec.detach().float().norm().item()) > 1e-6:
+                living_cols = self.project_living_to_columns(living_assoc_vec, batch_size=b)
+                # Smooth, strictly bounded mixing factor so BrocaByteTransformer stays stable
+                eff_blend = float(living_blend) * (1.0 + 0.25 * min(1.0, cur_val))
+                eff_blend = max(0.0, min(0.22, eff_blend))
+                if hasattr(F, "rms_norm"):
+                    raw_normed = F.rms_norm(raw_cols, (self.column_dim,), eps=1e-6)
+                else:
+                    raw_normed = raw_cols * torch.rsqrt(raw_cols.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+                raw_cols = (1.0 - eff_blend) * raw_normed + eff_blend * living_cols
+
+        if hasattr(F, "rms_norm"):
+            columns_star = F.rms_norm(raw_cols, (self.column_dim,), eps=1e-6)
+        else:
+            columns_star = raw_cols * torch.rsqrt(raw_cols.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+
+        return CortexThought(
+            z_star=z,
+            columns_star=columns_star,
+            hopfield_weights=attn_weights,
+            hopfield_energy=round(float(energy), 4),
+            attractor_steps=n_steps,
+            sparsity_pct=sparsity_pct,
+            max_hopfield_sim=round(best_sim_val, 4),
+        )
+
+    @torch.no_grad()
+    def learn_local(
+        self,
+        sensory_columns: torch.Tensor,
+        z_batch: torch.Tensor,
+        steps: int = 1,
+        noise_std: float = 0.04,
+    ) -> dict[str, float | int]:
+        """
+        100% Local Biological Plasticity in @torch.no_grad() (ZERO global backprop):
+          1. Predictive Coding on W_in: minimizes local reconstruction error e = s - s_hat
+          2. Local Hebbian learning on W_rec (zero diagonal enforced)
+          3. Threshold homeostasis tracking average firing activity vs target k/N sparsity
+        """
+        b = z_batch.shape[0]
+        if b == 0:
+            return {
+                "prediction_error_start": 0.0,
+                "prediction_error_end": 0.0,
+                "active_synapses": self.active_synapses_count(),
+            }
+
+        s_flat = F.normalize(
+            sensory_columns.to(device=self.device, dtype=torch.float32).reshape(b, self.sensory_dim),
+            dim=-1,
+            eps=1e-6,
+        )
+        z_base = F.normalize(z_batch.to(device=self.device, dtype=torch.float32), dim=-1, eps=1e-6)
+
+        err_start = 0.0
+        err_end = 0.0
+        n_steps = max(1, int(steps))
+        # Accumulate local plasticity updates in fp32 so small lr steps never underflow bf16!
+        w_in_f = self.W_in.float()
+        w_rec_f = self.W_rec.float()
+
+        for step_i in range(n_steps):
+            if noise_std > 0.0 and step_i > 0:
+                noisy = z_base + torch.randn_like(z_base) * (noise_std * 0.25)
+                z, _, _ = k_wta(noisy, k=self.sdr_k, normalize=True)
+            else:
+                z = z_base
+
+            # 1) Predictive Coding: local reconstruction s_hat = z @ W_in, error = s - s_hat
+            s_hat = z @ w_in_f  # [B, 16*D]
+            err = s_flat - s_hat
+            mse = float(err.pow(2).mean().item())
+            if step_i == 0:
+                err_start = mse
+            err_end = mse
+
+            # Local Hebbian/Predictive delta: dW_in = (z^T @ err) / B with safe row-norm ceiling
+            dw_in = (z.T @ err) / float(b)
+            eff_pc_lr = float(self.cfg.pc_lr) * (float(self.num_neurons) / float(max(1, self.sdr_k))) * 0.15
+            w_in_f.add_(dw_in * eff_pc_lr)
+            row_norms = w_in_f.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            scale = torch.clamp(2.5 / row_norms, max=1.0)
+            w_in_f.mul_(scale)
+
+            # 2) Local Hebbian plasticity on W_rec with strictly zero diagonal
+            coact = (z.T @ z) / float(b)
+            w_rec_f.add_(float(self.cfg.hebb_lr) * (coact - float(self.cfg.hebb_decay) * w_rec_f))
+            w_rec_f.fill_diagonal_(0.0)
+            w_rec_f.clamp_(-1.0, 1.0)
+
+            # 3) Homeostatic threshold plasticity
+            fired = (z > 0).float().mean(dim=0)
+            self.avg_activity.mul_(0.90).add_(0.10 * fired)
+            self.threshold.add_(float(self.cfg.homeostasis_lr) * (self.avg_activity - self.target_sparsity))
+            self.threshold.clamp_(-0.4, 0.4)
+            self.total_local_updates += 1
+
+        self.W_in.copy_(w_in_f.to(dtype=self.W_in.dtype))
+        self.W_rec.copy_(w_rec_f.to(dtype=self.W_rec.dtype))
+        # Re-evaluate final clean reconstruction error after the last update
+        final_err = float((s_flat - (z_base @ w_in_f)).pow(2).mean().item())
+        err_end = min(err_end, final_err) if n_steps > 1 else final_err
+        self.last_prediction_error = round(err_end, 6)
+
+        return {
+            "prediction_error_start": round(err_start, 6),
+            "prediction_error_end": round(err_end, 6),
+            "active_synapses": self.active_synapses_count(),
+        }
+
+    @torch.no_grad()
+    def apply_synaptic_homeostasis(
+        self,
+        downscale: float | None = None,
+        prune_eps: float | None = None,
+    ) -> dict[str, int]:
+        """
+        Synaptic Homeostasis Hypothesis (SHY):
+          - Global multiplicative downscaling W_rec *= 0.94
+          - Prune weak weights below prune_eps to keep recurrent memory sharp and sparse
+          - Strictly enforce zero diagonal
+        """
+        factor = float(downscale if downscale is not None else self.cfg.shy_downscale)
+        eps = float(prune_eps if prune_eps is not None else self.cfg.shy_prune_eps)
+
+        self.W_rec.fill_diagonal_(0.0)
+        before = int((self.W_rec.abs() > 0).sum().item())
+        self.W_rec.mul_(factor)
+        prune_mask = (self.W_rec.abs() < eps) & (self.W_rec != 0)
+        pruned = int(prune_mask.sum().item())
+        self.W_rec[prune_mask] = 0.0
+        self.W_rec.fill_diagonal_(0.0)
+        after = int((self.W_rec.abs() > 0).sum().item())
+
+        return {
+            "before_synapses": before,
+            "pruned_synapses": pruned,
+            "active_synapses": after,
+        }
+
+    @torch.no_grad()
+    def compute_2d_projection(
+        self,
+        max_nodes: int = 52,
+        max_edges: int = 85,
+        engram_bank: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        """
+        Project the real strongest recurrent synapses from W_rec (post-SHY) and neurons active
+        after the last k-WTA onto 2D via GPU SVD/PCA for live visualization in static/index.html.
+        """
+        n_total = self.num_neurons
+        w_abs = self.W_rec.abs()
+
+        # Select top active neurons from last k-WTA + neurons with strongest total recurrent weight
+        active_mask = self.last_active_sdr > 0
+        active_indices = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
+        if active_indices.numel() > 0:
+            active_vals = self.last_active_sdr[active_indices]
+            order = torch.argsort(active_vals, descending=True)
+            chosen_active = active_indices[order[: min(22, active_indices.numel())]].tolist()
+        else:
+            chosen_active = []
+
+        neuron_strength = w_abs.sum(dim=1) + w_abs.sum(dim=0)
+        top_hubs = torch.topk(neuron_strength, k=min(max_nodes, n_total)).indices.tolist()
+
+        selected: list[int] = []
+        seen: set[int] = set()
+        for idx in chosen_active + top_hubs:
+            if idx not in seen:
+                seen.add(idx)
+                selected.append(int(idx))
+                if len(selected) >= max_nodes:
+                    break
+
+        if not selected:
+            return {"nodes": [], "edges": []}
+
+        cur_dev = self.W_rec.device
+        sel_t = torch.tensor(selected, dtype=torch.long, device=cur_dev)
+        sub_w = self.W_rec.index_select(0, sel_t).index_select(1, sel_t).float()  # [K, K]
+        # Build feature matrix from synaptic profiles + engram affinity if available
+        feats = self.W_in.index_select(0, sel_t).float()  # [K, sensory_dim]
+        if engram_bank is not None and engram_bank.numel() > 0:
+            e_sub = engram_bank.to(device=cur_dev, dtype=torch.float32)[:, sel_t].T  # [K, M]
+            if e_sub.shape[1] > 64:
+                e_sub = e_sub[:, -64:]
+            feats = torch.cat([F.normalize(feats, dim=-1), F.normalize(e_sub, dim=-1)], dim=-1)
+
+        k_nodes = len(selected)
+        if k_nodes == 1:
+            coords = [[0.0, 0.0]]
+        else:
+            centered = feats - feats.mean(dim=0, keepdim=True)
+            u, s, _ = torch.linalg.svd(centered, full_matrices=False)
+            c2 = u[:, :2] * s[:2]
+            if c2.shape[1] == 1:
+                c2 = torch.cat([c2, torch.zeros((k_nodes, 1), device=cur_dev)], dim=1)
+            max_abs = c2.abs().max().clamp(min=1e-5)
+            coords = ((c2 / max_abs) * 0.90).cpu().tolist()
+
+            # Lightweight repulsion so nodes do not stack
+            min_dist = 0.14
+            for _ in range(6):
+                for i in range(k_nodes):
+                    xi, yi = coords[i]
+                    for j in range(i + 1, k_nodes):
+                        xj, yj = coords[j]
+                        dx, dy = xi - xj, yi - yj
+                        dist = (dx * dx + dy * dy) ** 0.5
+                        if dist < min_dist:
+                            ux, uy = (0.7071, 0.7071) if dist < 1e-6 else (dx / dist, dy / dist)
+                            push = (min_dist - dist) * 0.35
+                            xi = max(-0.94, min(0.94, xi + ux * push))
+                            yi = max(-0.94, min(0.94, yi + uy * push))
+                            coords[j][0] = max(-0.94, min(0.94, xj - ux * push))
+                            coords[j][1] = max(-0.94, min(0.94, yj - uy * push))
+                    coords[i][0], coords[i][1] = xi, yi
+
+        # Extract real top edges from sub_w
+        sub_abs = sub_w.abs()
+        flat_vals = sub_abs.reshape(-1)
+        nz = int((flat_vals > 0).sum().item())
+        edge_k = min(max_edges, nz)
+        edges: list[dict[str, Any]] = []
+        degree_map: dict[int, int] = {}
+        active_set = set(chosen_active)
+
+        if edge_k > 0:
+            _, top_e_idx = torch.topk(flat_vals, k=edge_k)
+            for flat_i in top_e_idx.cpu().tolist():
+                r = flat_i // k_nodes
+                c = flat_i % k_nodes
+                if r == c:
+                    continue
+                w_val = float(sub_w[r, c].item())
+                if abs(w_val) < 1e-6:
+                    continue
+                n_src = selected[c]
+                n_dst = selected[r]
+                degree_map[n_src] = degree_map.get(n_src, 0) + 1
+                degree_map[n_dst] = degree_map.get(n_dst, 0) + 1
+                both_active = (n_src in active_set) and (n_dst in active_set)
+                edges.append(
+                    {
+                        "src": f"N{n_src:04d}",
+                        "dst": f"N{n_dst:04d}",
+                        "rel": f"{w_val:+.3f}",
+                        "weight": round(w_val, 4),
+                        "strength": round(abs(w_val), 4),
+                        "source": "ACTIVE_SYNAPSE" if both_active else "W_REC",
+                    }
+                )
+
+        nodes: list[dict[str, Any]] = []
+        for i, n_idx in enumerate(selected):
+            act_val = float(self.last_active_sdr[n_idx].item())
+            thr_val = float(self.threshold[n_idx].item())
+            nodes.append(
                 {
-                    "concept": self.id_to_concept[idx_t],
-                    "score": round(float(score), 3),
-                    "via_relation": rel_name,
-                    "direct_sim": round(float(sim_direct[idx_t].item()), 3),
+                    "id": f"N{n_idx:04d}",
+                    "neuron_idx": n_idx,
+                    "x": round(float(coords[i][0]), 4),
+                    "y": round(float(coords[i][1]), 4),
+                    "active": act_val > 0.0,
+                    "activity": round(act_val, 4),
+                    "threshold": round(thr_val, 4),
+                    "consolidated": degree_map.get(n_idx, 0) > 0,
+                    "degree": degree_map.get(n_idx, 0),
                 }
             )
-        return results
 
-    @torch.no_grad()
-    def compute_2d_projection(self, limit: int = 80, concepts: list[str] | None = None) -> dict[str, tuple[float, float]]:
-        n_total = len(self.id_to_concept)
-        if n_total == 0:
-            return {}
-        all_mat = self.normalized_concept_matrix()
-        if concepts is not None:
-            idxs: list[int] = []
-            seen: set[int] = set()
-            for c in concepts:
-                cid = self.concept_to_id.get(c)
-                if cid is not None and cid not in seen:
-                    seen.add(cid)
-                    idxs.append(cid)
-                    if len(idxs) >= limit:
-                        break
-            if not idxs:
-                return {}
-            mat = all_mat[idxs]
-            names = [self.id_to_concept[i] for i in idxs]
-            n = len(names)
-        else:
-            mat = all_mat
-            names = self.id_to_concept
-            n = n_total
-            if n > limit:
-                mat = mat[-limit:]
-                names = names[-limit:]
-                n = limit
-        if n == 1:
-            return {names[0]: (0.0, 0.0)}
-        centered = mat - mat.mean(dim=0, keepdim=True)
-        u, s, _ = torch.linalg.svd(centered, full_matrices=False)
-        coords_t = u[:, :2] * s[:2]
-        if coords_t.shape[1] == 1:
-            coords_t = torch.cat([coords_t, torch.zeros((n, 1), device=self.device)], dim=1)
-        max_abs = coords_t.abs().max().clamp(min=1e-5)
-        coords = ((coords_t / max_abs) * 0.92).cpu().tolist()
-
-        # Lightweight pairwise repulsion so concept labels do not overlap
-        min_dist = 0.16
-        for _ in range(8):
-            for i in range(n):
-                xi, yi = coords[i]
-                for j in range(i + 1, n):
-                    xj, yj = coords[j]
-                    dx = xi - xj
-                    dy = yi - yj
-                    dist = (dx * dx + dy * dy) ** 0.5
-                    if dist < min_dist:
-                        if dist < 1e-6:
-                            ux, uy = 0.7071, 0.7071
-                        else:
-                            ux, uy = dx / dist, dy / dist
-                        push = (min_dist - dist) * 0.35
-                        xi += ux * push
-                        yi += uy * push
-                        xj -= ux * push
-                        yj -= uy * push
-                        coords[j][0] = max(-0.95, min(0.95, xj))
-                        coords[j][1] = max(-0.95, min(0.95, yj))
-                coords[i][0] = max(-0.95, min(0.95, xi))
-                coords[i][1] = max(-0.95, min(0.95, yi))
-
-        return {names[i]: (float(coords[i][0]), float(coords[i][1])) for i in range(n)}
+        return {"nodes": nodes, "edges": edges}
 
     def export_state(self) -> dict[str, Any]:
         return {
-            "concept_to_id": self.concept_to_id,
-            "id_to_concept": self.id_to_concept,
-            "relation_to_id": self.relation_to_id,
-            "id_to_relation": self.id_to_relation,
-            "weights": {k: v.cpu() for k, v in self.state_dict().items()},
-            "fisher": {k: v.cpu() for k, v in self.fisher.items()},
-            "anchor": {k: v.cpu() for k, v in self.anchor_params.items()},
+            "num_neurons": self.num_neurons,
+            "sensory_dim": self.sensory_dim,
+            "sdr_k": self.sdr_k,
+            "W_in": self.W_in.detach().cpu().to(torch.bfloat16),
+            "W_rec": self.W_rec.detach().cpu().to(torch.bfloat16),
+            "threshold": self.threshold.detach().cpu().float(),
+            "avg_activity": self.avg_activity.detach().cpu().float(),
+            "last_active_sdr": self.last_active_sdr.detach().cpu().to(torch.bfloat16),
+            "last_prediction_error": self.last_prediction_error,
+            "total_local_updates": self.total_local_updates,
         }
 
     def import_state(self, state: dict[str, Any]) -> None:
-        self.concept_to_id = dict(state["concept_to_id"])
-        self.id_to_concept = list(state["id_to_concept"])
-        self.relation_to_id = dict(state["relation_to_id"])
-        self.id_to_relation = list(state["id_to_relation"])
-        # Handle resized embedding tables safely if upgrading from an older checkpoint
-        saved_weights = state["weights"]
-        cur_sd = self.state_dict()
-        merged = {}
-        for k, cur_v in cur_sd.items():
-            if k in saved_weights and saved_weights[k].shape == cur_v.shape:
-                merged[k] = saved_weights[k].to(self.device)
-            elif k in saved_weights and saved_weights[k].ndim == 2 and cur_v.ndim == 2 and saved_weights[k].shape[1] == cur_v.shape[1]:
-                buf = cur_v.clone()
-                rows = min(buf.shape[0], saved_weights[k].shape[0])
-                buf[:rows] = saved_weights[k][:rows].to(self.device)
-                merged[k] = buf
-            else:
-                merged[k] = cur_v
-        self.load_state_dict(merged)
-        self.fisher = {
-            k: v.to(self.device)
-            for k, v in state.get("fisher", {}).items()
-            if k in cur_sd and v.shape == cur_sd[k].shape
-        }
-        self.anchor_params = {
-            k: v.to(self.device)
-            for k, v in state.get("anchor", {}).items()
-            if k in cur_sd and v.shape == cur_sd[k].shape
-        }
+        if state.get("num_neurons") != self.num_neurons or state.get("sensory_dim") != self.sensory_dim:
+            raise ValueError("Incompatible BiologicalAssociativeCortex dimensions in checkpoint")
+        self.W_in.copy_(state["W_in"].to(device=self.device, dtype=self.W_in.dtype))
+        self.W_rec.copy_(state["W_rec"].to(device=self.device, dtype=self.W_rec.dtype))
+        self.W_rec.fill_diagonal_(0.0)
+        self.threshold.copy_(state["threshold"].to(device=self.device, dtype=torch.float32))
+        self.avg_activity.copy_(state["avg_activity"].to(device=self.device, dtype=torch.float32))
+        if "last_active_sdr" in state:
+            self.last_active_sdr.copy_(state["last_active_sdr"].to(device=self.device, dtype=torch.float32))
+        self.last_prediction_error = float(state.get("last_prediction_error", 0.0))
+        self.total_local_updates = int(state.get("total_local_updates", 0))
+
+
+def next_param_dtype(fn: Any, fallback: torch.dtype) -> torch.dtype:
+    owner = getattr(fn, "__self__", None)
+    if isinstance(owner, nn.Module):
+        for p in owner.parameters():
+            return p.dtype
+    return fallback

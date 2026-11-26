@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -11,14 +12,22 @@ from pathlib import Path
 
 import torch
 
-from brain.agent import SleepingBrain
+from brain.agent import CHECKPOINT_VERSION, SleepingBrain
 from brain.config import BrainConfig
-from brain.hippocampus import Hippocampus, _cosine
-from brain.language_cortex import LanguageCortex, _fallback_hash_embed
-from brain.neural_cortex import AssociativeConceptCortex
-from brain.neural_language import CorticalSemanticEncoder, CorticalTransformerLM, SubwordTokenizer
+from brain.hippocampus import Hippocampus
+from brain.language_cortex import LanguageCortex
+from brain.language_trainer import iter_utf8_text_chunks
+from brain.neural_cortex import BiologicalAssociativeCortex
+from brain.neural_language import BrocaByteTransformer
+from brain.sensory_wernicke import WernickeByteCortex, encode_utf8_bytes
 from brain.sleep_engine import SleepEngine
-from brain.web_learner import WebDocument, clean_search_query, extract_lead_definition, gather_web_sources, is_relevant_doc
+from brain.web_learner import (
+    WebDocument,
+    clean_search_query,
+    extract_lead_definition,
+    gather_web_sources,
+    is_relevant_doc,
+)
 from server import BrainServer
 
 
@@ -32,7 +41,7 @@ def _start_test_web_server():
                 html_doc = (
                     "<html><head><title>Foton</title></head><body>"
                     "<h1>Foton</h1>"
-                    "<p>Foton jest cząstką elementarną nieposiadającą masy spoczynkowej, będącą nośnikiem oddziaływaniem elektromagnetycznym.</p>"
+                    "<p>Foton jest cząstką elementarną nieposiadającą masy spoczynkowej, będącą nośnikiem oddziaływania elektromagnetycznego.</p>"
                     "<p>Energia fotonu zależy od częstotliwości promieniowania elektromagnetycznego i stałej Plancka.</p>"
                     "</body></html>"
                 ).encode("utf-8")
@@ -50,375 +59,260 @@ def _start_test_web_server():
     return srv
 
 
-class TestNeuralLanguageModels(unittest.TestCase):
-    def test_tokenizer_lossless_polish_and_code(self):
-        tok = SubwordTokenizer(max_vocab_size=2048)
-        sample = "Żółć gęślą jaźń — int* ptr = &x; // C++ wskaźnik"
-        tok.learn_texts([sample])
-        ids = tok.encode(sample, max_len=128)
-        decoded = tok.decode(ids)
-        self.assertEqual(decoded, sample)
-        self.assertGreater(tok.vocab_used, SubwordTokenizer.VOCAB_OFFSET)
-
-        state = tok.export_state()
-        tok2 = SubwordTokenizer(max_vocab_size=2048)
-        tok2.import_state(state)
-        self.assertEqual(tok2.encode(sample, max_len=128), ids)
-
-    def test_semantic_encoder_and_transformer_gpu_training(self):
+class TestTokenlessUTF8Pipeline(unittest.TestCase):
+    def test_full_tokenless_utf8_wernicke_cortex_broca_pipeline(self):
+        """
+        1) Pełny tor beztokenowy UTF-8: polskie znaki + C++ przechodzą przez
+           Wernicke (Byte-Patching + k-WTA 3-5%) -> Modern Hopfield + 16 kolumn Z*
+           -> BrocaByteTransformer na CUDA/CPU bez błędów wymiarów i urządzeń.
+        """
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        tok = SubwordTokenizer(max_vocab_size=4096)
-        pairs = [
-            ("kunktator", "Kunktator to osoba powolna i ostrożna w działaniu."),
-            ("wskaźnik C++", "Wskaźnik w C++ przechowuje adres zmiennej w pamięci."),
-            ("foton", "Foton jest cząstką elementarną bez masy spoczynkowej."),
-            ("czarna dziura", "Czarna dziura ma horyzont zdarzeń, z którego nie ucieka światło."),
-        ]
-        tok.learn_texts([p[0] + " " + p[1] for p in pairs])
-
-        enc = CorticalSemanticEncoder(vocab_size=4096, ngram_buckets=1024, d_model=128).to(device)
-        vecs = enc.encode_texts(["kunktatora", "Kunktator to osoba powolna.", "kompilator Rust"], tok)
-        self.assertGreater(_cosine(vecs[0], vecs[1]), _cosine(vecs[0], vecs[2]))
-
-        enc_s, enc_e = enc.train_contrastive(pairs, tok, epochs=10, lr=2e-3)
-        self.assertLess(enc_e, enc_s)
-
-        lm = CorticalTransformerLM(vocab_size=4096, d_model=128, n_layers=2, n_heads=4, ff_dim=256, max_seq_len=128).to(device)
-        seqs = [f"<MEM> {a} <CTX> początek rozmowy <USER> {q} <BOT> {a}" for q, a in pairs]
-        lm_s, lm_e = lm.train_sleep_replay(seqs, tok, epochs=18, lr=2e-3)
-        self.assertLess(lm_e, lm_s)
-        self.assertGreater(lm.fluency_score, 40.0)
-
-        gen = lm.generate_reply("<MEM> Kunktator to osoba powolna. <CTX> początek rozmowy <USER> kunktator <BOT>", tok, max_new_tokens=30)
-        self.assertIsInstance(gen["text"], str)
-        self.assertGreater(gen["num_tokens"], 0)
-
-        exported = lm.export_state()
-        lm2 = CorticalTransformerLM(vocab_size=4096, d_model=128, n_layers=2, n_heads=4, ff_dim=256, max_seq_len=128).to(device)
-        lm2.import_state(exported)
-        self.assertEqual(lm2.total_parameters(), lm.total_parameters())
-        self.assertEqual(lm2.fluency_score, lm.fluency_score)
-
-
-class TestLanguageCortexStandalone(unittest.TestCase):
-    def test_extraction_update_no_hallucination_and_streaming(self):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        cfg = BrainConfig(cortex_sleep_epochs=8)
-        lc = LanguageCortex(cfg=cfg, device=device)
-        self.assertTrue(lc.load_sync())
-        self.assertGreater(lc.total_parameters(), 1_000_000)
-
-        # Deterministic fallback hash check
-        self.assertEqual(_fallback_hash_embed("wskaźniki C++"), _fallback_hash_embed("wskaźniki C++"))
-
-        # Questions without '?' or diacritics must NOT be stored
-        self.assertEqual(lc.extract_memories_from_turn("jak dziala pamiec")["memories"], [])
-        self.assertEqual(lc.extract_memories_from_turn("czym sa wskazniki w cpp")["memories"], [])
-        self.assertEqual(lc.extract_memories_from_turn("ale to nie prawda")["memories"], [])
-
-        # Declarative user info is extracted cleanly
-        ext = lc.extract_memories_from_turn("Mam na imię Janek, mieszkam w Krakowie i interesuję się fizyką.")
-        texts = [m["text"] for m in ext["memories"]]
-        self.assertTrue(any("Janek" in t for t in texts))
-        self.assertTrue(any("Krakowie" in t for t in texts))
-
-        # Contradiction / update detection
-        idx = lc.check_memory_update("Użytkownik mieszka w Gdańsku.", ["Użytkownik ma na imię Janek.", "Użytkownik mieszka w Krakowie."])
-        self.assertEqual(idx, 1)
-
-        # Anti-hallucination gate on unknown subject
-        unknown_reply = lc.chat_reply("Kto to był Tamerlan?", [], [], [], [], [], 1, 0, 100.0, "AWAKE")
-        self.assertIn("/ucz", unknown_reply)
-
-        # Conversational capability with typos & short follow-ups must NOT suggest '/ucz ...'
-        cap_reply = lc.chat_reply("o czy moge z toba rozmiac", [], [], [], [], [], 1, 0, 100.0, "AWAKE")
-        self.assertNotIn("/ucz o czy", cap_reply.lower())
-        self.assertIn("/szkola", cap_reply.lower())
-
-        follow_reply = lc.chat_reply("ale co", [{"role": "assistant", "content": "Cześć!"}], [], [], [], [], 1, 0, 100.0, "AWAKE")
-        self.assertNotIn("/ucz ale co", follow_reply.lower())
-
-        # Elementary school math solver
-        self.assertIn("56", lc.chat_reply("ile to jest 7 * 8", [], [], [], [], [], 1, 0, 100.0, "AWAKE"))
-        self.assertIn("50", lc.chat_reply("ile to 25% z 200", [], [], [], [], [], 1, 0, 100.0, "AWAKE"))
-        self.assertIn("12", lc.chat_reply("pierwiastek z 144", [], [], [], [], [], 1, 0, 100.0, "AWAKE"))
-
-        # Streaming reply grounded in memory
-        chunks = list(
-            lc.chat_reply_stream(
-                "no to kto to jest Kunktator",
-                [],
-                [],
-                ["Kunktator to osoba powolna i ostrożna w działaniu; przydomek rzymskiego wodza Fabiusza Maksimusa."],
-                [],
-                [],
-                1,
-                0,
-                100.0,
-                "AWAKE",
-            )
+        cfg = BrainConfig(
+            language_bootstrap_epochs=0,
+            broca_layers=2,
+            broca_heads=4,
+            broca_dim=256,
+            broca_ff_dim=512,
         )
-        full = "".join(chunks)
-        self.assertGreaterEqual(len(chunks), 2)
-        self.assertIn("powolna", full.lower())
+        wernicke = WernickeByteCortex(cfg).to(device)
+        cortex = BiologicalAssociativeCortex(cfg, device)
+        broca = BrocaByteTransformer(cfg).to(device)
 
+        sample = "Żółć gęślą jaźń — wskaźniki w C++"
+        byte_ids, valid_mask = encode_utf8_bytes(
+            [sample], max_bytes=cfg.max_input_bytes, patch_size=cfg.patch_stride, device=device
+        )
+        self.assertEqual(byte_ids.device.type, device.type)
+        self.assertEqual(byte_ids.shape[1] % cfg.patch_stride, 0)
 
-class TestHippocampusAndCortex(unittest.TestCase):
-    def test_polish_inflection_search_and_crud(self):
-        hippo = Hippocampus()
-        m1 = hippo.record_memory("Kunktator to osoba powolna i ostrożna w działaniu.", "nauka_z_sieci", 5, day=1, topic="Kunktator")
-        hippo.record_memory("Wskaźnik w C++ przechowuje adres zmiennej w pamięci.", "nauka_z_sieci", 5, day=1, topic="wskaźniki C++")
+        w_out = wernicke.encode_texts([sample], device=device)
+        self.assertEqual(tuple(w_out.columns.shape), (1, cfg.num_columns, cfg.column_dim))
+        self.assertEqual(tuple(w_out.sdr.shape), (1, cfg.num_neurons))
+        self.assertEqual(tuple(w_out.reconstructed_columns.shape), (1, cfg.num_columns, cfg.column_dim))
+        self.assertEqual(w_out.active_indices.dtype, torch.int16)
+        self.assertEqual(w_out.active_values.dtype, torch.bfloat16)
 
-        res1 = hippo.search_memories([], "opowiedz o kunktatora", current_day=1)
-        self.assertTrue(any("Kunktator" in m.text for m in res1["hippocampus"]))
+        # Exact k-WTA sparsity within 3-5%
+        active_count = int((w_out.sdr[0] > 0).sum().item())
+        self.assertEqual(active_count, cfg.sdr_k)
+        self.assertGreaterEqual(w_out.sparsity_pct, 3.0)
+        self.assertLessEqual(w_out.sparsity_pct, 5.0)
 
-        res2 = hippo.search_memories([], "wskazniki w cpp", current_day=1)
-        self.assertTrue(any("Wskaźnik" in m.text for m in res2["hippocampus"]))
+        # Cortical Modern Hopfield + 16 columns Z*
+        fake_bank = w_out.sdr.to(torch.bfloat16)
+        thought = cortex.perceive_and_think(
+            sensory_columns=w_out.columns,
+            sensory_sdr=w_out.sdr,
+            engram_bank=fake_bank,
+            sdr_to_columns_fn=wernicke.sdr_to_columns,
+            steps=4,
+        )
+        self.assertEqual(tuple(thought.z_star.shape), (1, cfg.num_neurons))
+        self.assertEqual(tuple(thought.columns_star.shape), (1, cfg.num_columns, cfg.column_dim))
+        self.assertEqual(int((thought.z_star[0] > 0).sum().item()), cfg.sdr_k)
+        self.assertEqual(thought.attractor_steps, 4)
 
-        hippo.studied_topics["kunktator"] = {"topic": "Kunktator", "mastery": 90}
-        self.assertTrue(hippo.delete_memory(m1.id))
-        self.assertFalse(hippo.delete_memory("nonexistent"))
-        self.assertTrue(hippo.delete_topic("Kunktator"))
-        self.assertNotIn("kunktator", hippo.studied_topics)
+        # BrocaByteTransformer conditioned ONLY on Z* streams valid UTF-8
+        streamed = list(broca.generate_stream(thought.columns_star, max_new_bytes=36, temperature=0.85))
+        joined = "".join(streamed)
+        self.assertIsInstance(joined, str)
+        self.assertEqual(joined.encode("utf-8").decode("utf-8"), joined)
 
-    def test_concept_cortex_gpu_ewc_rem_and_projection(self):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        cfg = BrainConfig(nrem_concept_epochs=45, rem_similarity_threshold=-1.0)
-        cortex = AssociativeConceptCortex(cfg, device)
-        hippo = Hippocampus()
-        hippo.record_fact("kunktator", "określa", "fabiusz", day=1)
-        hippo.record_fact("fabiusz", "był", "konsulem", day=1)
-        hippo.record_fact("wskaźnik", "przechowuje", "adres", day=1)
-
-        engine = SleepEngine(cfg=cfg, concept_cortex=cortex, hippocampus=hippo, device=device)
-        rep = engine.run_sleep_cycle(night_number=1)
-        self.assertLess(rep.concept_loss_end, rep.concept_loss_start)
-        self.assertGreaterEqual(len(rep.rem_new_links), 1)
-
-        self.assertEqual(cortex.resolve_concept("kunktatora"), "kunktator")
-        self.assertEqual(cortex.resolve_concept("wskazniki"), "wskaźnik")
-        proj = cortex.compute_2d_projection(limit=10, concepts=["kunktator", "fabiusz", "konsulem"])
-        self.assertEqual(set(proj.keys()), {"kunktator", "fabiusz", "konsulem"})
-
-    def test_sleep_rem_reflections_and_convergent_dreaming(self):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        cfg = BrainConfig(nrem_concept_epochs=35, cortex_sleep_epochs=4, rem_similarity_threshold=-1.0)
+        # Denoising autoencoder training lowers loss through the SDR bottleneck
         lc = LanguageCortex(cfg=cfg, device=device)
-        self.assertTrue(lc.load_sync())
-        cortex = AssociativeConceptCortex(cfg, device)
-        hippo = Hippocampus()
+        train_res = lc.train_denoising_sleep(
+            texts=[
+                "Żółć gęślą jaźń — wskaźniki w C++ przechowują adresy pamięci.",
+                "Fotosynteza wytwarza glukozę oraz tlen pod wpływem światła słonecznego.",
+                "Pamięć RAM przechowuje dane tymczasowe, a dysk SSD służy do zapisu trwałego.",
+                "Stolicą Polski jest Warszawa położona nad rzeką Wisłą.",
+            ],
+            epochs=6,
+        )
+        self.assertTrue(train_res["trained"])
+        self.assertLess(train_res["loss_end"], train_res["loss_start"])
 
-        # Interconnected biology facts + unrelated facts (which must NOT be fused)
-        m_bio1 = "Chloroplasty występują w komórkach roślinnych i przeprowadzają fotosyntezę."
-        m_bio2 = "Fotosynteza to proces zachodzący pod wpływem światła słonecznego, który wytwarza glukozę oraz tlen."
-        m_bio3 = "Układ oddechowy z płucami dostarcza organizmowi tlen z powietrza."
-        m_unrel1 = "Dzielenie przez zero jest w matematyce niedozwolone."
-        m_unrel2 = "Kornwalia jest jednym z regionów Wielkiej Brytanii."
-        m_stub = "Słowo „przeszukiwać” oznacza: czasowniki przechodnie, rejestr wyrazów."
 
-        for m in (m_bio1, m_bio2, m_bio3, m_unrel1, m_unrel2, m_stub):
-            hippo.record_memory(m, "wiedza", 5, day=1, embedding=lc.encode_text(m))
-
-        hippo.record_fact("chloroplasty", "przeprowadzają", "fotosyntezę", day=1)
-        hippo.record_fact("fotosyntezę", "wytwarza", "tlen", day=1)
-        hippo.record_fact("układ oddechowy", "dostarcza", "tlen", day=1)
-
-        engine = SleepEngine(cfg=cfg, concept_cortex=cortex, hippocampus=hippo, device=device, language_cortex=lc)
-        rep = engine.run_sleep_cycle(night_number=1)
-
-        # Transitive (chloroplasty <-> tlen) AND convergent (fotosyntezę <-> układ oddechowy via tlen)
-        link_pairs = {(l["src"], l["dst"]) for l in rep.rem_new_links} | {(l["dst"], l["src"]) for l in rep.rem_new_links}
-        self.assertIn(("chloroplasty", "tlen"), link_pairs)
-        self.assertIn(("fotosyntezę", "układ oddechowy"), link_pairs)
-
-        # Reflections must be clean, non-truncated, without stopword garbage or unrelated pairings
-        self.assertGreaterEqual(len(rep.rem_reflections), 1)
-        for refl in rep.rem_reflections:
-            self.assertNotIn("czyl,", refl.lower())
-            self.assertNotIn("czasowniki przechodnie", refl.lower())
-            self.assertFalse("dzielen" in refl.lower() and "kornwali" in refl.lower())
-
-        # Subsequent manual sleep with empty STM still synthesizes new non-duplicate reflections
-        self.assertEqual(len(hippo.short_term_memories), 0)
-        rep2 = engine.run_sleep_cycle(night_number=2)
-        for refl in rep2.rem_reflections:
-            self.assertNotIn(refl, rep.rem_reflections)
-
-    def test_compound_queries_fact_connecting_and_deliberative_answering(self):
+class TestTensorHippocampusHopfieldSHYAndREM(unittest.TestCase):
+    def test_tensor_hippocampus_local_plasticity_shy_and_vectorized_rem(self):
+        """
+        2) Tensorowy Hipokamp + Modern Hopfield + SHY:
+           - bfloat16 engram tensors on GPU/CPU
+           - W_rec has strictly zero diagonal
+           - prediction_error_end < prediction_error_start
+           - pruned_synapses > 0 after SHY
+           - REM runs vectorized on GPU and creates new hybrid states
+        """
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        cfg = BrainConfig(nrem_concept_epochs=25, cortex_sleep_epochs=4, language_bootstrap_epochs=2)
+        cfg = BrainConfig(
+            language_bootstrap_epochs=0,
+            cortex_sleep_epochs=2,
+            nrem_sleep_steps=18,
+            broca_layers=2,
+            broca_heads=4,
+            broca_ff_dim=512,
+            shy_prune_eps=0.015,
+            rem_batch_size=4,
+        )
+        hippo = Hippocampus(num_neurons=cfg.num_neurons, sdr_k=cfg.sdr_k, device=device)
+        cortex = BiologicalAssociativeCortex(cfg, device)
+        lc = LanguageCortex(cfg=cfg, device=device)
+        engine = SleepEngine(cfg=cfg, cortex=cortex, hippocampus=hippo, device=device, language_cortex=lc)
+
+        stimuli = [
+            "Fotosynteza wytwarza tlen oraz glukozę w chloroplastach roślin.",
+            "Wskaźnik w C++ przechowuje adres zmiennej w pamięci operacyjnej.",
+            "Czarna dziura posiada horyzont zdarzeń, z którego nie ucieka światło.",
+            "Chrzest Polski odbył się w 966 roku za panowania Mieszka Pierwszego.",
+            "Mitochondria odpowiadają za oddychanie komórkowe i wytwarzanie ATP.",
+            "Układ Słoneczny składa się ze Słońca oraz ośmiu planet.",
+            "Algorytm to uporządkowany ciąg kroków prowadzących do rozwiązania.",
+            "Foton jest bezmasowym kwantem promieniowania elektromagnetycznego.",
+        ]
+        w_out = lc.perceive_texts(stimuli)
+        hippo.record_engrams_batch(
+            sdrs=w_out.sdr,
+            preview_labels=stimuli,
+            category="wiedza",
+            day=1,
+            sparsity_pct=w_out.sparsity_pct,
+        )
+        self.assertEqual(hippo.short_term.engrams.dtype, torch.bfloat16)
+        self.assertEqual(hippo.short_term.engrams.device.type, device.type)
+
+        # Ensure weak synapses exist in W_rec so SHY deterministically prunes them
+        with torch.no_grad():
+            cortex.W_rec[0, 1] = 0.005
+            cortex.W_rec[1, 2] = 0.006
+            cortex.W_rec[2, 3] = 0.007
+
+        report = engine.run_sleep_cycle(night_number=1, wake_texts_for_broca=stimuli)
+
+        # Zero diagonal invariant on W_rec
+        diag_max = float(torch.diag(cortex.W_rec).abs().max().item())
+        self.assertEqual(diag_max, 0.0)
+
+        # Local Predictive Coding reduced reconstruction error without backprop
+        self.assertGreater(report.prediction_error_start, 0.0)
+        self.assertLess(report.prediction_error_end, report.prediction_error_start)
+
+        # SHY pruned weak synapses and counted active synapses
+        self.assertGreater(report.pruned_synapses, 0)
+        self.assertGreaterEqual(report.active_synapses, 0)
+
+        # Short-term cleared, semantic consolidated in bfloat16, REM created vectorized hybrid states
+        self.assertEqual(len(hippo.short_term), 0)
+        self.assertGreaterEqual(len(hippo.semantic), 4)
+        self.assertEqual(hippo.semantic.engrams.dtype, torch.bfloat16)
+        self.assertGreater(len(hippo.rem), 0)
+        self.assertEqual(len(report.rem_reflections), len(hippo.rem))
+        self.assertGreater(len(report.rem_new_links), 0)
+
+        # 2D synaptic projection includes real W_rec edges & active k-WTA flags
+        cortex.perceive_and_think(w_out.columns[:1], w_out.sdr[:1], engram_bank=hippo.get_hopfield_bank())
+        proj = cortex.compute_2d_projection(max_nodes=32, max_edges=40, engram_bank=hippo.semantic.engrams)
+        self.assertGreater(len(proj["nodes"]), 0)
+        self.assertTrue(any(n["active"] for n in proj["nodes"]))
+
+
+class TestAntiCopyAndPersistenceMigration(unittest.TestCase):
+    def test_anti_copy_with_erased_preview_labels_and_stochastic_sampling(self):
+        """
+        3) Kluczowy test anty-kopiujący: po /ucz i /sen wyzeruj wszystkie preview_label
+           w Hippocampus i udowodnij, że chat() dalej generuje odpowiedź wyłącznie z Z*
+           przez BrocaByteTransformer, a dwa wywołania z temperature > 0 dają różne próbki.
+        """
+        web_srv = _start_test_web_server()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                cfg = BrainConfig(
+                    language_bootstrap_epochs=2,
+                    cortex_sleep_epochs=2,
+                    nrem_sleep_steps=10,
+                    broca_layers=2,
+                    broca_heads=4,
+                    broca_ff_dim=512,
+                    broca_max_new_bytes=48,
+                )
+                brain = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
+                article_url = f"http://127.0.0.1:{web_srv.server_port}/article.html"
+                study_res = brain.study_topic_online(article_url, max_rounds=1, consolidate_after=True)
+                self.assertEqual(study_res["pages_read"], 1)
+                self.assertGreaterEqual(study_res["facts_learned"], 2)
+                self.assertGreater(len(brain.hippocampus.semantic), 0)
+
+                # Erase EVERY preview_label across all three banks
+                brain.hippocampus.clear_all_preview_labels("")
+                for bank in (brain.hippocampus.short_term, brain.hippocampus.semantic, brain.hippocampus.rem):
+                    for m in bank.meta:
+                        self.assertEqual(m.preview_label, "")
+
+                # Two stochastic calls with temperature > 0 must succeed purely from Z* and differ
+                brain.auto_sleep = False
+                samples: list[str] = []
+                for _ in range(4):
+                    ans = brain.chat("Co to jest foton?", temperature=0.90)
+                    self.assertIsInstance(ans["reply"], str)
+                    self.assertGreater(len(ans["reply"]), 0)
+                    self.assertEqual(ans["reply"].encode("utf-8").decode("utf-8"), ans["reply"])
+                    samples.append(ans["reply"])
+
+                self.assertGreater(len(set(samples)), 1, f"Expected stochastic non-identical samples, got: {samples}")
+        finally:
+            web_srv.shutdown()
+            web_srv.server_close()
+
+    def test_sparse_sdr_persistence_and_legacy_checkpoint_migration(self):
+        """
+        4) Persistence, rzadki zapis SDR (int16, bfloat16) oraz automatyczna migracja
+           starego pliku tokenowego do *.legacy_<timestamp>.bak bez crasha.
+        """
         with tempfile.TemporaryDirectory() as tmp:
+            cfg = BrainConfig(
+                language_bootstrap_epochs=0,
+                cortex_sleep_epochs=1,
+                nrem_sleep_steps=8,
+                broca_layers=2,
+                broca_heads=4,
+                broca_ff_dim=512,
+            )
             brain = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
-            brain.auto_web = False
-            # Seed key facts + graph triples without running full 22-epoch curriculum training
-            seed_facts = [
-                "Słońce jest gwiazdą znajdującą się w centrum Układu Słonecznego i głównym źródłem światła oraz ciepła dla Ziemi.",
-                "Fotosynteza to proces zachodzący w roślinach pod wpływem światła słonecznego, w którym z wody i dwutlenku węgla powstają glukoza (cukier) oraz tlen.",
-                "Układ oddechowy z płucami dostarcza organizmowi tlen z powietrza i usuwa dwutlenek węgla.",
-                "Procesor (CPU) wykonuje rozkazy programu, karta graficzna (GPU) przyspiesza obliczenia graficzne, pamięć RAM przechowuje dane tymczasowe, a dysk SSD służy do zapisu trwałego.",
-                "Prędkość światła w próżni wynosi około 300 000 km/s, natomiast dźwięk rozchodzi się w powietrzu z prędkością około 340 m/s i nie rozchodzi się w próżni.",
-                "Bitwa pod Grunwaldem odbyła się 15 lipca 1410 roku; wojska polsko-litewskie pod wodzą króla Władysława Jagiełły pokonały Zakon Krzyżacki.",
-            ]
-            embs = brain.language_cortex.encode_texts(seed_facts)
-            for txt, emb in zip(seed_facts, embs):
-                brain.hippocampus.record_memory(txt, "wiedza", 5, day=1, embedding=emb)
-            for s, r, d in [
-                ("słońce", "jest źródłem", "światła słonecznego"),
-                ("fotosynteza", "wymaga", "światła słonecznego"),
-                ("fotosynteza", "wytwarza", "tlen"),
-                ("układ oddechowy", "dostarcza", "tlen"),
-                ("władysław jagiełło", "dowodził w", "bitwa pod grunwaldem"),
-                ("bitwa pod grunwaldem", "odbyła się w", "1410 rok"),
-            ]:
-                brain.hippocampus.record_fact(s, r, d, day=1)
+            brain.add_manual_memory("Żółć gęślą jaźń — zapis rzadkiego SDR.", category="wiedza", importance=5)
+            brain.add_manual_memory("Wskaźniki w C++ operują na adresach pamięci.", category="wiedza", importance=5)
             brain.sleep_now(visual_pacing=False)
 
-            # 1) Connection query
-            conn = brain.chat("Jaki jest związek między fotosyntezą a oddychaniem człowieka?")
-            conn_low = conn["reply"].lower()
-            self.assertNotIn("/ucz", conn_low)
-            self.assertFalse(conn_low.startswith("najprościej mówiąc:"))
-            self.assertTrue("tlen" in conn_low or "dwutlen" in conn_low, f"Expected bridge in: {conn['reply']}")
-            self.assertIn("oddech", conn_low)
-            self.assertTrue(any("Porównanie wariantów" in step for step in brain.language_cortex.last_thinking_steps))
+            ckpt_path = brain.save_state()
+            saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            self.assertEqual(saved["version"], CHECKPOINT_VERSION)
+            sem_sparse = saved["hippocampus_engrams"]["semantic"]
+            self.assertEqual(sem_sparse["indices"].dtype, torch.int16)
+            self.assertEqual(sem_sparse["values"].dtype, torch.bfloat16)
+            self.assertEqual(sem_sparse["indices"].shape[1], cfg.sdr_k)
 
-            # 2) Causal multi-hop query
-            why_res = brain.chat("Dlaczego bez Słońca nie byłoby tlenu na Ziemi?")
-            why_low = why_res["reply"].lower()
-            self.assertFalse(why_low.startswith("najprościej mówiąc:"))
-            self.assertIn("fotosyntez", why_low)
-            self.assertIn("tlen", why_low)
+            # Reload into a new SleepingBrain instance
+            brain2 = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
+            self.assertEqual(brain2.day, brain.day)
+            self.assertEqual(brain2.total_sleeps, brain.total_sleeps)
+            self.assertEqual(len(brain2.hippocampus.semantic), len(brain.hippocampus.semantic))
+            self.assertEqual(len(brain2.hippocampus.rem), len(brain.hippocampus.rem))
 
-            # 3) Comparison query
-            comp = brain.chat("Porównaj pamięć RAM i dysk SSD")
-            comp_low = comp["reply"].lower()
-            self.assertFalse(comp_low.startswith("najprościej mówiąc:"))
-            self.assertIn("ram", comp_low)
-            self.assertIn("ssd", comp_low)
-            self.assertIn("tymczasow", comp_low)
-            self.assertIn("trwał", comp_low)
+        # Legacy token-based checkpoint migration test
+        with tempfile.TemporaryDirectory() as tmp_legacy:
+            state_dir = Path(tmp_legacy) / "brain_state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            legacy_pt = state_dir / "brain_weights.pt"
+            legacy_json = state_dir / "brain_memory.json"
+            torch.save({"concept_cortex": {"id_to_concept": ["stary_token"]}, "language_cortex": {"tokenizer": {}}}, legacy_pt)
+            legacy_json.write_text(json.dumps({"embedding_version": "standalone_pytorch_v1", "day": 9}), encoding="utf-8")
 
-            # 4) Yes/No grounded query
-            yn = brain.chat("Czy dźwięk rozchodzi się w próżni?")
-            yn_low = yn["reply"].lower()
-            self.assertTrue(yn_low.startswith("**nie.**"), f"Expected '**Nie.**', got: {yn['reply']}")
-            self.assertIn("próżni", yn_low)
-
-            # 5) Multi-part factual query
-            mp = brain.chat("Kto dowodził pod Grunwaldem i kiedy to było?")
-            mp_low = mp["reply"].lower()
-            self.assertIn("jagiełł", mp_low)
-            self.assertIn("1410", mp_low)
-
-            # 6) Self-capability query (must NOT give dictionary definition or '/ucz pliki' fallback)
-            cap = brain.chat("mozesz pliki przeszukiwac?")
-            cap_low = cap["reply"].lower()
-            self.assertNotIn("/ucz pliki", cap_low)
-            self.assertNotIn("nie wiem jeszcze", cap_low)
-            self.assertNotIn("czasowniki przechodnie", cap_low)
-            self.assertTrue("plik" in cap_low or "dostępu" in cap_low)
-
-    def test_code_request_and_followup_context(self):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        cfg = BrainConfig(nrem_concept_epochs=15, cortex_sleep_epochs=2, language_bootstrap_epochs=2)
-        with tempfile.TemporaryDirectory() as tmp:
-            brain = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
-            brain.auto_web = False
-            prime_fact = "Liczba pierwsza to liczba naturalna większa od 1, która ma dokładnie dwa dzielniki: 1 oraz samą siebie."
-            win_noise = "Wybierz Wyszukaj na pasku zadań lub naciśnij klawisz Windows na klawiaturze i wpisz nazwę aplikacji lub programu."
-            embs = brain.language_cortex.encode_texts([prime_fact, win_noise])
-            brain.hippocampus.record_memory(prime_fact, "wiedza", 5, day=1, embedding=embs[0])
-            brain.hippocampus.record_memory(win_noise, "nauka_z_sieci", 4, day=1, embedding=embs[1])
-
-            res1 = brain.chat("napisz program w cpp ktory liczy liczby pierwsze")
-            r1 = res1["reply"]
-            self.assertIn("```cpp", r1)
-            self.assertIn("czyPierwsza", r1)
-            self.assertIn("int main()", r1)
-            self.assertIn("dzielniki", r1.lower())
-            self.assertNotIn("pasku zadań", r1.lower())
-
-            res2 = brain.chat("napisz program w cpp który to robi")
-            r2 = res2["reply"]
-            self.assertIn("```cpp", r2)
-            self.assertIn("czyPierwsza", r2)
-            self.assertNotIn("/ucz", r2.lower())
-            self.assertNotIn("pasku zadań", r2.lower())
-
-            res3 = brain.chat("napisz program w pythonie do sterowania rakietą na Marsa")
-            r3 = res3["reply"].lower()
-            self.assertNotIn("pasku zadań", r3)
-            self.assertNotIn("/ucz", r3)
-            self.assertIn("pytorch", r3)
-
-    def test_creativity_and_informational_sleep_without_fatigue(self):
-        cfg = BrainConfig(
-            nrem_concept_epochs=25,
-            cortex_sleep_epochs=4,
-            language_bootstrap_epochs=2,
-            rem_similarity_threshold=-1.0,
-            auto_sleep_pending_threshold=4,
-            creativity_level=0.85,
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            brain = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
-            brain.auto_web = False
-
-            # 1) Chatting & teaching facts must NOT drain energy or enter DROWSY
-            for fact in (
-                "Fotosynteza to proces wykorzystujący światło słoneczne do wytwarzania glukozy oraz tlenu w roślinach.",
-                "Układ oddechowy to układ pobierający tlen i dostarczający go do komórek organizmu.",
-                "Komputer to maszyna przetwarzająca informacje w procesorze i zapisująca je w pamięci.",
-            ):
-                res = brain.chat(fact)
-                self.assertEqual(brain.energy, 100.0)
-                self.assertEqual(brain.state_mode, "AWAKE")
-                self.assertFalse(res["slept"])
-                self.assertNotIn("śpiący", res["reply"].lower())
-                self.assertNotIn("zmęczony", res["reply"].lower())
-
-            brain.hippocampus.record_fact("fotosynteza", "wytwarza", "tlen", day=1)
-            brain.hippocampus.record_fact("układ oddechowy", "pobiera", "tlen", day=1)
-            brain.hippocampus.record_fact("komputer", "przetwarza", "informacje", day=1)
-            brain.hippocampus.record_fact("rośliny", "przeprowadzają", "fotosynteza", day=1)
-
-            snap_before = brain.snapshot()
-            score_before = snap_before["creativity_score"]
-            self.assertEqual(snap_before["energy"], 100.0)
-            self.assertGreaterEqual(snap_before["pending_info_to_link"], 3)
-
-            # 2) Sleep is strictly for linking & consolidating information (NREM + REM + creative analogies)
-            rep = brain.sleep_now(visual_pacing=False)
-            self.assertEqual(brain.energy, 100.0)
-            self.assertEqual(brain.state_mode, "AWAKE")
-            self.assertGreaterEqual(len(rep.rem_new_links), 1)
-            self.assertTrue(any(l.get("rel") == "kreatywna_analogia" for l in rep.rem_new_links))
-
-            snap_after = brain.snapshot()
-            self.assertGreater(snap_after["creativity_score"], score_before)
-
-            # 3) Creative query triggers 'creative' intent and produces grounded creative analogy
-            intent_info = brain.language_cortex.analyze_query_intent(
-                "Wymyśl kreatywną analogię między fotosyntezą a oddychaniem"
-            )
-            self.assertEqual(intent_info["intent"], "creative")
-            creative_res = brain.chat("Wymyśl kreatywną analogię między fotosyntezą a oddychaniem")
-            cr_low = creative_res["reply"].lower()
-            self.assertTrue(
-                any(w in cr_low for w in ("analogia", "twórcz", "kreatywn", "pomost", "tlen")),
-                f"Expected creative grounded answer, got: {creative_res['reply']}",
-            )
-            self.assertNotIn("śpiący", cr_low)
-
-            # 4) Auto-sleep triggers only when pending info reaches auto_sleep_pending_threshold
-            auto_res = brain.chat("Gwiazdy to ciała niebieskie świecące dzięki reakcjom termojądrowym w swoim wnętrzu.")
-            self.assertFalse(auto_res["slept"])
-            brain.chat("Księżyc to naturalny satelita krążący wokół Ziemi i wywołujący pływy morskie.")
-            brain.chat("Ocean to wielki zbiornik wodny regulujący klimat na powierzchni Ziemi.")
-            trig_res = brain.chat("Wulkan to miejsce na powierzchni Ziemi wydobywające magmę z głębi płaszcza.")
-            self.assertTrue(trig_res["slept"])
-            self.assertEqual(brain.energy, 100.0)
-            self.assertEqual(brain.state_mode, "AWAKE")
+            cfg_l = BrainConfig(language_bootstrap_epochs=0, broca_layers=2, broca_heads=4, broca_ff_dim=512)
+            migrated = SleepingBrain(cfg=cfg_l, base_dir=tmp_legacy, load_language_mode="sync")
+            self.assertEqual(migrated.day, 1)
+            self.assertTrue(migrated.language_cortex.ready)
+            pt_baks = list(state_dir.glob("brain_weights.pt.legacy_*.bak"))
+            json_baks = list(state_dir.glob("brain_memory.json.legacy_*.bak"))
+            self.assertEqual(len(pt_baks), 1)
+            self.assertEqual(len(json_baks), 1)
 
 
 class TestWebLearner(unittest.TestCase):
@@ -427,9 +321,19 @@ class TestWebLearner(unittest.TestCase):
         self.assertEqual(clean_search_query("wzkaźniki w cpp"), "wskaźniki w C++")
         self.assertEqual(clean_search_query("node.ks"), "Node.js")
 
-        doc = WebDocument(title="Wskaźnik", url="https://example.org", text="Wskaźnik w języku C++ przechowuje adres w pamięci programu.", source="wikipedia_pl")
+        doc = WebDocument(
+            title="Wskaźnik",
+            url="https://example.org",
+            text="Wskaźnik w języku C++ przechowuje adres w pamięci programu.",
+            source="wikipedia_pl",
+        )
         self.assertTrue(is_relevant_doc(doc, "wskazniki w cpp"))
-        bad_doc = WebDocument(title="Wskaźnik P/E", url="https://example.org/pe", text="Wskaźnik giełdowy cena do zysku spółki.", source="wikipedia_pl")
+        bad_doc = WebDocument(
+            title="Wskaźnik P/E",
+            url="https://example.org/pe",
+            text="Wskaźnik giełdowy cena do zysku spółki.",
+            source="wikipedia_pl",
+        )
         self.assertFalse(is_relevant_doc(bad_doc, "wskazniki w cpp"))
         self.assertIsNotNone(extract_lead_definition(doc))
 
@@ -445,187 +349,760 @@ class TestWebLearner(unittest.TestCase):
             srv.server_close()
 
 
-class TestSleepingBrainAndServer(unittest.TestCase):
-    def test_real_state_migration_and_server_sse(self):
-        # 1) Read-only copy of user's real brain_state migrates & answers in Polish without Ollama
-        real_state = Path(__file__).resolve().parent.parent / "brain_state"
-        if (real_state / "brain_memory.json").exists() and (real_state / "brain_weights.pt").exists():
-            with tempfile.TemporaryDirectory() as tmp_copy:
-                dst_state = Path(tmp_copy) / "brain_state"
-                dst_state.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(real_state / "brain_memory.json", dst_state / "brain_memory.json")
-                shutil.copy2(real_state / "brain_weights.pt", dst_state / "brain_weights.pt")
-                b_real = SleepingBrain(base_dir=tmp_copy, load_language_mode="sync")
-                self.assertGreaterEqual(b_real.day, 1)
-                snap_real = b_real.snapshot()
-                self.assertIn("nodes", snap_real["graph"])
-                # Anti-hallucination on unlearned topic when Auto-web is disabled
-                b_real.auto_web = False
-                unk_real = b_real.chat("co to jest kwark powabny")
-                self.assertIn("/ucz", unk_real["reply"])
-                # Conversational Polish small-talk & typo tolerance
-                wow_res = b_real.chat("wow")
-                self.assertNotIn("/ucz", wow_res["reply"])
-                compliment_res = b_real.chat("moadry jestes")
-                self.assertNotIn("/szkola", compliment_res["reply"])
+class TestHTTPServerSSEAndPretrainScript(unittest.TestCase):
+    def test_server_endpoints_real_sse_and_pretrain_smoke(self):
+        """
+        5) Test serwera HTTP/SSE i skryptu pre-trainingu:
+           /api/state, realne strumieniowanie /api/chat/stream, /api/sleep,
+           /api/memory/add, /api/memory/delete oraz 1-epokowy smoke test scripts/pretrain_broca.py.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BrainConfig(
+                language_bootstrap_epochs=1,
+                cortex_sleep_epochs=1,
+                nrem_sleep_steps=8,
+                broca_layers=2,
+                broca_heads=4,
+                broca_ff_dim=512,
+                broca_max_new_bytes=40,
+            )
+            brain = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
+            static_dir = Path(__file__).resolve().parent.parent / "static"
+            srv_wrap = BrainServer(brain=brain, static_dir=static_dir, port=0)
+            httpd = srv_wrap.create_server()
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            base_url = f"http://127.0.0.1:{httpd.server_port}"
+            try:
+                # GET /api/state
+                st = json.loads(urllib.request.urlopen(f"{base_url}/api/state", timeout=10).read().decode("utf-8"))
+                lc = st["language_cortex"]
+                self.assertTrue(lc["ready"])
+                self.assertEqual(lc["num_columns"], cfg.num_columns)
+                self.assertGreater(lc["wernicke_params"], 0)
+                self.assertGreater(lc["cortex_params"], 0)
+                self.assertGreater(lc["broca_params"], 0)
+                self.assertGreaterEqual(lc["sdr_sparsity_pct"], 3.0)
+                self.assertLessEqual(lc["sdr_sparsity_pct"], 5.0)
 
-        # 2) Direct URL study + sleep GPU loss + BrainServer SSE & CRUD
-        web_srv = _start_test_web_server()
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                cfg = BrainConfig(nrem_concept_epochs=25, cortex_sleep_epochs=8)
-                brain = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
-                brain.working_chat = [
-                    {"role": "user", "content": "Cześć, mam na imię Janek."},
-                    {"role": "assistant", "content": "Cześć Janek!"},
-                    {"role": "user", "content": "Co to foton?"},
-                    {"role": "assistant", "content": "Nie wiem dokładnie co to foton — użyj /ucz foton."},
-                ]
-                article_url = f"http://127.0.0.1:{web_srv.server_port}/article.html"
-                res = brain.study_topic_online(article_url, max_rounds=1, consolidate_after=True)
-                self.assertEqual(res["pages_read"], 1)
-                self.assertGreaterEqual(res["facts_learned"], 2)
-                self.assertIsNotNone(res["sleep_report"])
-                self.assertTrue(res["sleep_report"]["lora_trained"])
-                self.assertLess(res["sleep_report"]["lora_loss_end"], res["sleep_report"]["lora_loss_start"])
+                # POST /api/memory/add & /api/memory/delete
+                req_add = urllib.request.Request(
+                    f"{base_url}/api/memory/add",
+                    data=json.dumps({"text": "Żółć gęślą jaźń — test engramu SDR.", "category": "wiedza"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                added = json.loads(urllib.request.urlopen(req_add, timeout=10).read().decode("utf-8"))
+                self.assertTrue(added["ok"])
+                mem_id = added["memory"]["id"]
 
-                contents = [t["content"] for t in brain.working_chat]
-                self.assertTrue(any("Janek" in c for c in contents))
-                self.assertFalse(any("Nie wiem dokładnie co to foton" in c for c in contents))
-
-                static_dir = Path(__file__).resolve().parent.parent / "static"
-                server_wrapper = BrainServer(brain=brain, static_dir=static_dir, port=0)
-                httpd = server_wrapper.create_server()
-                t = threading.Thread(target=httpd.serve_forever, daemon=True)
-                t.start()
-                srv_url = f"http://127.0.0.1:{httpd.server_port}"
-                try:
-                    st = json.loads(urllib.request.urlopen(f"{srv_url}/api/state", timeout=5).read().decode("utf-8"))
-                    self.assertTrue(st["language_cortex"]["ready"])
-                    self.assertGreater(st["language_cortex"]["total_params"], 1_000_000)
-
-                    exp = json.loads(urllib.request.urlopen(f"{srv_url}/api/export", timeout=5).read().decode("utf-8"))
-                    self.assertIn("semantic_memories", exp)
-
-                    req_add = urllib.request.Request(
-                        f"{srv_url}/api/memory/add",
-                        data=json.dumps({"text": "Zasada: zawsze używaj TypeScript.", "category": "zasada"}).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    added = json.loads(urllib.request.urlopen(req_add, timeout=5).read().decode("utf-8"))
-                    self.assertTrue(added["ok"])
-                    mem_id = added["memory"]["id"]
-
-                    req_del = urllib.request.Request(
-                        f"{srv_url}/api/memory/delete",
-                        data=json.dumps({"id": mem_id}).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    deleted = json.loads(urllib.request.urlopen(req_del, timeout=5).read().decode("utf-8"))
-                    self.assertTrue(deleted["deleted"])
-
-                    req_stream = urllib.request.Request(
-                        f"{srv_url}/api/chat/stream",
-                        data=json.dumps({"message": "co to jest foton"}).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(req_stream, timeout=10) as resp:
-                        raw_sse = resp.read().decode("utf-8")
-                    events = [
-                        json.loads(line[5:].strip())
-                        for line in raw_sse.splitlines()
-                        if line.startswith("data:")
-                    ]
-                    ev_types = [e["type"] for e in events]
-                    self.assertIn("meta", ev_types)
-                    self.assertIn("token", ev_types)
-                    self.assertEqual(ev_types[-1], "done")
-                    self.assertIn("cząstką", events[-1]["reply"].lower())
-
-                    # Screenshot regression: 'ale co' must have 0 unrelated semantic memory pills
-                    ale_co = brain.chat("ale co")
-                    self.assertEqual(ale_co["recalled_memories"]["semantic"], [])
-                    self.assertNotIn("/ucz ale co", ale_co["reply"].lower())
-
-                    cap_chat = brain.chat("o czy moge z toba rozmiac")
-                    self.assertNotIn("/ucz o czy", cap_chat["reply"].lower())
-
-                    # POST /api/curriculum (Elementary School pack + GPU training + idempotency)
-                    train_timeout = 60 if torch.cuda.is_available() else 420
-                    req_curr = urllib.request.Request(
-                        f"{srv_url}/api/curriculum",
-                        data=json.dumps({"deep_web": False}).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    curr = json.loads(urllib.request.urlopen(req_curr, timeout=train_timeout).read().decode("utf-8"))
-                    self.assertTrue(curr["ok"])
-                    self.assertGreaterEqual(curr["added_facts"], 80)
-                    self.assertGreaterEqual(curr["added_triples"], 70)
-                    self.assertTrue(curr["sleep_report"]["lora_trained"])
-
-                    # Re-applying /api/curriculum is idempotent (0 duplicates)
-                    curr2 = json.loads(urllib.request.urlopen(
+                # Add two more so sleep & REM have rich pairs
+                for txt in (
+                    "Fotosynteza produkuje tlen z dwutlenku węgla i wody.",
+                    "Wskaźnik w C++ przechowuje adres obiektu w pamięci.",
+                ):
+                    urllib.request.urlopen(
                         urllib.request.Request(
-                            f"{srv_url}/api/curriculum",
-                            data=json.dumps({"deep_web": False}).encode("utf-8"),
+                            f"{base_url}/api/memory/add",
+                            data=json.dumps({"text": txt, "category": "wiedza"}).encode("utf-8"),
                             headers={"Content-Type": "application/json"},
                             method="POST",
                         ),
-                        timeout=15,
-                    ).read().decode("utf-8"))
-                    self.assertEqual(curr2["added_facts"], 0)
+                        timeout=10,
+                    ).read()
 
-                    # Elementary school Q&A after GPU consolidation
-                    self.assertIn("warszawa", brain.chat("jaka jest stolica Polski")["reply"].lower())
-                    foto = brain.chat("na czym polega fotosynteza")["reply"].lower()
-                    self.assertTrue("tlen" in foto or "glukoz" in foto)
-                    self.assertTrue(any(w in brain.chat("ile planet ma Układ Słoneczny")["reply"].lower() for w in ("ośmiu", "8", "merkury")))
-                    self.assertIn("966", brain.chat("kiedy był chrzest Polski")["reply"].lower())
+                req_del = urllib.request.Request(
+                    f"{base_url}/api/memory/delete",
+                    data=json.dumps({"id": mem_id}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                deleted = json.loads(urllib.request.urlopen(req_del, timeout=10).read().decode("utf-8"))
+                self.assertTrue(deleted["deleted"])
 
-                    # Contextual follow-up across turns ("kto to był Mikołaj Kopernik?" -> "a kiedy żył?")
-                    kop1 = brain.chat("kto to był Mikołaj Kopernik?")["reply"]
-                    self.assertIn("kopernik", kop1.lower())
-                    kop2 = brain.chat("a kiedy żył?")["reply"]
-                    self.assertTrue("1473" in kop2 or "1543" in kop2, f"Expected Kopernik years in follow-up, got: {kop2}")
+                # POST /api/sleep
+                req_sleep = urllib.request.Request(
+                    f"{base_url}/api/sleep",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                sleep_res = json.loads(urllib.request.urlopen(req_sleep, timeout=30).read().decode("utf-8"))
+                self.assertTrue(sleep_res["ok"])
+                rep = sleep_res["report"]
+                self.assertIn("prediction_error_start", rep)
+                self.assertIn("prediction_error_end", rep)
+                self.assertIn("pruned_synapses", rep)
+                self.assertIn("active_synapses", rep)
+                self.assertIn("broca_loss_start", rep)
+                self.assertIn("broca_loss_end", rep)
 
-                    # Human 1st/2nd person style & brain naming
-                    name_ack = brain.chat("Twoje imię to Krzysztof, a ja mam na imię Kuba")["reply"]
-                    self.assertNotIn("użytkownik ma na imię", name_ack.lower())
-                    self.assertIn("krzysztof", name_ack.lower())
-                    self.assertIn("krzysztof", brain.chat("jak masz na imię?")["reply"].lower())
+                # POST /api/chat/stream (real UTF-8 streaming from BrocaByteTransformer)
+                req_stream = urllib.request.Request(
+                    f"{base_url}/api/chat/stream",
+                    data=json.dumps({"message": "Żółć gęślą jaźń — co wiesz o fotosyntezie?"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_stream, timeout=20) as resp:
+                    raw_sse = resp.read().decode("utf-8")
+                events = [
+                    json.loads(line[5:].strip())
+                    for line in raw_sse.splitlines()
+                    if line.startswith("data:")
+                ]
+                ev_types = [e["type"] for e in events]
+                self.assertIn("meta", ev_types)
+                self.assertIn("token", ev_types)
+                self.assertEqual(ev_types[-1], "done")
+                streamed_reply = "".join(e.get("delta", "") for e in events if e["type"] == "token").strip()
+                self.assertEqual(streamed_reply, events[-1]["reply"])
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
 
-                    # Episodic conversation memory across sleep ("pamiętasz co wczenij pisalimi?")
-                    brain.chat("Dzisiaj piszę grę kosmiczną w Pythonie i chciałbym dodać grawitację.")
-                    brain.sleep_now(visual_pacing=False)
-                    ep_ans = brain.chat("pamiętasz co wczenij pisalimi?")["reply"].lower()
-                    self.assertTrue(
-                        any(w in ep_ans for w in ("kosmiczn", "python", "grawitacj", "kopernik", "krzysztof")),
-                        f"Expected episodic recall, got: {ep_ans}",
+        # 1-epoch smoke test of scripts/pretrain_broca.py with streaming UTF-8 .txt corpus
+        with tempfile.TemporaryDirectory() as tmp_pre:
+            corpus_file = Path(tmp_pre) / "pl_corpus.txt"
+            corpus_file.write_text(
+                "\n".join(
+                    [
+                        "Żółć gęślą jaźń — polska ortografia i znaki diakrytyczne w UTF-8.",
+                        "Wskaźnik w C++ wskazuje adres komórki pamięci operacyjnej RAM.",
+                        "Fotosynteza zamienia światło słoneczne, wodę i dwutlenek węgla w glukozę oraz tlen.",
+                        "Podczas snu NREM kora asocjacyjna wykonuje lokalne uczenie predykcyjne i homeostazę SHY.",
+                        "Faza REM łączy odległe engramy SDR w nowe stany atraktora sieci Hopfielda.",
+                    ]
+                    * 4
+                ),
+                encoding="utf-8",
+            )
+            chunks = list(iter_utf8_text_chunks(corpus_file, chunk_chars=220, max_chunks=10))
+            self.assertEqual(len(chunks), 10)
+
+            script_path = Path(__file__).resolve().parent.parent / "scripts" / "pretrain_broca.py"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script_path),
+                    "--data",
+                    str(corpus_file),
+                    "--base-dir",
+                    str(tmp_pre),
+                    "--epochs",
+                    "1",
+                    "--batch-size",
+                    "8",
+                    "--max-chunks",
+                    "16",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+            self.assertEqual(proc.returncode, 0, f"pretrain_broca failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+            self.assertIn("[pretrain_broca] GOTOWE", proc.stdout)
+            self.assertTrue((Path(tmp_pre) / "brain_state" / "brain_weights.pt").exists())
+
+    def test_polish_parquet_streaming_and_train_parquet_endpoint(self):
+        """
+        6) Strumieniowy trening polskiego i gramatyki z Parquet:
+           - weryfikacja detekcji i filtrowania realnego train-00000-of-00006.parquet (jeśli istnieje),
+           - pełny test POST /api/train_parquet + spadek loss na lokalnym pliku .parquet.
+        """
+        import time
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from brain.language_trainer import inspect_parquet_corpus, iter_parquet_polish_pairs
+
+        real_pq = Path(__file__).resolve().parent.parent / "train-00000-of-00006.parquet"
+        if real_pq.exists():
+            info = inspect_parquet_corpus(real_pq)
+            self.assertTrue(info["exists"])
+            self.assertGreater(info["num_rows"], 1000)
+            sample_pairs = list(iter_parquet_polish_pairs(real_pq, max_pairs=16))
+            self.assertEqual(len(sample_pairs), 16)
+            self.assertTrue(any(s == t for s, t in sample_pairs))
+            self.assertTrue(any(s != t for s, t in sample_pairs))
+
+        real_pq2 = Path(__file__).resolve().parent.parent / "000_00000.parquet"
+        if real_pq2.exists():
+            info2 = inspect_parquet_corpus(real_pq2)
+            self.assertTrue(info2["exists"])
+            self.assertTrue(info2["has_quality_score"])
+            self.assertGreater(info2["num_rows"], 1000)
+            sample_pairs2 = list(iter_parquet_polish_pairs(real_pq2, max_pairs=12))
+            self.assertEqual(len(sample_pairs2), 12)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mini_pq = Path(tmp) / "train-00000-of-00006.parquet"
+            mini_pq2 = Path(tmp) / "000_00000.parquet"
+            table = pa.table(
+                {
+                    "id": ["1", "2", "3"],
+                    "title": ["Gramatyka", "Składnia", "Ortografia"],
+                    "text": [
+                        "Język polski należy do rodziny języków słowiańskich i posiada bogatą odmianę przez przypadki. "
+                        "Poprawna gramatyka pozwala budować jasne i zrozumiałe zdania w codziennej komunikacji. "
+                        "Rzeczowniki odmieniają się przez siedem przypadków oraz dwie liczby.",
+                        "Składnia opisuje zasady łączenia wyrazów w spójne wypowiedzenia pojedyncze i złożone. "
+                        "Podmiot oraz orzeczenie tworzą główny trzon każdego zdania w języku polskim. "
+                        "Właściwa interpunkcja ułatwia szybkie zrozumienie myśli autora tekstu.",
+                        "Polska ortografia obejmuje znaki diakrytyczne takie jak ą, ć, ę, ł, ń, ó, ś, ź oraz ż. "
+                        "Regularne czytanie dobrej literatury rozwija styl oraz zasób słownictwa.",
+                    ],
+                }
+            )
+            pq.write_table(table, mini_pq)
+
+            table2 = pa.table(
+                {
+                    "text": [
+                        "Śmieciowy post na forum z bardzo niską oceną jakości powinien zostać odfiltrowany.",
+                        "Polska literatura piękna zachwyca bogactwem metafor, rytmem zdań oraz głębią psychologiczną bohaterów. "
+                        "Dobra proza uczy naturalnego szyku wyrazów i precyzyjnego wyrażania myśli.",
+                    ],
+                    "quality_score": [0.05, 0.96],
+                    "language_score": [0.99, 0.999],
+                }
+            )
+            pq.write_table(table2, mini_pq2)
+
+            # Verify quality_score filtering skips row 0 (0.05 < 0.45) and keeps row 1 (0.96)
+            filtered_pairs = list(iter_parquet_polish_pairs(mini_pq2, max_pairs=10, min_quality_score=0.45))
+            self.assertGreaterEqual(len(filtered_pairs), 2)
+            self.assertFalse(any("Śmieciowy post" in s for s, _ in filtered_pairs))
+
+            cfg = BrainConfig(
+                language_bootstrap_epochs=0,
+                broca_layers=2,
+                broca_heads=4,
+                broca_ff_dim=512,
+            )
+            brain = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
+            static_dir = Path(__file__).resolve().parent.parent / "static"
+            srv_wrap = BrainServer(brain=brain, static_dir=static_dir, port=0)
+            httpd = srv_wrap.create_server()
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            base_url = f"http://127.0.0.1:{httpd.server_port}"
+            try:
+                st = json.loads(urllib.request.urlopen(f"{base_url}/api/state", timeout=10).read().decode("utf-8"))
+                self.assertTrue(st["parquet_corpus"]["exists"])
+                self.assertEqual(st["parquet_corpus"]["file_count"], 2)
+                self.assertEqual(st["parquet_corpus"]["total_rows"], 5)
+
+                req_pq = urllib.request.Request(
+                    f"{base_url}/api/train_parquet",
+                    data=json.dumps({"filename": "__ALL__", "max_steps": 20, "batch_size": 4}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                started = json.loads(urllib.request.urlopen(req_pq, timeout=10).read().decode("utf-8"))
+                self.assertTrue(started["ok"])
+                self.assertTrue(started["started"])
+                self.assertEqual(len(started["files"]), 2)
+
+                # Wait for async background training to complete
+                deadline = time.monotonic() + 30.0
+                while time.monotonic() < deadline:
+                    cur_st = json.loads(urllib.request.urlopen(f"{base_url}/api/state", timeout=10).read().decode("utf-8"))
+                    if not cur_st["study"]["active"]:
+                        break
+                    time.sleep(0.15)
+                self.assertFalse(cur_st["study"]["active"])
+                self.assertGreater(cur_st["language_cortex"]["trained_steps"], 0)
+                self.assertGreater(cur_st["language_cortex"]["fluency"], 0.0)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_z_star_conditioning_no_cross_attention_collapse_and_dialogue_finetune(self):
+        """
+        7) Test warunkowania Z* (brak Cross-Attention collapse) + faza dostrajania dialogowego:
+           - BASE_HUMAN_DIALOGUES >= 150 par i akceptacja krótkich wejść od 2 znaków ('ok', 'pa', 'siema'),
+           - ujednolicona norma RMSNorm na Z* w BiologicalAssociativeCortex.perceive_and_think(),
+           - rozkład logitsów Broki dla 'cześć' vs 'co to jest fotosynteza' wyraźnie się różni,
+           - dostrajanie dialogowe (train_language_now) obniża loss dla krótkich pytań i Q&A.
+        """
+        import torch.nn.functional as F
+
+        from brain.language_trainer import BASE_HUMAN_DIALOGUES, build_dialogue_qa_pairs
+        from brain.sensory_wernicke import BOS_BYTE
+
+        self.assertGreaterEqual(len(BASE_HUMAN_DIALOGUES), 150)
+        qa_pairs = build_dialogue_qa_pairs(include_curriculum=True, min_chars=2)
+        self.assertGreaterEqual(len(qa_pairs), 580)
+        q_set = {q.lower() for q, _ in qa_pairs}
+        self.assertIn("ok", q_set)
+        self.assertIn("siema", q_set)
+        self.assertIn("cześć", q_set)
+        self.assertIn("ale kto", q_set)
+        self.assertIn("co to jest teoria względności?", q_set)
+        self.assertIn("czym różni się cpu od gpu?", q_set)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BrainConfig(
+                language_bootstrap_epochs=0,
+                broca_layers=2,
+                broca_heads=4,
+                broca_ff_dim=512,
+            )
+            self.assertAlmostEqual(cfg.broca_temperature, 0.55, places=2)
+            self.assertAlmostEqual(cfg.broca_top_p, 0.85, places=2)
+            self.assertAlmostEqual(cfg.broca_repetition_penalty, 1.18, places=2)
+
+            brain = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
+
+            # Train short dialogue + Q&A phase through Wernicke -> Cortex -> Broca (lr=1e-4, ls=0.05)
+            tr = brain.train_language_now(epochs=14)
+            self.assertTrue(tr["trained"])
+            self.assertGreaterEqual(tr["dialogues"], 350)
+            self.assertLess(tr["loss_end"], tr["loss_start"])
+
+            # Verify Z* conditioning on two distinct prompts: "cześć" vs "co to jest fotosynteza"
+            w1 = brain.language_cortex.perceive_one("cześć")
+            w2 = brain.language_cortex.perceive_one("co to jest fotosynteza")
+            t1 = brain.cortex.perceive_and_think(
+                w1.columns, w1.sdr, engram_bank=None, sdr_to_columns_fn=brain.language_cortex.wernicke_module.sdr_to_columns
+            )
+            t2 = brain.cortex.perceive_and_think(
+                w2.columns, w2.sdr, engram_bank=None, sdr_to_columns_fn=brain.language_cortex.wernicke_module.sdr_to_columns
+            )
+
+            # Unified RMSNorm scale on Z*
+            rms1 = float(t1.columns_star.pow(2).mean(dim=-1).sqrt().mean().item())
+            rms2 = float(t2.columns_star.pow(2).mean(dim=-1).sqrt().mean().item())
+            self.assertGreater(rms1, 0.90)
+            self.assertLess(rms1, 1.10)
+            self.assertGreater(rms2, 0.90)
+            self.assertLess(rms2, 1.10)
+
+            # Z* representations themselves must stay sharply separated (no rank-1 collapse)
+            z_cos = float(F.cosine_similarity(t1.columns_star.flatten(1), t2.columns_star.flatten(1)).item())
+            self.assertLess(z_cos, 0.72, f"Z* collapsed across distinct prompts! cos={z_cos:.4f}")
+
+            # Broca logits at <BOS> must diverge clearly between "cześć" and "co to jest fotosynteza"
+            bos = torch.tensor([[BOS_BYTE]], dtype=torch.long, device=brain.device)
+            brain.language_cortex.broca_module.eval()
+            with torch.no_grad():
+                logits1 = brain.language_cortex.broca_module(bos, t1.columns_star)[:, -1, :].float()
+                logits2 = brain.language_cortex.broca_module(bos, t2.columns_star)[:, -1, :].float()
+                p1 = F.softmax(logits1 / cfg.broca_temperature, dim=-1)
+                p2 = F.softmax(logits2 / cfg.broca_temperature, dim=-1)
+                l1_dist = float((p1 - p2).abs().sum().item())
+                max_logit_diff = float((logits1 - logits2).abs().max().item())
+
+            self.assertGreater(l1_dist, 0.25, f"Cross-Attention collapse detected! L1(p1, p2)={l1_dist:.4f}")
+            self.assertGreater(max_logit_diff, 0.50, f"Broca logits barely depend on Z*! max_diff={max_logit_diff:.4f}")
+
+    def test_working_memory_sdr_self_critique_and_creativity_control(self):
+        """
+        8) Test rozszerzonej beztokenowej pamięci tymczasowej SDR, wielościeżkowego myślenia
+           z pętlą samokrytyki Wernicke → Broca oraz żywej kontroli kreatywności (/api/control).
+        """
+        from brain.language_cortex import LanguageCortex
+
+        default_cfg = BrainConfig()
+        self.assertGreaterEqual(default_cfg.max_short_term_memories, 50000)
+        self.assertGreaterEqual(default_cfg.max_semantic_memories, 200000)
+        self.assertGreaterEqual(default_cfg.working_chat_window, 128)
+        self.assertGreaterEqual(default_cfg.working_chat_buffer, 256)
+        self.assertEqual(default_cfg.working_sdr_capacity, 64)
+        self.assertGreaterEqual(default_cfg.max_input_bytes, 4096)
+        self.assertGreaterEqual(default_cfg.broca_llm_max_new_tokens, 2048)
+        self.assertEqual(default_cfg.num_neurons, 12288)
+        self.assertFalse(default_cfg.use_local_llm_broca)
+        self.assertTrue(default_cfg.self_correction_enabled)
+
+        # Polish quality critic must clearly separate clean Polish from loop garbage
+        good_q = LanguageCortex.score_polish_quality(
+            "Fotosynteza to proces biologiczny, w którym rośliny wytwarzają glukozę ze światła.",
+            creativity_level=0.7,
+        )
+        loop_q = LanguageCortex.score_polish_quality(
+            "ciekawe ciekawe ciekawe i ciekawe ciekawe i ciekawe",
+            creativity_level=0.7,
+        )
+        self.assertGreater(good_q, loop_q + 0.35, f"Expected clean Polish > loop garbage: {good_q} vs {loop_q}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BrainConfig(
+                language_bootstrap_epochs=1,
+                broca_layers=2,
+                broca_heads=4,
+                broca_ff_dim=512,
+                broca_max_new_bytes=48,
+                self_critique_candidates=3,
+            )
+            brain = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
+            brain.auto_sleep = False
+            brain.auto_web = False
+
+            # Direct multi-path deliberation + Wernicke auditory feedback
+            delib = brain.language_cortex.deliberate_and_critique(
+                user_message="Co to jest foton?",
+                cortex=brain.cortex,
+                engram_bank=None,
+                creativity_level=0.8,
+                base_temperature=0.60,
+                max_new_bytes=36,
+                num_candidates=3,
+            )
+            self.assertEqual(len(delib["candidates"]), 3)
+            labels = [c["label"] for c in delib["candidates"]]
+            self.assertEqual(labels, ["Precyzyjna", "Kontekstowa", "Kreatywna"])
+            self.assertGreaterEqual(len(delib["critique_notes"]), 4)
+            self.assertTrue(any("Słyszę" in n for n in delib["critique_notes"]))
+
+            # Multi-turn chat populates the Prefrontal Working Memory SDR Ring (user + assistant SDRs)
+            res1 = brain.chat("Opowiedz o komputerach i procesorach.")
+            self.assertGreaterEqual(len(brain._working_sdr_ring), 2)
+            self.assertTrue(any("Samokontrola końcowa" in line for line in res1["thinking"]))
+            self.assertTrue(any("Pamięć robocza SDR:" in line for line in res1["thinking"]))
+
+            res2 = brain.chat("Dlaczego?")
+            self.assertGreaterEqual(len(brain._working_sdr_ring), 4)
+
+            snap = brain.snapshot()
+            self.assertEqual(snap["memory"]["working_sdr_count"], len(brain._working_sdr_ring))
+            self.assertEqual(snap["limits"]["working_sdr_capacity"], 64)
+            self.assertGreaterEqual(snap["limits"]["short_term_memories"], 50000)
+
+            # Conversational online plasticity: giving the brain a name should adapt Broca with ZERO Wernicke drift
+            res_name = brain.chat("okej to nadaje ci imie: Krzysztof")
+            self.assertTrue(any("plastyczność konwersacyjna" in line.lower() for line in res_name["thinking"]))
+            self.assertGreater(brain.language_cortex._known_q_sdrs.shape[0], 0)
+            self.assertFalse(brain._is_question_or_command("okej to nadaje ci imie: Krzysztof"))
+            self.assertTrue(brain._is_question_or_command("jak masz na imie"))
+
+            # Live creativity update via HTTP /api/control
+            static_dir = Path(__file__).resolve().parent.parent / "static"
+            srv_wrap = BrainServer(brain=brain, static_dir=static_dir, port=0)
+            httpd = srv_wrap.create_server()
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            base_url = f"http://127.0.0.1:{httpd.server_port}"
+            try:
+                req = urllib.request.Request(
+                    f"{base_url}/api/control",
+                    data=json.dumps({"creativity_level": 0.92}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                ctrl = json.loads(urllib.request.urlopen(req, timeout=10).read().decode("utf-8"))
+                self.assertTrue(ctrl["ok"])
+                self.assertAlmostEqual(brain.creativity_level, 0.92, places=2)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_hybrid_local_broca_llm_prompt_and_config(self):
+        """
+        9) Test integracji hybrydowego obszaru Broki (LocalPolishBrocaLLM):
+           - dynamiczne budowanie kontekstu biologicznego (Dzień, kreatywność, pamięć SDR, REM)
+           - wieloturowa historia rozmowy bez stałych tekstów w kodzie.
+        """
+        from brain.broca_llm import LocalPolishBrocaLLM
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BrainConfig(use_local_llm_broca=True)
+            llm = LocalPolishBrocaLLM(cfg=cfg, device=torch.device("cpu"), lora_dir=Path(tmp) / "lora")
+            self.assertEqual(llm.model_id, "MassivDash/Bielik-4.5B-v3-heretic")
+            self.assertGreaterEqual(cfg.broca_llm_max_new_tokens, 2048)
+            sys_p = llm.build_system_prompt(
+                day=5,
+                total_sleeps=4,
+                creativity_level=0.85,
+                recalled_semantic=["Fotosynteza zachodzi w chloroplastach roślin."],
+                recalled_hippo=["Użytkownik nadał mi imię Krzysztof."],
+                recalled_rem=["Skojarzenie REM między światłem a pamięcią."],
+                sdr_sparsity_pct=4.0,
+            )
+            self.assertIn("Dzień 5", sys_p)
+            self.assertIn("85%", sys_p)
+            self.assertIn("Krzysztof", sys_p)
+            self.assertIn("Fotosynteza", sys_p)
+
+            msgs = llm._build_chat_messages(
+                sys_p,
+                [{"role": "user", "content": "Siema co tam!"}, {"role": "assistant", "content": "Siema! Wszystko gra."}],
+                "SUEPR to co robimy",
+            )
+            self.assertEqual(len(msgs), 4)
+            self.assertEqual(msgs[0]["role"], "system")
+            self.assertEqual(msgs[-1]["content"], "SUEPR to co robimy")
+
+    def test_living_brain_neurogenesis_curiosity_neuromod_and_budget_compaction(self):
+        """
+        10) Test Living Brain (M1/M2/M4 bez backprop):
+            - zero requires_grad (wyłącznie lokalna reguła Oja-Hebba + Predictive Coding)
+            - dynamiczna neurogeneza (wzrost L1/L2/L3/Assoc/M4 bez sztywnego limitu)
+            - zaskoczenie (L3->L2->L1), predictive suppression, ciekawość M4 i eksploracja nudy
+            - neuromodulacja NA/DA/ACh, offline sleep replay (M2->M1) i zmęczenie neuronów
+            - dynamiczny budżet pamięci (68 MB - 32 GB), przełączanie GPU/RAM oraz natychmiastowe
+              przycinanie i kompaktowanie tensorów przy obniżeniu suwaka!
+        """
+        from brain.living_brain import LivingBrainEngine
+
+        lb = LivingBrainEngine(
+            sensory_dim=256,
+            target_device="gpu" if torch.cuda.is_available() else "ram",
+            memory_budget_mb=2048.0,
+            start_background_clock=False,
+        )
+        # 1) Strictly zero backpropagation parameters anywhere
+        for attr in ("W_in_L1", "G_10", "W_12", "G_21", "W_23", "G_32", "W_3a", "W_assoc_rec", "m4_prototypes"):
+            self.assertFalse(getattr(lb, attr).requires_grad)
+
+        init_neurons = lb.total_neurons_count()
+        init_mb = lb.living_memory_mb()
+
+        # 2) Drive novel surprising stimuli -> triggers M2 encoding + structural neurogenesis
+        tel_list = []
+        for i in range(6):
+            stim = torch.randn(256)
+            tel_list.append(lb.cognitive_step(sensory_vec=stim, external_valence=0.4, allow_growth=True))
+        self.assertGreater(lb.total_neurons_count(), init_neurons, "Neurogenesis should grow neuron count dynamically")
+        self.assertGreater(int(lb.m2_assoc_traces.shape[0]), 0, "Surprising episodes should encode into M2")
+        self.assertTrue(any(t.surprise > 0.0 for t in tel_list))
+        self.assertGreater(lb.last_telemetry.mean_fatigue, 0.0)
+
+        # 3) Explicit growth pushes memory up, then lowering slider to 68 MB compacts tensors immediately!
+        for _ in range(4):
+            lb.grow_structure(add_l1=512, add_l2=384, add_l3=256, add_assoc=384, add_m4=64)
+        grown_neurons = lb.total_neurons_count()
+        grown_mb = lb.living_memory_mb()
+        self.assertGreater(grown_neurons, init_neurons)
+        self.assertGreater(grown_mb, init_mb)
+
+        # Test sleep replay M2 -> M1 + SHY pruning + fatigue reset
+        rep = lb.sleep_consolidate_replay(replay_steps=6)
+        self.assertGreater(rep["replayed_episodes"], 0)
+        self.assertEqual(float(lb.fatigue_l1.abs().max().item()), 0.0)
+
+        # Test RAM/GPU device switch + lowering budget to 68 MB triggers controlled compaction
+        res_ram = lb.set_memory_budget(budget_mb=68.0, target_device="ram")
+        self.assertEqual(res_ram["target_device"], "ram")
+        self.assertLessEqual(res_ram["living_mb"], 68.0)
+        if torch.cuda.is_available():
+            res_gpu = lb.set_memory_budget(budget_mb=1024.0, target_device="gpu")
+            self.assertEqual(res_gpu["target_device"], "gpu")
+
+    def test_priority1_living_projection_neuromod_and_pinned_core(self):
+        """
+        11) Test Priorytetu 1:
+            - bezpośrednia adaptacyjna projekcja rosnącego LivingBrainEngine (state_assoc + top-3 M2) do Z*
+              (z zachowaniem RMSNorm i bez awarii przy grow_structure()),
+            - sterowanie krokami atraktora i temperaturą przez NA oraz ścieżką Kreatywną przez ciekawość M4,
+            - dopaminowe lekkie wzmocnienie online przy czystej samokrytyce + aktywny zegar tła,
+            - pełna ochrona pinned=True w Hippocampus (sen + capacity), LivingBrainEngine (m2_pinned + compaction)
+              oraz LanguageCortex (_learned_qa_replay przy >200 wpisach).
+        """
+        import time
+
+        from brain.hippocampus import EngramMeta, Hippocampus
+        from brain.living_brain import LivingBrainEngine, LivingStepTelemetry, NeuromodulatorState
+
+        # 1) LivingBrainEngine -> Z* adaptive projection across neurogenesis growth
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BrainConfig(
+                language_bootstrap_epochs=0,
+                broca_layers=2,
+                broca_heads=4,
+                broca_ff_dim=512,
+                broca_max_new_bytes=36,
+            )
+            brain = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
+            brain.auto_sleep = False
+            brain.auto_web = False
+            try:
+                # Background spontaneous clock must be running automatically
+                self.assertIsNotNone(brain.living_brain._bg_thread)
+                self.assertTrue(brain.living_brain._bg_thread.is_alive())
+                t0_ticks = brain.living_brain.tick_count
+                time.sleep(0.8)
+                self.assertGreater(brain.living_brain.tick_count, t0_ticks)
+
+                w = brain.language_cortex.perceive_one("Co to jest fotosynteza?")
+                base_thought = brain.cortex.perceive_and_think(
+                    w.columns,
+                    w.sdr,
+                    engram_bank=None,
+                    sdr_to_columns_fn=brain.language_cortex.wernicke_module.sdr_to_columns,
+                    steps=3,
+                )
+
+                # Drive LivingBrain with stimuli + M2 traces, then project into Z*
+                for _ in range(4):
+                    brain.living_brain.cognitive_step(
+                        sensory_vec=torch.randn(512),
+                        external_valence=0.4,
+                        allow_growth=False,
                     )
+                assoc_v1 = brain.living_brain.get_cortical_association_vector(top_k_m2=3)
+                self.assertEqual(int(assoc_v1.numel()), brain.living_brain.n_assoc)
 
-                    # Self-training endpoint POST /api/train_language
-                    req_tr = urllib.request.Request(
-                        f"{srv_url}/api/train_language",
-                        data=json.dumps({"epochs": 10}).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    tr_res = json.loads(urllib.request.urlopen(req_tr, timeout=train_timeout).read().decode("utf-8"))
-                    self.assertTrue(tr_res["ok"])
-                    self.assertLess(tr_res["loss_end"], tr_res["loss_start"])
-                    self.assertGreater(tr_res["fluency"], 40.0)
-                    st2 = json.loads(urllib.request.urlopen(f"{srv_url}/api/state", timeout=5).read().decode("utf-8"))
-                    self.assertGreater(st2["language_cortex"]["fluency"], 40.0)
+                th_lb1 = brain.cortex.perceive_and_think(
+                    w.columns,
+                    w.sdr,
+                    engram_bank=None,
+                    sdr_to_columns_fn=brain.language_cortex.wernicke_module.sdr_to_columns,
+                    steps=3,
+                    living_assoc_vec=assoc_v1,
+                    living_blend=0.10,
+                )
+                diff1 = float((th_lb1.columns_star - base_thought.columns_star).abs().mean().item())
+                self.assertGreater(diff1, 1e-3, "LivingBrain projection should genuinely modify Z*")
+                rms1 = float(th_lb1.columns_star.pow(2).mean(dim=-1).sqrt().mean().item())
+                self.assertGreater(rms1, 0.90)
+                self.assertLess(rms1, 1.10)
+
+                # Grow LivingBrain structure dynamically -> n_assoc changes, projection stays size-independent!
+                old_assoc_n = brain.living_brain.n_assoc
+                born = brain.living_brain.grow_structure(add_l1=64, add_l2=48, add_l3=32, add_assoc=64, add_m4=16)
+                self.assertGreater(born, 0)
+                self.assertEqual(brain.living_brain.n_assoc, old_assoc_n + 64)
+                brain.living_brain.cognitive_step(sensory_vec=torch.randn(512), external_valence=0.5, allow_growth=False)
+                assoc_v2 = brain.living_brain.get_cortical_association_vector(top_k_m2=3)
+                self.assertEqual(int(assoc_v2.numel()), old_assoc_n + 64)
+                th_lb2 = brain.cortex.perceive_and_think(
+                    w.columns,
+                    w.sdr,
+                    engram_bank=None,
+                    sdr_to_columns_fn=brain.language_cortex.wernicke_module.sdr_to_columns,
+                    steps=3,
+                    living_assoc_vec=assoc_v2,
+                    living_blend=0.10,
+                )
+                self.assertEqual(tuple(th_lb2.columns_star.shape), tuple(base_thought.columns_star.shape))
+
+                # 2) Neuromodulator control: High NA -> 6 attractor steps + lower T; High Curiosity -> higher Creative T
+                high_na = NeuromodulatorState(noradrenaline=2.2, dopamine=0.5, acetylcholine=0.8)
+                high_pe_tel = LivingStepTelemetry(surprise=0.80, intrinsic_curiosity=0.10, boredom_exploration=False)
+                th_na = brain.cortex.perceive_and_think(
+                    w.columns,
+                    w.sdr,
+                    engram_bank=None,
+                    sdr_to_columns_fn=brain.language_cortex.wernicke_module.sdr_to_columns,
+                    steps=3,
+                    neuromod=high_na,
+                    living_telemetry=high_pe_tel,
+                )
+                self.assertEqual(th_na.attractor_steps, 6)
+
+                delib_na = brain.language_cortex.deliberate_and_critique(
+                    user_message="Co to jest fotosynteza?",
+                    cortex=brain.cortex,
+                    engram_bank=None,
+                    creativity_level=0.5,
+                    base_temperature=0.62,
+                    max_new_bytes=28,
+                    num_candidates=3,
+                    living_assoc_vec=assoc_v2,
+                    neuromod=high_na,
+                    living_telemetry=high_pe_tel,
+                )
+                self.assertEqual(delib_na["thought"].attractor_steps, 6)
+                prec_na_t = next(c["temperature"] for c in delib_na["candidates"] if c["label"] == "Precyzyjna")
+
+                low_na = NeuromodulatorState(noradrenaline=0.30, dopamine=0.7, acetylcholine=0.4)
+                high_cur_tel = LivingStepTelemetry(surprise=0.15, intrinsic_curiosity=0.95, boredom_exploration=True)
+                delib_cur = brain.language_cortex.deliberate_and_critique(
+                    user_message="Co to jest fotosynteza?",
+                    cortex=brain.cortex,
+                    engram_bank=None,
+                    creativity_level=0.5,
+                    base_temperature=0.62,
+                    max_new_bytes=28,
+                    num_candidates=3,
+                    living_assoc_vec=assoc_v2,
+                    neuromod=low_na,
+                    living_telemetry=high_cur_tel,
+                )
+                prec_low_t = next(c["temperature"] for c in delib_cur["candidates"] if c["label"] == "Precyzyjna")
+                cre_na_t = next(c["temperature"] for c in delib_na["candidates"] if c["label"] == "Kreatywna")
+                cre_cur_t = next(c["temperature"] for c in delib_cur["candidates"] if c["label"] == "Kreatywna")
+                self.assertLess(prec_na_t, prec_low_t, "High NA should lower sampling temperature for factual precision")
+                self.assertGreater(cre_cur_t, cre_na_t, "High curiosity / boredom exploration should raise Creative temperature")
+
+                # 3) Pinned identity memories via chat ("nadaję ci imię: Krzysztof") survive >200 replay writes & compaction
+                brain.chat("nadaję ci imię: Krzysztof")
+                self.assertIn("jak masz na imię", brain.language_cortex._pinned_qa_keys)
+                self.assertTrue(any(m.pinned for m in brain.hippocampus.short_term.meta))
+                self.assertGreater(int(brain.living_brain.m2_pinned.sum().item()), 0)
+
+                # Push >210 unpinned pairs into _learned_qa_replay — pinned identity pairs MUST NOT be evicted!
+                flood_pairs = [(f"pytanie testowe numer {i}", f"To jest odpowiedź testowa numer {i}.") for i in range(215)]
+                brain.language_cortex.adapt_qa_pairs_online(flood_pairs[:2], cortex=brain.cortex, steps=4, pinned=False, lightweight=True)
+                # Directly exercise buffer cap logic with 215 unpinned entries appended via adapt_qa_pairs_online
+                with brain.language_cortex._op_lock:
+                    brain.language_cortex._learned_qa_replay.extend(flood_pairs)
+                brain.language_cortex.adapt_qa_pairs_online(
+                    [("kolejne pytanie testowe", "To jest kolejna odpowiedź testowa.")],
+                    cortex=brain.cortex,
+                    steps=4,
+                    pinned=False,
+                    lightweight=True,
+                )
+                replay_qs = {q.lower() for q, _ in brain.language_cortex._learned_qa_replay}
+                self.assertIn("jak masz na imię", replay_qs)
+                self.assertIn("jak się nazywasz", replay_qs)
+
+                # Checkpoint save/load preserves pinned flags across Hippocampus, LivingBrain & LanguageCortex
+                brain.save_state()
+                brain2 = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
+                try:
+                    self.assertIn("jak masz na imię", brain2.language_cortex._pinned_qa_keys)
+                    self.assertTrue(any(m.pinned for m in brain2.hippocampus.short_term.meta))
+                    self.assertGreater(int(brain2.living_brain.m2_pinned.sum().item()), 0)
                 finally:
-                    httpd.shutdown()
-                    httpd.server_close()
-        finally:
-            web_srv.shutdown()
-            web_srv.server_close()
+                    brain2.living_brain.stop_spontaneous_clock()
+            finally:
+                brain.living_brain.stop_spontaneous_clock()
+
+        # 4) Hippocampus pinned immunity: _enforce_capacity() & consolidate_nrem_light_gpu()
+        hippo = Hippocampus(num_neurons=128, sdr_k=8, max_short_term_memories=20, max_semantic_memories=4, device=torch.device("cpu"))
+        pinned_sdr = torch.zeros(128)
+        pinned_sdr[:8] = 1.0
+        hippo.semantic.add_batch(
+            sdrs=pinned_sdr.unsqueeze(0),
+            metas=[EngramMeta(id="pin01", category="zasada", preview_label="Moje imię to Krzysztof", pinned=True)],
+            strengths=[0.05],  # below prune_threshold=0.18!
+            importances=[1.0],  # low importance!
+            day=1,
+        )
+        # Add 6 high-priority unpinned engrams to exceed max_semantic_memories=4
+        for i in range(6):
+            v = torch.zeros(128)
+            v[10 + i * 8 : 18 + i * 8] = 1.0
+            hippo.semantic.add_batch(
+                sdrs=v.unsqueeze(0),
+                metas=[EngramMeta(id=f"unp{i}", category="wiedza", preview_label=f"Fakt {i}", pinned=False)],
+                strengths=[5.0],
+                importances=[5.0],
+                day=2,
+            )
+        self.assertIn("pin01", [m.id for m in hippo.semantic.meta], "Pinned engram must survive _enforce_capacity()")
+        hippo.consolidate_nrem_light_gpu(decay=0.5, prune_threshold=0.5, current_day=10)
+        pin_idx = [m.id for m in hippo.semantic.meta].index("pin01")
+        self.assertAlmostEqual(float(hippo.semantic.strengths[pin_idx].item()), 0.05, places=4)
+
+        # 5) LivingBrainEngine m2_pinned immunity during budget compaction to 68 MB & _prune_weak_episodes()
+        lb = LivingBrainEngine(sensory_dim=256, target_device="ram", memory_budget_mb=2048.0, start_background_clock=False)
+        lb.cognitive_step(sensory_vec=torch.randn(256), external_valence=0.5, allow_growth=False, pinned=True)
+        lb.cognitive_step(sensory_vec=torch.randn(256), external_valence=0.5, allow_growth=False, pinned=True)
+        pinned_before = int(lb.m2_pinned.sum().item())
+        self.assertGreaterEqual(pinned_before, 1)
+        for _ in range(18):
+            lb.cognitive_step(sensory_vec=torch.randn(256), external_valence=0.1, allow_growth=False, pinned=False)
+        for _ in range(4):
+            lb.grow_structure(add_l1=512, add_l2=384, add_l3=256, add_assoc=384, add_m4=64)
+        lb.set_memory_budget(budget_mb=68.0, target_device="ram")
+        lb._prune_weak_episodes(fraction=0.80)
+        self.assertEqual(int(lb.m2_pinned.sum().item()), pinned_before, "m2_pinned episodes must survive compaction & pruning!")
 
 
 if __name__ == "__main__":

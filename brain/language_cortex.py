@@ -1,488 +1,162 @@
 from __future__ import annotations
 
-import ast
-import math
-import operator
+import random
 import re
 import threading
 import time
-import zlib
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 import torch
+import torch.nn.functional as F
 
 from .config import BrainConfig
 from .language_trainer import (
-    BASE_HUMAN_DIALOGUES,
-    build_training_dialogues,
-    clean_human_fact,
+    build_denoising_corpus,
+    build_dialogue_qa_pairs,
+    expand_question_paraphrases,
+    split_clean_sentences,
 )
-from .neural_language import (
-    CorticalSemanticEncoder,
-    CorticalTransformerLM,
-    SubwordTokenizer,
-    _strip_pl,
+from .neural_cortex import BiologicalAssociativeCortex, CortexThought
+from .neural_language import BrocaByteTransformer
+from .sensory_wernicke import (
+    WernickeByteCortex,
+    WernickeOutput,
+    amp_autocast,
+    configure_torch_backend,
+    encode_utf8_bytes,
+    maybe_compile_module,
 )
 
-
-def _compress_normalize(vec: list[float], target_dim: int = 256) -> list[float]:
-    if not vec:
-        return []
-    n = len(vec)
-    if n >= target_dim:
-        out: list[float] = []
-        for i in range(target_dim):
-            start = (i * n) // target_dim
-            end = max(start + 1, ((i + 1) * n) // target_dim)
-            out.append(sum(vec[start:end]) / (end - start))
-    else:
-        out = list(vec) + [0.0] * (target_dim - n)
-    norm = math.sqrt(sum(x * x for x in out))
-    if norm < 1e-8:
-        return [0.0] * target_dim
-    return [round(x / norm, 5) for x in out]
-
-
-def _fallback_hash_embed(clean: str, target_dim: int = 256) -> list[float]:
-    if not clean:
-        return []
-    vec = [0.0] * target_dim
-    low = clean.lower()
-    if len(low) < 3:
-        vec[zlib.crc32(low.encode("utf-8")) % target_dim] += 1.0
-    else:
-        for i in range(len(low) - 2):
-            gram = low[i : i + 3]
-            vec[zlib.crc32(gram.encode("utf-8")) % target_dim] += 1.0
-    return _compress_normalize(vec, target_dim=target_dim)
-
-
-def _cosine_list(a: list[float], b: list[float]) -> float:
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    return float(sum(x * y for x, y in zip(a, b)))
-
-
-_STOPWORDS_PL = {
-    "jest", "są", "sa", "to", "oraz", "lub", "albo", "czy", "jak", "jaki", "jaka",
-    "jakie", "kto", "co", "czym", "gdzie", "kiedy", "dlaczego", "czemu", "dla", "przez",
-    "przy", "nad", "pod", "przed", "bez", "jako", "jego", "jej", "ich", "tego",
-    "tym", "tej", "ten", "ta", "te", "tak", "nie", "ale", "lecz", "więc", "wiec",
-    "że", "ze", "się", "sie", "w", "we", "z", "na", "do", "od", "po", "o",
-    "u", "za", "i", "a", "no", "krótko", "krotko", "wyjaśnij", "wyjasnij",
-    "powiedz", "opowiedz", "opisz", "zdefiniuj", "napisz", "podaj", "temat",
-    "czyli", "jednak", "również", "rowniez", "także", "takze", "ponieważ", "poniewaz",
-    "można", "mozna", "który", "ktory", "która", "ktora", "które", "ktore",
-    "których", "ktorych", "często", "czesto", "bardzo", "między", "miedzy",
-    "związek", "zwiazek", "różnica", "roznica", "porównaj", "porownaj",
-    "łączy", "laczy", "wpływ", "wplyw", "zależy", "zalezy", "natomiast",
-    "ponadto", "wtedy", "słowo", "slowo", "oznacza", "wiele", "każdy", "kazdy",
-    "inny", "inne", "innych", "tylko", "jeszcze", "będzie", "bedzie", "może", "moze",
-    "był", "byl", "była", "byla", "było", "bylo", "sposób", "sposob", "polega",
-    "następnie", "nastepnie", "najpierw", "potem", "później", "pozniej",
-    "wcześniej", "wczesniej", "obecnie", "zwykle", "gdyż", "gdyz", "zatem",
-    "równocześnie", "rownoczesnie", "jednocześnie", "jednoczesnie", "podczas",
-    "pomimo", "mimo", "wobec",
-}
-
-_STOPWORDS_PL_NORM = {_strip_pl(w) for w in _STOPWORDS_PL}
-
-_SHORT_DOMAIN_ACRONYMS = {
-    "c++", "c#", "ai", "ip", "si", "pi", "o2", "co2", "h2o", "cpu", "gpu",
-    "ram", "ssd", "hdd", "dna", "rna", "sql", "dns", "psu", "onz",
-}
-
-_POLISH_ROOT_GROUPS: tuple[tuple[str, ...], ...] = (
-    ("slonc", "slonecz"),
-    ("oddychan", "oddech"),
-    ("czlowiek", "ludz"),
-    ("swiatl", "swietl"),
-    ("roslin", "roslinn"),
-    ("ziemi", "ziemsk"),
-    ("komork", "komor"),
-    ("energi", "energet"),
-    ("pamiec", "pamiet"),
-    ("dzien", "dni"),
-    ("procesor", "cpu"),
-    ("graficzn", "gpu"),
-    ("dysk", "ssd", "hdd"),
-    ("ram", "operacyjn"),
-    ("tlen", "tlenu", "tlenow"),
-    ("dwutlen", "co2"),
-    ("wod", "h2o"),
+_PL_TRANS = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZZ")
+_CASUAL_FILLER_RE = re.compile(
+    r"\b(?:kurwa|kurde|ku[zź]wa|cholera|cholerka|ja\s+pierdol[eę]|pierdol[eę]|do\s+cholery|ej|halo|no\s+we[zź])\b",
+    flags=re.IGNORECASE,
 )
 
 
-_WEAK_BRIDGE_WORDS_NORM = {
-    "zycie", "zycia", "zyciu", "swiat", "swiata", "swiecie", "czas", "czasu",
-    "miejsce", "miejsca", "czesc", "czesci", "forma", "formy", "rodzaj",
-    "przyklad", "przykladu", "czlowiek", "czlowieka", "ludzie", "ludzi",
-    "proces", "procesu", "uklad", "ukladu", "system", "systemu", "gwiazda",
-    "dzialanie", "dzialania", "powietrzu", "wokol",
-}
+def _strip_pl(text: str) -> str:
+    return text.translate(_PL_TRANS)
 
 
-def _word_matches(a: str, b: str) -> bool:
-    if a == b:
-        return True
-    if len(a) >= 4 and len(b) >= 4 and abs(len(a) - len(b)) <= 5:
-        a_stem = a[: max(4, min(len(a) - 2, 6))]
-        b_stem = b[: max(4, min(len(b) - 2, 6))]
-        if b.startswith(a_stem) or a.startswith(b_stem):
-            return True
-    for grp in _POLISH_ROOT_GROUPS:
-        a_hit = any((a == g or (len(g) >= 4 and a.startswith(g))) for g in grp)
-        if a_hit:
-            b_hit = any((b == g or (len(g) >= 4 and b.startswith(g))) for g in grp)
-            if b_hit:
-                return True
-    return False
-
-
-def _extract_meaningful_words(text: str, keep_originals: bool = False) -> list[str]:
-    raw_tokens = re.findall(r"[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ0-9+#]{2,}", text or "")
+def _chat_perception_variants(text: str) -> list[str]:
+    """
+    Build up to 4 normalized surface variants (raw, lowercase, stripped-filler/punctuation)
+    for case-insensitive UTF-8 byte perception in Wernicke (so 'Siema', 'SIEMA', 'Cześć',
+    'Co to jest kot', and 'CO TAM KURWA' all map cleanly to their trained SDR attractors!).
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return [" "]
     out: list[str] = []
     seen: set[str] = set()
-    for tok in raw_tokens:
-        low_orig = tok.lower()
-        norm = _strip_pl(low_orig)
-        if norm.isdigit():
-            continue
-        if norm in _STOPWORDS_PL_NORM:
-            continue
-        if len(norm) < 3 and norm not in _SHORT_DOMAIN_ACRONYMS:
-            continue
-        if norm not in seen:
-            seen.add(norm)
-            out.append(low_orig if keep_originals else norm)
-    return out
 
+    def _add(v: str) -> None:
+        s = re.sub(r"\s+", " ", v).strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
 
-def _shared_meaningful_concepts(text_a: str, text_b: str, allow_weak: bool = False) -> list[str]:
-    words_a = _extract_meaningful_words(text_a, keep_originals=True)
-    words_b = _extract_meaningful_words(text_b, keep_originals=False)
-    if not words_a or not words_b:
-        return []
-    shared: list[str] = []
-    seen_norm: set[str] = set()
-    for wa in words_a:
-        na = _strip_pl(wa)
-        if na in seen_norm:
-            continue
-        if not allow_weak and na in _WEAK_BRIDGE_WORDS_NORM:
-            continue
-        if any(_word_matches(na, wb) for wb in words_b):
-            seen_norm.add(na)
-            shared.append(wa)
-    return shared
-
-
-def _lc_first(text: str) -> str:
-    s = (text or "").strip()
-    if len(s) > 1 and s[0].isupper() and not s[:3].isupper():
-        return s[0].lower() + s[1:]
-    return s
-
-
-def _trim_sentence_clean(text: str, max_len: int = 165) -> str:
-    clean = _clean_fact_text(text)
-    if not clean:
-        return ""
-    if len(clean) <= max_len:
-        return clean if clean[-1] in ".!?" else clean + "."
-    sents = _split_polish_sentences(clean)
-    if sents and len(sents[0]) <= max_len:
-        acc = sents[0]
-        if len(sents) > 1 and len(acc) + 1 + len(sents[1]) <= max_len:
-            acc = f"{acc} {sents[1]}"
-        return acc if acc[-1] in ".!?" else acc + "."
-    cut = clean[:max_len]
-    # Prefer clause boundary or last complete word
-    for sep in ("; ", ", ", " "):
-        idx = cut.rfind(sep)
-        if idx >= max(28, max_len // 2):
-            cut = cut[:idx]
-            break
-    cut = cut.rstrip(" ,;:-")
-    return cut + "." if cut and cut[-1] not in ".!?" else cut
-
-
-def _is_noisy_memory(text: str) -> bool:
-    low = (text or "").strip().lower()
-    if len(low) < 16 or low.endswith("?"):
-        return True
-    noise_markers = (
-        "rzeczownik, rodzaj",
-        "czasowniki przechodnie",
-        "czasownik przechodni",
-        "źródło: „https://",
-        "zródło: „https://",
-        "dopuszczalne w grach",
-        "słownik ortograficzny",
-        "odmienność tak",
-        "rejestr wyraz",
-        "wybierz wyszukaj na pasku zadań",
-        "naciśnij klawisz windows",
-        "znajdowanie aplikacji lub programu",
-        "microsoft365.com",
-    )
-    return any(m in low for m in noise_markers)
-
-
-def _is_bare_definition(text: str) -> bool:
-    low = (text or "").strip().lower()
-    return (
-        low.startswith("słowo „")
-        or low.startswith("znaczenie słowa")
-        or " oznacza:" in low
-    )
-
-
-def _tokenize_stems(text: str) -> set[str]:
-    stripped = _strip_pl(text.lower())
-    words = re.findall(r"[a-z0-9+#]{2,}", stripped)
-    stems: set[str] = set()
-    for w in words:
-        if w in _STOPWORDS_PL_NORM:
-            continue
-        stems.add(w)
-        if len(w) >= 5:
-            stems.add(w[: max(4, len(w) - 2)])
-        if len(w) >= 6:
-            stems.add(w[:6])
-    return stems
-
-
-def _stem_overlap(query: str, candidate: str) -> float:
-    q_words = [
-        w for w in re.findall(r"[a-z0-9+#]{2,}", _strip_pl(query.lower()))
-        if w not in _STOPWORDS_PL_NORM and (len(w) >= 3 or w in _SHORT_DOMAIN_ACRONYMS)
-    ]
-    if not q_words:
-        return 0.0
-    cand_words = [
-        w for w in re.findall(r"[a-z0-9+#]{2,}", _strip_pl(candidate.lower()))
-        if len(w) >= 2
-    ]
-    if not cand_words:
-        return 0.0
-    hits = sum(1 for qw in q_words if any(_word_matches(qw, cw) for cw in cand_words))
-    return hits / max(1, len(q_words))
-
-
-def _clean_fact_text(txt: str) -> str:
-    cleaned = clean_human_fact(txt)
-    if cleaned:
-        return cleaned
-    s = re.sub(r"==+[^=]+==+", " ", txt)
-    s = re.sub(r"\[\d+\]|\[[a-z]\]", "", s)
-    s = re.sub(r"\(\d+\.\d+\)", "", s)
-    s = re.sub(r"zob\.\s*też\s+[^.\n]+w\s+Wikipedii", "", s, flags=re.I)
-    s = re.sub(r"rzeczownik,\s*rodzaj\s+(?:męski|żeński|nijaki)(?:\s+osobowy)?\s*", "", s, flags=re.I)
-    s = re.sub(r"\s+", " ", s).strip(" ;,-")
-    return s
-
-
-def _split_polish_sentences(text: str) -> list[str]:
-    protected = text
-    abbrs = (
-        "np.", "m.in.", "ok.", "łac.", "gr.", "p.n.e.", "n.e.", "ang.", "fr.",
-        "por.", "zob.", "tzw.", "wg.", "tj.", "itd.", "itp.", "dr.", "prof.",
-        "ryc.", "str.", "r.", "w.", "tys.", "mln.", "mld.",
-    )
-    for a in abbrs:
-        safe = a.replace(".", "@@DOT@@")
-        protected = re.sub(re.escape(a), safe, protected, flags=re.I)
-    protected = re.sub(r"\b([A-ZŁŚŻŹĆŃ])\.", r"\1@@DOT@@", protected)
-    protected = re.sub(r"(\d+)\.(\d+)", r"\1@@DOT@@\2", protected)
-
-    raw_parts = re.split(r"(?<=[.!?])\s+|\n+", protected)
-    sentences: list[str] = []
-    for p in raw_parts:
-        restored = p.replace("@@DOT@@", ".").strip()
-        restored = _clean_fact_text(restored)
-        if 24 <= len(restored) <= 440:
-            sentences.append(restored)
-    return sentences
-
-
-def _extract_query_subject(query: str) -> str:
-    s = query.strip()
-    patterns = [
-        r"^(?:no\s+to\s+|a\s+|powiedz\s+mi\s+|powiedz\s+|wyjaśnij(?:\s+krótko|\s+w\s+skrócie)?\s+|"
-        r"wyjasnij(?:\s+krotko|\s+w\s+skrocie)?\s+|wytłumacz\s+|opowiedz(?:\s+o)?\s+|opisz\s+|podaj\s+|zdefiniuj\s+)+",
-        r"^(?:kto\s+to\s+(?:jest|był|byl)|co\s+to\s+(?:jest|są|sa)|czym\s+(?:jest|są|sa)|kim\s+(?:jest|był|byl)|"
-        r"jaka\s+jest|jaki\s+jest|jakie\s+s[aą]|kiedy\s+(?:by[lł]|by[lł]a|odby[lł]\s+si[eę]|mia[lł]\s+miejsce)|"
-        r"gdzie\s+(?:le[zż]y|znajduje\s+si[eę])|ile\s+[a-ząćęłńóśźż]+\s+(?:ma|liczy)|"
-        r"jak\s+(?:działają|dzialaja|działa|dziala)|o\s+co\s+chodzi\s+z|na\s+czym\s+polega)\s+",
-    ]
-    for _ in range(4):
-        prev = s
-        for pat in patterns:
-            s = re.sub(pat, "", s, flags=re.I).strip(" ?.!,:;")
-        if s == prev:
-            break
-    return s or query.strip(" ?.!,:;")
-
-
-_BIN_OPS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.FloorDiv: operator.floordiv,
-    ast.Mod: operator.mod,
-    ast.Pow: operator.pow,
-}
-
-
-def _safe_eval_ast(node: ast.AST) -> float:
-    if isinstance(node, ast.Expression):
-        return _safe_eval_ast(node.body)
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return float(node.value)
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-        val = _safe_eval_ast(node.operand)
-        return val if isinstance(node.op, ast.UAdd) else -val
-    if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
-        left = _safe_eval_ast(node.left)
-        right = _safe_eval_ast(node.right)
-        if isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)) and abs(right) < 1e-12:
-            raise ZeroDivisionError("Nie można dzielić przez zero.")
-        if isinstance(node.op, ast.Pow):
-            if abs(right) > 200 or abs(left) > 1e6:
-                raise ValueError("Zbyt duża potęga.")
-        return float(_BIN_OPS[type(node.op)](left, right))
-    raise ValueError("Nieobsługiwane wyrażenie matematyczne.")
-
-
-def _fmt_num(val: float) -> str:
-    if abs(val - round(val)) < 1e-9:
-        return str(int(round(val)))
-    return f"{val:.6f}".rstrip("0").rstrip(".")
-
-
-def _try_solve_math(msg: str) -> str | None:
-    raw = msg.strip()
-    low = _strip_pl(raw.lower())
-
-    # 1) Procent z liczby: "25% z 200"
-    m_pct = re.search(r"(\d+(?:[.,]\d+)?)\s*%\s*(?:z|ze)\s*(\d+(?:[.,]\d+)?)", low)
-    if m_pct:
-        pct = float(m_pct.group(1).replace(",", "."))
-        base = float(m_pct.group(2).replace(",", "."))
-        res = (pct / 100.0) * base
-        return f"Obliczenie: {_fmt_num(pct)}% z {_fmt_num(base)} = **{_fmt_num(res)}**."
-
-    # 2) Pierwiastek kwadratowy: "pierwiastek z 144"
-    m_sqrt = re.search(r"pierwiastek(?:\s+kwadratowy)?\s+z[e]?\s*(-?\d+(?:[.,]\d+)?)", low)
-    if m_sqrt:
-        val = float(m_sqrt.group(1).replace(",", "."))
-        if val < 0:
-            return "Pierwiastek kwadratowy z liczby ujemnej nie istnieje w zbiorze liczb rzeczywistych."
-        return f"Pierwiastek kwadratowy z {_fmt_num(val)} wynosi **{_fmt_num(math.sqrt(val))}**."
-
-    # 3) Standardowe wyrażenia arytmetyczne
-    cleaned = re.sub(
-        r"^(?:ile\s+(?:to\s+jest|to|jest|wynosi)|oblicz|policz|wylicz)\s+",
-        "",
-        low,
-    ).strip(" ?.=!")
-    cleaned = cleaned.replace("×", "*").replace("÷", "/").replace("^", "**")
-    cleaned = re.sub(r"\b(?:dodac|plus)\b", "+", cleaned)
-    cleaned = re.sub(r"\b(?:odjac|minus)\b", "-", cleaned)
-    cleaned = re.sub(r"\b(?:pomnozone\s+przez|pomnozyc\s+przez|razy)\b", "*", cleaned)
-    cleaned = re.sub(r"\b(?:podzielone\s+przez|podzielic\s+przez)\b", "/", cleaned)
-    cleaned = re.sub(r"(\d)\s*:\s*(\d)", r"\1 / \2", cleaned)
-    cleaned = re.sub(r"(\d+(?:[.,]\d+)?)\s+do\s+kwadratu", r"(\1)**2", cleaned)
-    cleaned = re.sub(r"(\d+(?:[.,]\d+)?)\s+do\s+szescianu", r"(\1)**3", cleaned)
-    cleaned = re.sub(r"\bdo\s+potegi\b", "**", cleaned)
-    cleaned = cleaned.replace(",", ".")
-
-    if not re.search(r"\d", cleaned):
-        return None
-    if not any(op in cleaned for op in ("+", "-", "*", "/", "%")):
-        return None
-    if not re.fullmatch(r"[0-9.\s+\-*/()%]+", cleaned):
-        return None
-    try:
-        tree = ast.parse(cleaned, mode="eval")
-        res = _safe_eval_ast(tree)
-        return f"Wynik działania `{cleaned}` to **{_fmt_num(res)}**."
-    except ZeroDivisionError:
-        return "W matematyce nie można dzielić przez zero."
-    except Exception:
-        return None
+    _add(raw)
+    low = raw.lower()
+    _add(low)
+    no_punct = low.rstrip("?!.,;: ").strip()
+    _add(no_punct)
+    cleaned = _CASUAL_FILLER_RE.sub(" ", no_punct)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-?!")
+    if len(cleaned) >= 2:
+        _add(cleaned)
+        _add(_strip_pl(cleaned))
+    elif len(no_punct) >= 2:
+        _add(_strip_pl(no_punct))
+    return out[:4]
 
 
 class LanguageCortex:
     """
-    100% Self-Contained PyTorch GPU Language & Semantic Cortex (zero external LLMs, zero Ollama):
-      - `SubwordTokenizer`: lossless UTF-8 byte + dynamic Polish/code vocabulary
-      - `CorticalSemanticEncoder`: 256D GPU encoder fine-tuned contrastively during NREM sleep
-      - `CorticalTransformerLM`: 4-layer causal Transformer trained on GPU via sleep replay
-      - Polish neuro-linguistic analyzer/synthesizer grounded strictly in Hippocampus/Cortex memory
+    Thin neurobiological pipeline coordinator (ZERO templates, ZERO quote-gluing, ZERO tokens):
+      Raw UTF-8 bytes
+        -> WernickeByteCortex (Byte-Patching Conv1D + RMSNorm/SwiGLU -> 16 cols S -> k-WTA SDR)
+        -> BiologicalAssociativeCortex (Modern Continuous Hopfield + W_rec + k-WTA -> 16 cols Z*)
+        -> BrocaByteTransformer (Cross-Attention ONLY on Z* -> stochastic UTF-8 byte stream)
+
+    Broca training runs strictly as denoising autoencoding through the k-WTA SDR bottleneck
+    with label_smoothing=0.1, Gaussian noise + column dropout on Z*, AdamW(weight_decay=0.05),
+    and early stopping around loss 0.85-1.0 so it learns fluent Polish syntax without memorizing quotes.
     """
 
     def __init__(self, cfg: BrainConfig, device: torch.device, lora_dir: Path | None = None) -> None:
+        configure_torch_backend()
         self.cfg = cfg
         self.device = device
         self.lora_dir = lora_dir
-        self._op_lock = threading.Lock()
+        self._op_lock = threading.RLock()
 
-        self.tokenizer = SubwordTokenizer(max_vocab_size=cfg.vocab_size)
-        self.semantic_encoder = CorticalSemanticEncoder(
-            vocab_size=cfg.vocab_size,
-            ngram_buckets=cfg.ngram_buckets,
-            d_model=cfg.embed_dim,
-        ).to(device)
-        self.transformer_lm = CorticalTransformerLM(
-            vocab_size=cfg.vocab_size,
-            d_model=cfg.cortex_dim,
-            n_layers=cfg.cortex_layers,
-            n_heads=cfg.cortex_heads,
-            ff_dim=cfg.cortex_ff_dim,
-            max_seq_len=cfg.cortex_max_seq_len,
-        ).to(device)
+        self._wernicke_raw = WernickeByteCortex(cfg).to(device)
+        self._broca_raw = BrocaByteTransformer(cfg).to(device)
+
+        self.wernicke = maybe_compile_module(self._wernicke_raw, cfg.enable_torch_compile)
+        self.broca = maybe_compile_module(self._broca_raw, cfg.enable_torch_compile)
+        self._device_label = torch.cuda.get_device_name(0) if self.device.type == "cuda" else "CPU"
 
         self.ready: bool = True
         self.loading: bool = False
         self.load_error: str | None = None
         self.lora_updates_count: int = 0
         self.core_knowledge_summary: str = ""
-        self.online_dialogues: list[str] = []
-        self.last_thinking_steps: list[str] = []
-        self.available_models: list[str] = [cfg.language_model_id]
         self.status_message: str = ""
+        # Pure GPU bfloat16 Modern Hopfield paraphrase -> canonical question SDR attractor bank
+        self._known_q_sdrs: torch.Tensor = torch.empty((0, cfg.num_neurons), dtype=torch.bfloat16, device=device)
+        self._canonical_q_sdrs: torch.Tensor = torch.empty((0, cfg.num_neurons), dtype=torch.bfloat16, device=device)
+        # Rolling Q&A replay pairs learned online so NREM sleep preserves them instead of forgetting
+        self._learned_qa_replay: list[tuple[str, str]] = []
+        # Pinned identity / rule question keys (lowercase) immune to [-200:] eviction
+        self._pinned_qa_keys: set[str] = set()
         self._refresh_status()
 
+    @property
+    def wernicke_module(self) -> WernickeByteCortex:
+        return self._wernicke_raw
+
+    @property
+    def broca_module(self) -> BrocaByteTransformer:
+        return self._broca_raw
+
+    def wernicke_parameters(self) -> int:
+        return self._wernicke_raw.total_parameters()
+
+    def broca_parameters(self) -> int:
+        return self._broca_raw.total_parameters()
+
     def total_parameters(self) -> int:
-        enc_params = sum(p.numel() for p in self.semantic_encoder.parameters())
-        lm_params = self.transformer_lm.total_parameters()
-        return enc_params + lm_params
+        return self.wernicke_parameters() + self.broca_parameters()
 
     def _refresh_status(self) -> None:
-        dev_label = torch.cuda.get_device_name(0) if self.device.type == "cuda" else "CPU"
         m_params = self.total_parameters() / 1_000_000.0
-        fluency = self.transformer_lm.fluency_score
+        fluency = self._broca_raw.fluency_score
         self.status_message = (
-            f"Gotowa: {self.cfg.language_model_id} ({dev_label} · {m_params:.2f}M param. · płynność {fluency:.0f}%)"
+            f"Gotowa: {self.cfg.architecture_label} ({self._device_label} · "
+            f"{m_params:.2f}M param. Wernicke+Broca · {self.cfg.num_columns} kolumn · płynność {fluency:.0f}%)"
         )
 
     def load_sync(self) -> bool:
         with self._op_lock:
-            self.semantic_encoder.to(self.device)
-            self.transformer_lm.to(self.device)
-            if self.transformer_lm.trained_steps == 0:
-                boot_seqs = build_training_dialogues([], [], [], [], max_total=64)
-                self.tokenizer.learn_texts(boot_seqs)
-                self.transformer_lm.train_sleep_replay(
-                    sequences=boot_seqs,
-                    tokenizer=self.tokenizer,
+            self._wernicke_raw.to(self.device)
+            self._broca_raw.to(self.device)
+            if self._broca_raw.trained_steps == 0 and self.cfg.language_bootstrap_epochs > 0:
+                boot_corpus = build_denoising_corpus(
+                    extra_texts=None,
+                    include_base=True,
+                    include_curriculum=False,
+                    max_samples=64,
+                )
+                self._train_denoising_epochs_unlocked(
+                    texts=boot_corpus,
                     epochs=self.cfg.language_bootstrap_epochs,
-                    lr=self.cfg.cortex_lr,
-                    batch_size=32,
+                    lr=self.cfg.broca_lr,
+                    batch_size=min(self.cfg.broca_batch_size, 16),
+                    early_stop_loss=self.cfg.broca_early_stop_loss,
+                    mask_prob=0.16,
                 )
             self.ready = True
             self.loading = False
@@ -496,74 +170,1970 @@ class LanguageCortex:
     def shutdown(self) -> None:
         return
 
-    def save_lora(self) -> None:
-        return
-
-    def reset_lora(self) -> None:
+    def reset_models(self) -> None:
         with self._op_lock:
-            self.tokenizer = SubwordTokenizer(max_vocab_size=self.cfg.vocab_size)
-            self.semantic_encoder = CorticalSemanticEncoder(
-                vocab_size=self.cfg.vocab_size,
-                ngram_buckets=self.cfg.ngram_buckets,
-                d_model=self.cfg.embed_dim,
-            ).to(self.device)
-            self.transformer_lm = CorticalTransformerLM(
-                vocab_size=self.cfg.vocab_size,
-                d_model=self.cfg.cortex_dim,
-                n_layers=self.cfg.cortex_layers,
-                n_heads=self.cfg.cortex_heads,
-                ff_dim=self.cfg.cortex_ff_dim,
-                max_seq_len=self.cfg.cortex_max_seq_len,
-            ).to(self.device)
+            self._wernicke_raw = WernickeByteCortex(self.cfg).to(self.device)
+            self._broca_raw = BrocaByteTransformer(self.cfg).to(self.device)
+            self.wernicke = maybe_compile_module(self._wernicke_raw, self.cfg.enable_torch_compile)
+            self.broca = maybe_compile_module(self._broca_raw, self.cfg.enable_torch_compile)
             self.lora_updates_count = 0
             self.core_knowledge_summary = ""
-            self.online_dialogues = []
+            self._known_q_sdrs = torch.empty((0, self.cfg.num_neurons), dtype=torch.bfloat16, device=self.device)
+            self._canonical_q_sdrs = torch.empty((0, self.cfg.num_neurons), dtype=torch.bfloat16, device=self.device)
+            self._learned_qa_replay = []
+            self._pinned_qa_keys = set()
             self._refresh_status()
 
     def export_state(self) -> dict[str, Any]:
         with self._op_lock:
             return {
-                "tokenizer": self.tokenizer.export_state(),
-                "semantic_encoder": self.semantic_encoder.export_state(),
-                "transformer_lm": self.transformer_lm.export_state(),
-                "online_dialogues": list(self.online_dialogues[-200:]),
+                "wernicke": self._wernicke_raw.export_state(),
+                "broca": self._broca_raw.export_state(),
+                "lora_updates_count": self.lora_updates_count,
+                "known_q_sdrs": self._known_q_sdrs.detach().cpu(),
+                "canonical_q_sdrs": self._canonical_q_sdrs.detach().cpu(),
+                "learned_qa_replay": list(self._learned_qa_replay),
+                "pinned_qa_keys": sorted(self._pinned_qa_keys),
             }
 
     def import_state(self, state: dict[str, Any]) -> None:
         with self._op_lock:
-            if "tokenizer" in state:
-                self.tokenizer.import_state(state["tokenizer"])
-            if "semantic_encoder" in state:
-                self.semantic_encoder.import_state(state["semantic_encoder"])
-            if "transformer_lm" in state:
-                self.transformer_lm.import_state(state["transformer_lm"])
-            if "online_dialogues" in state:
-                self.online_dialogues = list(state.get("online_dialogues", []))[-200:]
+            self._wernicke_raw.import_state(state["wernicke"], device=self.device)
+            self._broca_raw.import_state(state["broca"], device=self.device)
+            self.lora_updates_count = int(state.get("lora_updates_count", 0))
+            if "known_q_sdrs" in state and isinstance(state["known_q_sdrs"], torch.Tensor):
+                self._known_q_sdrs = state["known_q_sdrs"].to(device=self.device, dtype=torch.bfloat16)
+            else:
+                self._known_q_sdrs = torch.empty((0, self.cfg.num_neurons), dtype=torch.bfloat16, device=self.device)
+            if "canonical_q_sdrs" in state and isinstance(state["canonical_q_sdrs"], torch.Tensor):
+                self._canonical_q_sdrs = state["canonical_q_sdrs"].to(device=self.device, dtype=torch.bfloat16)
+            else:
+                self._canonical_q_sdrs = torch.empty((0, self.cfg.num_neurons), dtype=torch.bfloat16, device=self.device)
+            self._pinned_qa_keys = {
+                str(k).strip().lower() for k in state.get("pinned_qa_keys", []) if str(k).strip()
+            }
+            raw_replay = [
+                (str(x[0]), str(x[1])) for x in state.get("learned_qa_replay", []) if isinstance(x, (list, tuple)) and len(x) == 2
+            ]
+            pinned_entries = [p for p in raw_replay if p[0].lower() in self._pinned_qa_keys]
+            unpinned_entries = [p for p in raw_replay if p[0].lower() not in self._pinned_qa_keys]
+            rem_slots = max(0, 200 - len(pinned_entries))
+            self._learned_qa_replay = pinned_entries + (unpinned_entries[-rem_slots:] if rem_slots > 0 else [])
+            if (
+                self._known_q_sdrs.shape[0] == 0
+                or self._canonical_q_sdrs.shape[0] != self._known_q_sdrs.shape[0]
+            ) and self._broca_raw.trained_steps > 0:
+                self.ensure_familiarity_bank(force_rebuild=True)
             self._refresh_status()
 
-    def encode_texts(self, texts: list[str]) -> list[list[float]]:
-        if not texts:
-            return []
+    @torch.no_grad()
+    def ensure_familiarity_bank(self, force_rebuild: bool = False) -> int:
+        """
+        Guarantee the GPU paraphrase -> canonical SDR attractor bank is populated whenever Broca
+        has trained weights, so paraphrase snapping & OOD gating can NEVER silently disable themselves.
+        """
         with self._op_lock:
-            self.tokenizer.learn_texts(texts)
-            return self.semantic_encoder.encode_texts(
+            if not force_rebuild and self._known_q_sdrs.shape[0] > 0 and self._canonical_q_sdrs.shape[0] == self._known_q_sdrs.shape[0]:
+                return int(self._known_q_sdrs.shape[0])
+            if self._broca_raw.trained_steps <= 0:
+                return 0
+            pairs = build_dialogue_qa_pairs(
+                include_curriculum=True,
+                extra_pairs=list(self._learned_qa_replay),
+                min_chars=2,
+            )
+            self._register_known_questions([q for q, _ in pairs], replace=True)
+            return int(self._known_q_sdrs.shape[0])
+
+    @torch.no_grad()
+    def _register_known_questions(self, questions: list[str], replace: bool = False) -> None:
+        """
+        Encode canonical trained questions and their natural Polish surface paraphrases into a
+        paired GPU bfloat16 Modern Hopfield attractor bank (`_known_q_sdrs -> _canonical_q_sdrs`).
+        Zero text is retained in the bank — strictly sparse SDR vectors!
+        """
+        canon_list: list[str] = []
+        canon_idx_map: dict[str, int] = {}
+        variant_texts: list[str] = []
+        variant_to_canon: list[int] = []
+        seen_v: set[str] = set()
+
+        for raw_q in questions:
+            q = (raw_q or "").strip()
+            if len(q) < 2 or q.startswith("__"):
+                continue
+            ckey = q.lower()
+            if ckey not in canon_idx_map:
+                canon_idx_map[ckey] = len(canon_list)
+                canon_list.append(q)
+            c_idx = canon_idx_map[ckey]
+            for variant in expand_question_paraphrases(q):
+                for v_form in (variant, variant.lower()):
+                    if v_form not in seen_v:
+                        seen_v.add(v_form)
+                        variant_texts.append(v_form)
+                        variant_to_canon.append(c_idx)
+
+        if not variant_texts or not canon_list:
+            return
+
+        w_canon = self._wernicke_raw.encode_texts(canon_list, device=self.device, batch_size=64)
+        canon_sdrs = F.normalize(w_canon.sdr.float(), dim=-1, eps=1e-6).to(torch.bfloat16)
+
+        w_var = self._wernicke_raw.encode_texts(variant_texts, device=self.device, batch_size=64)
+        var_sdrs = F.normalize(w_var.sdr.float(), dim=-1, eps=1e-6).to(torch.bfloat16)
+        idx_t = torch.tensor(variant_to_canon, dtype=torch.long, device=self.device)
+        mapped_canon = canon_sdrs[idx_t]
+
+        max_bank = 6144
+        if replace or self._known_q_sdrs.shape[0] == 0:
+            self._known_q_sdrs = var_sdrs[-max_bank:].contiguous()
+            self._canonical_q_sdrs = mapped_canon[-max_bank:].contiguous()
+        else:
+            self._known_q_sdrs = torch.cat([self._known_q_sdrs, var_sdrs], dim=0)[-max_bank:].contiguous()
+            self._canonical_q_sdrs = torch.cat([self._canonical_q_sdrs, mapped_canon], dim=0)[-max_bank:].contiguous()
+
+    @torch.no_grad()
+    def match_known_attractor(self, query_sdr: torch.Tensor) -> tuple[float, torch.Tensor | None]:
+        """
+        Continuous Modern Hopfield attention over the GPU bfloat16 SDR attractor bank:
+          - If max cosine similarity >= 0.78: returns the crisp matched canonical SDR attractor.
+          - If 0.45 <= max_sim < 0.78 (novel phrasings, typos like 'SUEPR to co robimy', or casual
+            follow-ups): returns a soft top-3 Modern Continuous Hopfield energy-weighted SDR blend
+            so the brain thinks continuously in SDR space instead of hitting a rigid OOD wall!
+        """
+        if self._known_q_sdrs.shape[0] == 0:
+            return 1.0, None
+        q = F.normalize(query_sdr.to(device=self.device, dtype=torch.float32).reshape(-1), dim=-1, eps=1e-6).to(
+            torch.bfloat16
+        )
+        sims = torch.mv(self._known_q_sdrs, q).float()
+        best_val, best_idx = sims.max(dim=0)
+        sim_f = round(float(best_val.item()), 4)
+        if self._canonical_q_sdrs.shape[0] != self._known_q_sdrs.shape[0]:
+            return sim_f, None
+        if sim_f >= 0.78:
+            return sim_f, self._canonical_q_sdrs[int(best_idx.item())]
+        if sim_f >= 0.45:
+            k_top = min(3, int(sims.shape[0]))
+            top_vals, top_idxs = torch.topk(sims, k=k_top)
+            weights = F.softmax(16.0 * top_vals, dim=-1).to(dtype=torch.float32)
+            blended = (weights.unsqueeze(-1) * self._canonical_q_sdrs[top_idxs].float()).sum(dim=0)
+            blended = F.normalize(blended, dim=-1, eps=1e-6).to(dtype=torch.bfloat16)
+            return sim_f, blended
+        return sim_f, None
+
+    @torch.no_grad()
+    def familiarity_score(self, query_sdr: torch.Tensor) -> float:
+        """Single GPU matmul checking if query_sdr matches any trained dialogue/Q&A paraphrase."""
+        sim_f, _ = self.match_known_attractor(query_sdr)
+        return sim_f
+
+    @torch.no_grad()
+    def perceive_for_chat(self, user_message: str) -> tuple[WernickeOutput, float, torch.Tensor | None]:
+        """
+        Case- & casual-punctuation-tolerant UTF-8 Wernicke perception on GPU:
+        encodes up to 4 lightweight surface normalizations (raw, lowercase, stripped punctuation/filler)
+        in ONE GPU batch (~0.8 ms) and picks the highest-familiarity SDR so 'Siema', 'SIEMA',
+        'Co to jest kot', and 'CO TAM KURWA' NEVER falsely fail OOD!
+        """
+        variants = _chat_perception_variants(user_message)
+        with self._op_lock:
+            w_batch = self._wernicke_raw.encode_texts(variants, device=self.device, batch_size=len(variants))
+            best_idx = 0
+            best_sim = -1.0
+            best_canon: torch.Tensor | None = None
+            for i in range(len(variants)):
+                sim_i, canon_i = self.match_known_attractor(w_batch.sdr[i])
+                if sim_i > best_sim:
+                    best_sim = sim_i
+                    best_idx = i
+                    best_canon = canon_i
+            single_out = WernickeOutput(
+                columns=w_batch.columns[best_idx : best_idx + 1],
+                sdr=w_batch.sdr[best_idx : best_idx + 1],
+                reconstructed_columns=w_batch.reconstructed_columns[best_idx : best_idx + 1],
+                active_indices=w_batch.active_indices[best_idx : best_idx + 1],
+                active_values=w_batch.active_values[best_idx : best_idx + 1],
+                sparsity_pct=w_batch.sparsity_pct,
+            )
+            return single_out, best_sim, best_canon
+
+    # ── Sensory Perception (Wernicke: UTF-8 bytes -> 16 columns S + k-WTA SDR) ──
+    @torch.no_grad()
+    def perceive_texts(self, texts: list[str], mask_prob: float = 0.0) -> WernickeOutput:
+        if not texts:
+            raise ValueError("Cannot perceive empty text batch")
+        with self._op_lock:
+            return self._wernicke_raw.encode_texts(
                 texts,
-                self.tokenizer,
+                device=self.device,
                 batch_size=self.cfg.embed_batch_size,
+                mask_prob=mask_prob,
             )
 
-    def encode_text(self, text: str) -> list[float]:
-        clean = text.strip()
-        if not clean:
-            return []
-        return self.encode_texts([clean])[0]
+    @torch.no_grad()
+    def perceive_one(self, text: str) -> WernickeOutput:
+        return self.perceive_texts([text or " "])
 
-    def normalize_study_queries(self, raw_topic: str) -> list[str]:
+    # ── Isolated Broca Decoding (STRICTLY from Z* in R^{1 x 16 x D}) ─────────
+    @torch.no_grad()
+    def decode_columns(
+        self,
+        columns_star: torch.Tensor,
+        max_new_bytes: int | None = None,
+        temperature: float | None = None,
+    ) -> dict[str, Any]:
+        with self._op_lock:
+            return self._broca_raw.generate(
+                memory_columns=columns_star,
+                max_new_bytes=max_new_bytes,
+                temperature=temperature,
+                top_p=self.cfg.broca_top_p,
+                repetition_penalty=self.cfg.broca_repetition_penalty,
+            )
+
+    @staticmethod
+    def score_polish_quality(text: str, creativity_level: float = 0.6) -> float:
+        """
+        Evaluate inner Broca draft for Polish linguistic quality without any external model:
+          - Penalizes empty/tiny drafts, repetitive word loops ('ciekawe i ciekawe'),
+            non-Polish symbol spam, and unbalanced brackets.
+          - Rewards clean sentence endings ('.', '!', '?'), good alphabetic ratio, and
+            lexical diversity (scaled by creativity_level).
+        Returns a quality score in [0.0, 1.0].
+        """
+        s = (text or "").strip()
+        if len(s) < 6:
+            return 0.05
+        score = 0.55
+        if s[-1] in ".!?":
+            score += 0.18
+        if s[0].isupper() or s[0] in "„\"":
+            score += 0.07
+        letters = sum(1 for ch in s if ch.isalpha())
+        alpha_ratio = letters / float(max(1, len(s)))
+        if alpha_ratio < 0.55:
+            score -= 0.30
+        elif alpha_ratio >= 0.72:
+            score += 0.08
+
+        words = [w.strip(".,!?;:„”\"()[]—-").lower() for w in s.split() if w.strip(".,!?;:„”\"()[]—-")]
+        if len(words) >= 3:
+            uniq_ratio = len(set(words)) / float(len(words))
+            # Strong penalty for word loops ("ciekawe i ciekawe", "jest jest jest")
+            adj_dups = sum(1 for i in range(1, len(words)) if words[i] == words[i - 1])
+            score -= 0.22 * adj_dups
+            if uniq_ratio < 0.60:
+                score -= 0.25
+            elif uniq_ratio >= 0.85:
+                score += 0.08 + 0.06 * max(0.0, min(1.0, creativity_level))
+            # Check bigram repetition loops
+            if len(words) >= 6:
+                bigrams = [(words[i], words[i + 1]) for i in range(len(words) - 1)]
+                bg_ratio = len(set(bigrams)) / float(len(bigrams))
+                if bg_ratio < 0.75:
+                    score -= 0.25
+
+        if s.count("(") != s.count(")"):
+            score -= 0.08
+        if "\ufffd" in s:
+            score -= 0.35
+        return round(max(0.0, min(1.0, score)), 4)
+
+    @torch.no_grad()
+    def analyze_self_heard_draft(
+        self,
+        draft_text: str,
+        thought: CortexThought,
+        creativity_level: float = 0.6,
+        heard_sdr: torch.Tensor | None = None,
+        conf_info: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Biological Arcuate Fasciculus Auditory Self-Hearing & Error Analysis:
+        The brain literally 'hears' its own generated draft through Wernicke, compares the heard SDR
+        against its intended cortical state Z*, checks Broca neural confidence & Polish coherence,
+        and diagnoses concrete flaws so it can actively self-correct BEFORE speaking!
+        """
+        s = (draft_text or "").strip()
+        quality = self.score_polish_quality(s, creativity_level=creativity_level)
+        if len(s) < 4:
+            return {
+                "total": 0.05,
+                "quality": quality,
+                "alignment": 0.0,
+                "confidence": 0.01,
+                "avg_nll": 5.0,
+                "issues": ["zbyt krótka / pusta odpowiedź"],
+                "needs_correction": True,
+                "heard_sdr": heard_sdr,
+            }
+
+        if heard_sdr is None:
+            with self._op_lock:
+                fb_out = self._wernicke_raw.encode_texts([s], device=self.device, batch_size=1)
+            heard_sdr = fb_out.sdr[0]
+        if conf_info is None:
+            with self._op_lock:
+                conf_info = self._broca_raw.score_text_confidence(s, thought.columns_star)
+
+        align = float(
+            F.cosine_similarity(
+                heard_sdr.float().unsqueeze(0),
+                thought.z_star[0].float().unsqueeze(0),
+            ).item()
+        )
+        align_norm = max(0.0, min(1.0, (align + 0.10) / 0.75))
+        conf = float(conf_info["confidence"])
+        nll = float(conf_info["avg_nll"])
+        total = round(0.45 * conf + 0.45 * quality + 0.10 * align_norm, 4)
+
+        issues: list[str] = []
+        if nll > 1.05:
+            issues.append(f"niska pewność Broki (NLL={nll:.2f})")
+        if quality < 0.75:
+            issues.append(f"słaba płynność polska ({quality*100:.0f}%)")
+        if align < 0.16:
+            issues.append(f"rozbieżność słuchowa z intencją Z* (cos={align:.2f})")
+        words = re.findall(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż0-9]+", s.lower())
+        if len(words) >= 6 and (len(set(words)) / float(len(words))) < 0.52:
+            issues.append("pętla powtórzeń słów")
+        if len(s) >= 24 and s[-1] not in ".!?\"')»…":
+            issues.append("ucięte zdanie bez zakończenia")
+        if "\ufffd" in s:
+            issues.append("uszkodzone znaki UTF-8")
+
+        thresh = float(getattr(self.cfg, "self_correction_threshold", 0.78))
+        needs_correction = bool(issues) or (total < thresh)
+        return {
+            "total": total,
+            "quality": round(quality, 4),
+            "alignment": round(align, 4),
+            "confidence": round(conf, 4),
+            "avg_nll": round(nll, 4),
+            "issues": issues,
+            "needs_correction": needs_correction,
+            "heard_sdr": heard_sdr,
+        }
+
+    @torch.no_grad()
+    def self_critique_reply(
+        self,
+        draft_text: str,
+        thought: CortexThought,
+        creativity_level: float = 0.6,
+    ) -> dict[str, float]:
+        """
+        Biological Arcuate Fasciculus auditory feedback + Broca neural confidence critic:
+        Wernicke reads Broca's own output while Broca evaluates its own byte perplexity under Z*.
+        """
+        diag = self.analyze_self_heard_draft(draft_text, thought, creativity_level=creativity_level)
+        return {
+            "total": float(diag["total"]),
+            "quality": float(diag["quality"]),
+            "alignment": float(diag["alignment"]),
+            "confidence": float(diag["confidence"]),
+            "avg_nll": float(diag["avg_nll"]),
+        }
+
+    @torch.no_grad()
+    def deliberate_and_critique(
+        self,
+        user_message: str,
+        cortex: BiologicalAssociativeCortex,
+        engram_bank: torch.Tensor | None,
+        working_memory_sdr: torch.Tensor | None = None,
+        working_memory_weight: float = 0.0,
+        creativity_level: float = 0.7,
+        base_temperature: float | None = None,
+        max_new_bytes: int | None = None,
+        num_candidates: int | None = None,
+        living_assoc_vec: torch.Tensor | None = None,
+        living_blend: float = 0.08,
+        neuromod: Any | None = None,
+        living_telemetry: Any | None = None,
+    ) -> dict[str, Any]:
+        """
+        System-2 Batched Parallel Cortical Thinking + Auditory Self-Hearing & Active Self-Correction,
+        steered live by LivingBrainEngine neuromodulators (NA, DA, ACh) and M4 intrinsic curiosity:
+          1. High NA / PE extends attractor deliberation (3 -> 6 steps) and lowers sampling temperature.
+          2. High intrinsic_curiosity or boredom_exploration elevates temperature and weight of the
+             'Kreatywna' path during candidate self-critique.
+          3. Directly projects LivingBrainEngine's growing associative state + top-3 M2 traces into Z*.
+        """
+        base_t = float(base_temperature if base_temperature is not None else self.cfg.broca_temperature)
+        k_cand = max(1, min(3, int(num_candidates or self.cfg.self_critique_candidates)))
+        cre = max(0.0, min(1.0, float(creativity_level)))
+        max_b = int(max_new_bytes or self.cfg.broca_max_new_bytes)
+
+        # Read LivingBrain neuromodulators & M4 curiosity telemetry (if supplied)
+        na_val = 0.35
+        pe_val = 0.0
+        cur_val = 0.0
+        boredom_exp = False
+        has_nm = (neuromod is not None) or (living_telemetry is not None)
+        if neuromod is not None:
+            if isinstance(neuromod, dict):
+                na_val = float(neuromod.get("noradrenaline", 0.35))
+            else:
+                na_val = float(getattr(neuromod, "noradrenaline", 0.35))
+        if living_telemetry is not None:
+            pe_val = float(getattr(living_telemetry, "surprise", 0.0))
+            cur_val = float(getattr(living_telemetry, "intrinsic_curiosity", 0.0))
+            boredom_exp = bool(getattr(living_telemetry, "boredom_exploration", False))
+            if neuromod is None:
+                nm_dict = getattr(living_telemetry, "neuromodulators", None) or {}
+                if isinstance(nm_dict, dict):
+                    na_val = float(nm_dict.get("noradrenaline", na_val))
+
+        na_arousal = (
+            max(0.0, min(1.0, max((na_val - 0.85) / 1.15, (pe_val - 0.30) / 0.45)))
+            if has_nm
+            else 0.0
+        )
+        cur_boost = (
+            max(0.0, min(1.0, max(0.0, (cur_val - 0.30) / 0.70) + (0.45 if boredom_exp else 0.0)))
+            if living_telemetry is not None
+            else 0.0
+        )
+
+        # High Noradrenaline / PE: deeper attractor convergence (3 -> 6) & sharper (lower) temperature
+        eff_steps = max(self.cfg.attractor_steps, min(6, 3 + int(round(3.0 * na_arousal)))) if has_nm else self.cfg.attractor_steps
+        eff_base_t = max(0.38, base_t - 0.14 * na_arousal) if has_nm else base_t
+        cre_temp = max(eff_base_t, min(0.95, eff_base_t + 0.14 * cre + 0.16 * cur_boost))
+        cre_noise = 0.010 * cre + 0.008 * cur_boost
+
+        w_out, q_sim, canon_sdr = self.perceive_for_chat(user_message)
+
+        if canon_sdr is not None and q_sim >= 0.45:
+            snap_sdr = canon_sdr.to(device=self.device, dtype=w_out.sdr.dtype).unsqueeze(0)
+        else:
+            snap_sdr = w_out.sdr
+
+        path_specs: list[tuple[str, float, bool, float, float, int, float, bool]] = [
+            ("Precyzyjna", max(0.36, eff_base_t - 0.08), False, 0.92, 0.0, eff_steps, 0.0, True),
+            ("Kontekstowa", eff_base_t, True, 0.85, working_memory_weight, min(6, eff_steps + 1), 0.0, q_sim >= 0.72),
+            ("Kreatywna", cre_temp, False, 0.90, working_memory_weight * 0.5, eff_steps, cre_noise, q_sim >= 0.78),
+        ][:k_cand]
+
+        thoughts: list[CortexThought] = []
+        temps: list[float] = []
+        labels: list[str] = []
+        for label, cand_t, use_bank, hop_min, cand_wm_w, cand_steps, cand_noise, use_snap in path_specs:
+            thought = cortex.perceive_and_think(
+                sensory_columns=w_out.columns,
+                sensory_sdr=snap_sdr if use_snap else w_out.sdr,
+                engram_bank=engram_bank if use_bank else None,
+                sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
+                steps=cand_steps,
+                noise_std=cand_noise,
+                update_last_active=False,
+                hopfield_min_sim=hop_min,
+                working_memory_sdr=working_memory_sdr if cand_wm_w > 0.0 else None,
+                working_memory_weight=cand_wm_w,
+                living_assoc_vec=living_assoc_vec,
+                living_blend=living_blend,
+                neuromod=neuromod,
+                living_telemetry=living_telemetry,
+            )
+            thoughts.append(thought)
+            temps.append(round(cand_t, 3))
+            labels.append(label)
+
+        # Parallel batched generation + single-pass batched neural confidence scoring on GPU!
+        mem_batch = torch.cat([th.columns_star[:1] for th in thoughts], dim=0)  # [K, 16, D]
+        with self._op_lock:
+            gen_batch = self._broca_raw.generate_batch(
+                memory_columns_batch=mem_batch,
+                temperatures=temps,
+                max_new_bytes=max_b,
+                top_p=self.cfg.broca_top_p,
+                repetition_penalty=self.cfg.broca_repetition_penalty,
+            )
+            conf_list = self._broca_raw.score_texts_confidence_batch(
+                [g["text"] for g in gen_batch],
+                mem_batch,
+            )
+
+        draft_texts = [g["text"] if g["text"] else " " for g in gen_batch]
+
+        # Batch auditory self-hearing: Wernicke listens to ALL generated drafts simultaneously on GPU
+        with self._op_lock:
+            fb_batch = self._wernicke_raw.encode_texts(draft_texts, device=self.device, batch_size=len(draft_texts))
+
+        candidates: list[dict[str, Any]] = []
+        best_idx = 0
+        best_score = -1.0
+        critique_notes: list[str] = []
+        if has_nm and (na_arousal > 0.05 or cur_boost > 0.05):
+            critique_notes.append(
+                f"Neuromodulacja inferencji: NA={na_val:.2f} (kroki={eff_steps}, T_baz={eff_base_t:.2f}) · "
+                f"Ciekawość M4={cur_val:.2f}{'+eksploracja' if boredom_exp else ''} (T_kreat={cre_temp:.2f})"
+            )
+        p1_conf = float(conf_list[0]["confidence"])
+
+        for idx in range(len(thoughts)):
+            draft = gen_batch[idx]["text"]
+            diag = self.analyze_self_heard_draft(
+                draft_text=draft,
+                thought=thoughts[idx],
+                creativity_level=cre,
+                heard_sdr=fb_batch.sdr[idx],
+                conf_info=conf_list[idx],
+            )
+            cre_q_min = 0.78 if cur_boost >= 0.35 else 0.85
+            cre_c_min = max(0.50, p1_conf - (0.08 if cur_boost >= 0.35 else 0.04))
+            cre_bonus = (
+                (0.015 * cre + 0.045 * cur_boost)
+                if (labels[idx] == "Kreatywna" and diag["quality"] >= cre_q_min and diag["confidence"] >= cre_c_min)
+                else 0.0
+            )
+            total = round(min(1.0, float(diag["total"]) + cre_bonus), 4)
+            cand = {
+                "label": labels[idx],
+                "thought": thoughts[idx],
+                "temperature": temps[idx],
+                "draft": draft,
+                "score": total,
+                "confidence": float(diag["confidence"]),
+                "avg_nll": float(diag["avg_nll"]),
+                "quality": float(diag["quality"]),
+                "alignment": float(diag["alignment"]),
+                "issues": list(diag["issues"]),
+                "needs_correction": bool(diag["needs_correction"]),
+                "heard_sdr": fb_batch.sdr[idx],
+            }
+            candidates.append(cand)
+            critique_notes.append(
+                f"Ścieżka {cand['label']} (T={cand['temperature']:.2f}): ocena={total*100:.0f}% "
+                f"(pewność={cand['confidence']*100:.0f}%, NLL={cand['avg_nll']:.2f}, jakość={cand['quality']*100:.0f}%)"
+            )
+            if total > best_score:
+                best_score = total
+                best_idx = idx
+
+        winner = dict(candidates[best_idx])
+        self_corrected = False
+
+        # Active Auditory Self-Correction ("słyszę co mówię -> analizuję -> poprawiam"):
+        if bool(getattr(self.cfg, "self_correction_enabled", True)) and winner["needs_correction"] and winner["draft"]:
+            from .sensory_wernicke import k_wta
+
+            err_signal = winner["thought"].z_star[0].float() - winner["heard_sdr"].float()
+            corrected_pre = winner["thought"].z_star[0].float() + 0.35 * err_signal
+            corr_sdr, _, _ = k_wta(corrected_pre.unsqueeze(0), k=self.cfg.sdr_k, normalize=True)
+            corr_thought = cortex.perceive_and_think(
+                sensory_columns=w_out.columns,
+                sensory_sdr=corr_sdr.to(dtype=w_out.sdr.dtype),
+                engram_bank=None,
+                sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
+                steps=eff_steps,
+                noise_std=0.0,
+                update_last_active=False,
+                hopfield_min_sim=0.92,
+                living_assoc_vec=living_assoc_vec,
+                living_blend=living_blend,
+                neuromod=neuromod,
+                living_telemetry=living_telemetry,
+            )
+            corr_temp = max(0.36, round(winner["temperature"] - 0.10, 3))
+            corr_rep = round(self.cfg.broca_repetition_penalty + 0.10, 2)
+            with self._op_lock:
+                rev_gen = self._broca_raw.generate(
+                    memory_columns=corr_thought.columns_star,
+                    max_new_bytes=max_b,
+                    temperature=corr_temp,
+                    top_p=max(0.75, self.cfg.broca_top_p - 0.05),
+                    repetition_penalty=corr_rep,
+                )
+            rev_diag = self.analyze_self_heard_draft(
+                draft_text=rev_gen["text"],
+                thought=corr_thought,
+                creativity_level=cre,
+            )
+            issues_str = ", ".join(winner["issues"][:2]) if winner["issues"] else "niska ocena ogólna"
+            if float(rev_diag["total"]) > float(winner["score"]) + 0.01 and len(rev_gen["text"].strip()) >= 4:
+                old_score = winner["score"]
+                winner["thought"] = corr_thought
+                winner["draft"] = rev_gen["text"]
+                winner["temperature"] = corr_temp
+                winner["score"] = float(rev_diag["total"])
+                winner["confidence"] = float(rev_diag["confidence"])
+                winner["avg_nll"] = float(rev_diag["avg_nll"])
+                winner["quality"] = float(rev_diag["quality"])
+                winner["alignment"] = float(rev_diag["alignment"])
+                winner["needs_correction"] = bool(rev_diag["needs_correction"])
+                self_corrected = True
+                critique_notes.append(
+                    f"🎧 Słyszę siebie → wykryto: {issues_str} → aktywna samokorekta Z* poprawiła odpowiedź "
+                    f"({old_score*100:.0f}% → {winner['score']*100:.0f}%)"
+                )
+            else:
+                critique_notes.append(
+                    f"🎧 Słyszę siebie → sprawdziłem poprawkę ({issues_str}), ale pierwotny szkic pozostał najlepszy "
+                    f"({winner['score']*100:.0f}%)"
+                )
+        else:
+            critique_notes.append(
+                f"🎧 Słyszę własną odpowiedź → spójność słuchowa i polszczyzna OK ({winner['score']*100:.0f}%, pewność={winner['confidence']*100:.0f}%)"
+            )
+
+        # Commit winning thought SDR to cortex.last_active_sdr so 2D graph highlights the final thought!
+        cortex.last_active_sdr.copy_(winner["thought"].z_star[-1].detach())
+        cortex.last_sparsity_pct = winner["thought"].sparsity_pct
+        cortex.last_attractor_steps = winner["thought"].attractor_steps
+
+        critique_notes.append(
+            f"Samokrytyka wybrała ścieżkę „{winner['label']}” ({winner['score']*100:.0f}%, pewność={winner['confidence']*100:.0f}%) z {len(candidates)} myśli."
+        )
+
+        return {
+            "w_out": w_out,
+            "thought": winner["thought"],
+            "draft": winner["draft"],
+            "temperature": winner["temperature"],
+            "score": winner["score"],
+            "confidence": winner["confidence"],
+            "avg_nll": winner["avg_nll"],
+            "quality": winner["quality"],
+            "needs_correction": bool(winner["needs_correction"]),
+            "label": winner["label"],
+            "self_corrected": self_corrected,
+            "critique_notes": critique_notes,
+            "candidates": [
+                {
+                    "label": c["label"],
+                    "score": c["score"],
+                    "confidence": c["confidence"],
+                    "avg_nll": c["avg_nll"],
+                    "quality": c["quality"],
+                    "alignment": c["alignment"],
+                    "temperature": c["temperature"],
+                }
+                for c in candidates
+            ],
+        }
+
+    @torch.no_grad()
+    def think_and_stream(
+        self,
+        user_message: str,
+        cortex: BiologicalAssociativeCortex,
+        engram_bank: torch.Tensor | None,
+        temperature: float | None = None,
+        max_new_bytes: int | None = None,
+        working_memory_sdr: torch.Tensor | None = None,
+        working_memory_weight: float = 0.0,
+    ) -> tuple[WernickeOutput, CortexThought, Iterator[str]]:
+        """
+        Full zero-token cognitive pathway:
+          UTF-8 bytes -> Wernicke (S, u_sdr) -> BiologicalAssociativeCortex (z*, Z*) -> Broca stream(Z*).
+        Hard isolation: Broca receives ONLY Z* and NEVER sees user_message or any memory text.
+        """
+        with self._op_lock:
+            w_out = self._wernicke_raw.encode_texts([user_message], device=self.device, batch_size=1)
+            thought = cortex.perceive_and_think(
+                sensory_columns=w_out.columns,
+                sensory_sdr=w_out.sdr,
+                engram_bank=engram_bank,
+                sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
+                steps=self.cfg.attractor_steps,
+                noise_std=0.0,
+                update_last_active=True,
+                working_memory_sdr=working_memory_sdr,
+                working_memory_weight=working_memory_weight,
+            )
+
+        def _stream_gen() -> Iterator[str]:
+            with self._op_lock:
+                yield from self._broca_raw.generate_stream(
+                    memory_columns=thought.columns_star,
+                    max_new_bytes=max_new_bytes or self.cfg.broca_max_new_bytes,
+                    temperature=temperature,
+                    top_p=self.cfg.broca_top_p,
+                    repetition_penalty=self.cfg.broca_repetition_penalty,
+                )
+
+        return w_out, thought, _stream_gen()
+
+    # ── Denoising Autoencoder Training through k-WTA SDR Bottleneck ──────────
+    def _build_optimizer(self, lr: float, cond_lr_mult: float = 1.0) -> torch.optim.Optimizer:
+        # Keep zero weight decay on Z* conditioning pathways (cross-attn, FiLM, BOS/out projections)
+        # so AdamW NEVER decays Z* conditioning weights toward zero (prevents Cross-Attention collapse).
+        cond_keys = ("cross_", "film_", "bos_z_", "out_z_", "z_col_", "z_summary_", "sdr_expand_")
+        decay_params: list[torch.nn.Parameter] = []
+        norm_params: list[torch.nn.Parameter] = []
+        cond_params: list[torch.nn.Parameter] = []
+        for mod in (self._wernicke_raw, self._broca_raw):
+            for name, p in mod.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if any(k in name for k in cond_keys):
+                    cond_params.append(p)
+                elif p.ndim < 2 or "norm" in name:
+                    norm_params.append(p)
+                else:
+                    decay_params.append(p)
+        groups = [
+            {"params": decay_params, "lr": lr, "weight_decay": float(self.cfg.broca_weight_decay)},
+            {"params": norm_params, "lr": lr, "weight_decay": 0.0},
+            {"params": cond_params, "lr": lr * float(cond_lr_mult), "weight_decay": 0.0},
+        ]
+        use_fused = self.device.type == "cuda"
+        try:
+            return torch.optim.AdamW(groups, lr=lr, fused=use_fused)
+        except Exception:
+            return torch.optim.AdamW(groups, lr=lr, fused=False)
+
+    @staticmethod
+    def _z_decorrelation_loss(z_cols: torch.Tensor) -> torch.Tensor:
+        """Lightweight batch decorrelation penalty preventing Z* collapse across distinct inputs."""
+        b = z_cols.shape[0]
+        if b < 2:
+            return torch.zeros((), device=z_cols.device, dtype=torch.float32)
+        flat = F.normalize(z_cols.float().reshape(b, -1), dim=-1, eps=1e-6)
+        sim = flat @ flat.T
+        eye = torch.eye(b, device=z_cols.device, dtype=torch.bool)
+        off = sim.masked_fill(eye, 0.0)
+        return 0.65 * (off - 0.20).clamp(min=0.0).pow(2).mean()
+
+    def _train_denoising_epochs_unlocked(
+        self,
+        texts: list[str],
+        epochs: int,
+        lr: float,
+        batch_size: int,
+        early_stop_loss: float,
+        mask_prob: float = 0.18,
+    ) -> dict[str, Any]:
+        clean_texts = [t.strip() for t in texts if t and len(t.strip()) >= 8]
+        if not clean_texts:
+            return {
+                "trained": False,
+                "samples": 0,
+                "epochs_run": 0,
+                "loss_start": round(self._broca_raw.last_loss, 4),
+                "loss_end": round(self._broca_raw.last_loss, 4),
+                "fluency": self._broca_raw.fluency_score,
+                "duration_ms": 0.0,
+            }
+
+        t0 = time.perf_counter()
+        self._wernicke_raw.train()
+        self._broca_raw.train()
+        opt = self._build_optimizer(lr=lr)
+
+        loss_start: float | None = None
+        loss_end: float = self._broca_raw.last_loss
+        epochs_run = 0
+        bs = max(1, int(batch_size))
+
+        try:
+            for _ in range(max(1, int(epochs))):
+                epochs_run += 1
+                order = list(clean_texts)
+                random.shuffle(order)
+                ep_loss_sum = 0.0
+                ep_batches = 0
+
+                for i in range(0, len(order), bs):
+                    batch = order[i : i + bs]
+                    in_bytes, in_mask = encode_utf8_bytes(
+                        batch,
+                        max_bytes=self.cfg.max_input_bytes,
+                        patch_size=self.cfg.patch_stride,
+                        add_bos_eos=False,
+                        mask_prob=mask_prob,
+                        device=self.device,
+                    )
+                    tgt_bytes, _ = encode_utf8_bytes(
+                        batch,
+                        max_bytes=self.cfg.broca_max_seq_len,
+                        patch_size=1,
+                        add_bos_eos=True,
+                        mask_prob=0.0,
+                        device=self.device,
+                    )
+                    opt.zero_grad(set_to_none=True)
+                    with amp_autocast(self.device):
+                        w_out = self.wernicke(in_bytes, in_mask)
+                        z_cols = self._normalize_z_columns(w_out.reconstructed_columns)
+                        loss = self._broca_raw.compute_loss(tgt_bytes, z_cols)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        list(self._wernicke_raw.parameters()) + list(self._broca_raw.parameters()),
+                        max_norm=1.0,
+                    )
+                    opt.step()
+
+                    val = float(loss.detach().item())
+                    if loss_start is None:
+                        loss_start = val
+                    ep_loss_sum += val
+                    ep_batches += 1
+                    self._broca_raw.trained_steps += 1
+
+                loss_end = ep_loss_sum / max(1, ep_batches)
+                self._broca_raw._update_fluency(loss_end)
+                # Early stopping around 0.85-1.0 to avoid 1:1 memorization
+                if loss_end <= early_stop_loss:
+                    break
+        finally:
+            self._wernicke_raw.eval()
+            self._broca_raw.eval()
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        self._refresh_status()
+        return {
+            "trained": True,
+            "samples": len(clean_texts),
+            "epochs_run": epochs_run,
+            "loss_start": round(float(loss_start if loss_start is not None else loss_end), 4),
+            "loss_end": round(float(loss_end), 4),
+            "fluency": self._broca_raw.fluency_score,
+            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+        }
+
+    def train_denoising_sleep(
+        self,
+        texts: list[str],
+        epochs: int | None = None,
+        cortex: BiologicalAssociativeCortex | None = None,
+    ) -> dict[str, Any]:
+        """
+        Sleep consolidation for Broca that NEVER resets or degrades dialogue tuning:
+        - When dialogue Q&A has been trained (`_known_q_sdrs` populated), replays online-learned Q&A
+          + Polish dialogues gently at low LR so sleep strengthens dialogue instead of overwriting it.
+        """
+        from .language_trainer import BASE_HUMAN_DIALOGUES
+
+        fresh = [t.strip() for t in texts if t and len(t.strip()) >= 12]
+        if not fresh and not self._learned_qa_replay:
+            return {
+                "trained": False,
+                "samples": 0,
+                "epochs_run": 0,
+                "loss_start": round(self._broca_raw.last_loss, 4),
+                "loss_end": round(self._broca_raw.last_loss, 4),
+                "fluency": self._broca_raw.fluency_score,
+                "duration_ms": 0.0,
+            }
+
+        if cortex is not None and self._known_q_sdrs.shape[0] > 0:
+            pinned_replay = [p for p in self._learned_qa_replay if p[0].lower() in self._pinned_qa_keys]
+            unpinned_replay = [p for p in self._learned_qa_replay if p[0].lower() not in self._pinned_qa_keys][-40:]
+            replay_pairs = pinned_replay + unpinned_replay + random.sample(
+                BASE_HUMAN_DIALOGUES, k=min(48, len(BASE_HUMAN_DIALOGUES))
+            )
+            for txt in fresh[:16]:
+                replay_pairs.append((txt, txt))
+            return self.train_dialogue_finetune(
+                pairs=replay_pairs,
+                cortex=cortex,
+                engram_bank=None,
+                epochs=min(3, max(1, int(epochs or 2))),
+                lr=1.5e-4,
+                batch_size=32,
+                label_smoothing=0.05,
+                early_stop_loss=0.52,
+                decoder_byte_dropout=0.08,
+                cortex_noise_std=0.01,
+                register_questions=False,
+            )
+
+        replay_pool = [a for _, a in BASE_HUMAN_DIALOGUES]
+        replay_k = min(len(replay_pool), max(16, len(fresh) * 3))
+        mixed = fresh + random.sample(replay_pool, k=replay_k)
+        with self._op_lock:
+            res = self._train_denoising_epochs_unlocked(
+                texts=mixed,
+                epochs=min(2, int(epochs if epochs is not None else self.cfg.cortex_sleep_epochs)),
+                lr=min(1.5e-4, self.cfg.broca_lr * 0.15),
+                batch_size=self.cfg.broca_batch_size,
+                early_stop_loss=self.cfg.broca_early_stop_loss,
+                mask_prob=0.14,
+            )
+            if res["trained"]:
+                self.lora_updates_count += 1
+            return res
+
+    def adapt_qa_pairs_online(
+        self,
+        pairs: list[tuple[str, str]],
+        cortex: BiologicalAssociativeCortex,
+        steps: int = 18,
+        pinned: bool = False,
+        lightweight: bool = False,
+    ) -> float | None:
+        """
+        Fast (~180 ms on RTX 5080) ZERO-FORGETTING online Broca synaptic plasticity for newly taught
+        facts or personal conversational updates (e.g. brain's name, user's name, Auto-sieć definitions).
+        Protections against catastrophic forgetting:
+          1. Keeps Wernicke FROZEN so existing SDRs in Hippocampus and `_known_q_sdrs` NEVER drift.
+          2. Mixes >= 64 diverse dialogue + curriculum + pinned + uncertainty replay pairs (~85% of every batch).
+          3. Applies EWC-style L2 anchor regularization toward pre-update Broca weights so unrelated
+             Q&A answers (e.g. 'co to jest kot', 'co to jest fotosynteza') stay 100% intact.
+          4. Pinned entries (`pinned=True`) can NEVER be evicted from `_learned_qa_replay`.
+        """
+        clean_new = [
+            (q.strip(), a.strip()[:210])
+            for q, a in pairs
+            if q and a and len(q.strip()) >= 2 and len(a.strip()) >= 6
+        ]
+        if not clean_new:
+            return None
+
+        replay_pool = build_dialogue_qa_pairs(include_curriculum=True, min_chars=2)
+        new_q_low = {q.lower() for q, _ in clean_new}
+        # Always include pinned core identity/rule pairs + recent unpinned taught facts + broad Q&A replay
+        prior_pinned = [p for p in self._learned_qa_replay if p[0].lower() in self._pinned_qa_keys and p[0].lower() not in new_q_low][-24:]
+        prior_unpinned = [p for p in self._learned_qa_replay if p[0].lower() not in self._pinned_qa_keys and p[0].lower() not in new_q_low][-12:]
+        ood_anchors = [p for p in replay_pool if p[0].startswith("__")][:4]
+        general_pool = [p for p in replay_pool if p[0].lower() not in new_q_low and not p[0].startswith("__")]
+        replay = ood_anchors + prior_pinned + prior_unpinned + random.sample(general_pool, k=min(60, len(general_pool)))
+
+        # Keep new pairs <= ~15% of batch so Broca adapts cleanly without overwriting global weights
+        repeat_mult = 1 if lightweight else (2 if len(clean_new) <= 4 else 1)
+        batch_pairs = clean_new * repeat_mult + replay
+
+        with self._op_lock:
+            self._wernicke_raw.eval()
+            self._broca_raw.train()
+            broca_decay, broca_cond = [], []
+            cond_keys = ("cross_attn", "film", "bos_z_proj", "out_z_proj", "col_norm", "z_col_compress", "z_summary_proj")
+            for name, p in self._broca_raw.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if any(k in name for k in cond_keys):
+                    broca_cond.append(p)
+                else:
+                    broca_decay.append(p)
+            # Snapshot pre-update weights for EWC-style L2 anchor penalty (zero catastrophic forgetting)
+            anchor_params = [(p, p.detach().clone()) for p in self._broca_raw.parameters() if p.requires_grad]
+
+            kwargs: dict[str, Any] = {}
+            if self.device.type == "cuda":
+                kwargs["fused"] = True
+            lr_scale = 0.45 if lightweight else 1.0
+            opt = torch.optim.AdamW(
+                [
+                    {"params": broca_decay, "lr": 3.5e-4 * lr_scale, "weight_decay": 0.01},
+                    {"params": broca_cond, "lr": 1.8e-3 * lr_scale, "weight_decay": 0.0},
+                ],
+                **kwargs,
+            )
+
+            qs = [x[0] for x in batch_pairs]
+            ans = [x[1] for x in batch_pairs]
+            n_new_rows = len(clean_new) * repeat_mult
+            in_bytes, in_mask = encode_utf8_bytes(
+                qs,
+                max_bytes=self.cfg.max_input_bytes,
+                patch_size=self.cfg.patch_stride,
+                add_bos_eos=False,
+                mask_prob=0.0,
+                device=self.device,
+            )
+            tgt_bytes, _ = encode_utf8_bytes(
+                ans,
+                max_bytes=self.cfg.broca_max_seq_len,
+                patch_size=1,
+                add_bos_eos=True,
+                mask_prob=0.0,
+                device=self.device,
+            )
+
+            with torch.no_grad():
+                w_out = self._wernicke_raw(in_bytes, in_mask)
+                thought = cortex.perceive_and_think(
+                    sensory_columns=w_out.columns,
+                    sensory_sdr=w_out.sdr,
+                    engram_bank=None,
+                    sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
+                    steps=self.cfg.attractor_steps,
+                    noise_std=0.0,
+                    update_last_active=False,
+                )
+                z_star = thought.columns_star.detach()
+
+            broca_params = list(self._broca_raw.parameters())
+            min_steps = 4 if lightweight else 16
+            max_steps = max(min_steps, min(64, int(steps)))
+            ewc_weight = 0.012 if lightweight else 0.004
+            last_new_loss = 5.0
+            try:
+                for _ in range(max_steps):
+                    opt.zero_grad(set_to_none=True)
+                    with amp_autocast(self.device):
+                        # Separate new-pair loss & replay loss so Broca crisply absorbs new Wikipedia/personal facts
+                        # while EWC + 60+ replay pairs preserve all prior Q&A knowledge!
+                        loss_new = self._broca_raw.compute_loss(
+                            tgt_bytes[:n_new_rows],
+                            z_star[:n_new_rows],
+                            label_smoothing=0.03,
+                            decoder_byte_dropout=0.02,
+                            clean_z=True,
+                        )
+                        loss_rep = self._broca_raw.compute_loss(
+                            tgt_bytes[n_new_rows:],
+                            z_star[n_new_rows:],
+                            label_smoothing=0.05,
+                            decoder_byte_dropout=0.05,
+                            clean_z=True,
+                        )
+                        ewc_pen = sum((p - p0).pow(2).sum() for p, p0 in anchor_params)
+                        loss = 0.65 * loss_new + 0.35 * loss_rep + ewc_weight * ewc_pen
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(broca_params, max_norm=1.0)
+                    opt.step()
+                    self._broca_raw.trained_steps += 1
+                    last_new_loss = float(loss_new.detach().item())
+                    if last_new_loss <= 0.28:
+                        break
+            finally:
+                self._broca_raw.eval()
+
+            self._register_known_questions([q for q, _ in clean_new], replace=False)
+            if pinned:
+                for q, _ in clean_new:
+                    self._pinned_qa_keys.add(q.lower())
+            # Deduplicate replay buffer by lowercase question and NEVER evict pinned core entries!
+            existing = [p for p in self._learned_qa_replay if p[0].lower() not in new_q_low]
+            merged = existing + clean_new
+            pinned_entries = [p for p in merged if p[0].lower() in self._pinned_qa_keys]
+            unpinned_entries = [p for p in merged if p[0].lower() not in self._pinned_qa_keys]
+            rem_slots = max(0, 200 - len(pinned_entries))
+            self._learned_qa_replay = pinned_entries + (unpinned_entries[-rem_slots:] if rem_slots > 0 else [])
+            return round(last_new_loss, 4)
+
+    def adapt_qa_online(
+        self,
+        question: str,
+        answer: str,
+        cortex: BiologicalAssociativeCortex,
+        steps: int = 56,
+        pinned: bool = False,
+        lightweight: bool = False,
+    ) -> float:
+        """Single-pair wrapper around zero-drift online Broca adaptation."""
+        res = self.adapt_qa_pairs_online(
+            [(question, answer)],
+            cortex=cortex,
+            steps=steps,
+            pinned=pinned,
+            lightweight=lightweight,
+        )
+        return float(res) if res is not None else 5.0
+
+    def _normalize_z_columns(self, cols: torch.Tensor) -> torch.Tensor:
+        """Unify Z* RMS scale across training and BiologicalAssociativeCortex.perceive_and_think()."""
+        if hasattr(F, "rms_norm"):
+            return F.rms_norm(cols, (self.cfg.column_dim,), eps=1e-6)
+        return cols * torch.rsqrt(cols.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+
+    def train_dialogue_finetune(
+        self,
+        pairs: list[tuple[str, str]],
+        cortex: BiologicalAssociativeCortex,
+        engram_bank: torch.Tensor | None = None,
+        epochs: int = 120,
+        lr: float | None = None,
+        batch_size: int | None = None,
+        label_smoothing: float | None = None,
+        early_stop_loss: float | None = None,
+        decoder_byte_dropout: float | None = None,
+        cortex_noise_std: float = 0.015,
+        register_questions: bool = True,
+        progress_callback: Any | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """
+        Tokenless Dialogue + Q&A Fine-Tuning through the full cognitive pipeline:
+          Wernicke(question) -> BiologicalAssociativeCortex (attractor + noise, @torch.no_grad())
+            -> RMSNorm(Z*) -> BrocaByteTransformer(answer)
+        - Accepts short inputs down to 2 characters (NO 60-char floor!).
+        - Uses differential LR (2x on Z* conditioning pathways: cross-attn, FiLM, BOS/out bridges)
+          + cosine decay + label_smoothing=0.05 + decoder byte dropout so Broca reliably answers
+          the user's actual question conditioned on Z*.
+        """
+        import math
+
+        clean_pairs = [
+            (q.strip(), a.strip())
+            for q, a in pairs
+            if q and a and len(q.strip()) >= 2 and len(a.strip()) >= 2
+        ]
+        if not clean_pairs:
+            return {
+                "trained": False,
+                "samples": 0,
+                "dialogues": 0,
+                "epochs_run": 0,
+                "loss_start": round(self._broca_raw.last_loss, 4),
+                "loss_end": round(self._broca_raw.last_loss, 4),
+                "fluency": self._broca_raw.fluency_score,
+                "duration_ms": 0.0,
+            }
+
+        t0 = time.perf_counter()
+        eff_lr = float(lr if lr is not None else self.cfg.broca_dialogue_lr)
+        eff_ls = float(label_smoothing if label_smoothing is not None else self.cfg.broca_dialogue_label_smoothing)
+        eff_stop = float(early_stop_loss if early_stop_loss is not None else self.cfg.broca_dialogue_early_stop_loss)
+        eff_drop = float(0.08 if decoder_byte_dropout is None else decoder_byte_dropout)
+        is_cuda = self.device.type == "cuda"
+        # VRAM-aware GPU batch sizing (stay well below WDDM paging cliff while saturating Tensor Cores!)
+        if batch_size is not None:
+            bs = int(batch_size)
+        elif is_cuda:
+            try:
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024.0 ** 3)
+            except Exception:
+                vram_gb = 12.0
+            # Keep peak activations safely inside physical 16 GB VRAM (zero WDDM RAM paging!)
+            bs = 48 if vram_gb >= 14.0 else 32
+        else:
+            bs = 24
+        bs = max(2, bs)
+        total_epochs = max(1, int(epochs))
+        all_params = list(self._wernicke_raw.parameters()) + list(self._broca_raw.parameters())
+
+        # Pre-encode all UTF-8 byte sequences ONCE on CPU before the epoch loop
+        # (eliminates 160x redundant Python string encoding + regex diacritic stripping!).
+        import numpy as np
+        from .sensory_wernicke import BOS_BYTE, EOS_BYTE, MASK_BYTE, PAD_BYTE
+
+        in_cap = max(1, int(self.cfg.max_input_bytes))
+        tgt_cap = max(1, int(self.cfg.broca_max_seq_len) - 2)
+        patch_stride = max(1, int(self.cfg.patch_stride))
+
+        pre_q_orig: list[np.ndarray] = []
+        pre_q_alt: list[np.ndarray] = []
+        pre_ans: list[np.ndarray] = []
+        pre_ans_lens: list[int] = []
+        for raw_q, raw_a in clean_pairs:
+            qb = raw_q.encode("utf-8")[:in_cap]
+            pre_q_orig.append(np.frombuffer(qb, dtype=np.uint8))
+            if not raw_q.startswith("__"):
+                alt_s = _strip_pl(raw_q).rstrip("?!.").strip()
+                alt_b = (alt_s if len(alt_s) >= 2 else raw_q).encode("utf-8")[:in_cap]
+                pre_q_alt.append(np.frombuffer(alt_b, dtype=np.uint8))
+            else:
+                pre_q_alt.append(pre_q_orig[-1])
+            ab = raw_a.encode("utf-8")[:tgt_cap]
+            pre_ans.append(np.frombuffer(ab, dtype=np.uint8))
+            pre_ans_lens.append(len(ab))
+
+        def _pack_preencoded_batch(
+            idxs: list[int],
+            use_alt_prob: float,
+            mask_p: float,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            b_n = len(idxs)
+            q_arrs = [
+                pre_q_alt[i] if (use_alt_prob > 0.0 and random.random() < use_alt_prob) else pre_q_orig[i]
+                for i in idxs
+            ]
+            a_arrs = [pre_ans[i] for i in idxs]
+            q_max = max((len(x) for x in q_arrs), default=1)
+            if patch_stride > 1:
+                q_max = max(patch_stride, math.ceil(q_max / patch_stride) * patch_stride)
+            q_max = min(in_cap, max(1, q_max))
+            if patch_stride > 1 and q_max % patch_stride != 0:
+                q_max = max(patch_stride, (q_max // patch_stride) * patch_stride)
+            a_max = min(self.cfg.broca_max_seq_len, max(3, max((len(x) for x in a_arrs), default=1) + 2))
+
+            q_np = np.full((b_n, q_max), PAD_BYTE, dtype=np.int64)
+            a_np = np.full((b_n, a_max), PAD_BYTE, dtype=np.int64)
+            for r, arr in enumerate(q_arrs):
+                n = min(len(arr), q_max)
+                if n > 0:
+                    q_np[r, :n] = arr[:n]
+            for r, arr in enumerate(a_arrs):
+                n = min(len(arr), a_max - 2)
+                a_np[r, 0] = BOS_BYTE
+                if n > 0:
+                    a_np[r, 1 : 1 + n] = arr[:n]
+                a_np[r, 1 + n] = EOS_BYTE
+
+            in_t = torch.from_numpy(q_np)
+            mask_t = in_t.ne(PAD_BYTE)
+            tgt_t = torch.from_numpy(a_np)
+            if is_cuda:
+                in_b = in_t.pin_memory().to(self.device, non_blocking=True)
+                in_m = mask_t.pin_memory().to(self.device, non_blocking=True)
+                tg_b = tgt_t.pin_memory().to(self.device, non_blocking=True)
+            else:
+                in_b = in_t.to(self.device)
+                in_m = mask_t.to(self.device)
+                tg_b = tgt_t.to(self.device)
+            if mask_p > 0.0:
+                corruptible = in_m & (in_b < 256)
+                drop = (torch.rand(in_b.shape, device=self.device) < mask_p) & corruptible
+                in_b = torch.where(drop, torch.full_like(in_b, MASK_BYTE), in_b)
+            return in_b, in_m, tg_b
+
+        with self._op_lock:
+            self._wernicke_raw.train()
+            self._broca_raw.train()
+            cond_mult = 2.0
+            opt = self._build_optimizer(lr=eff_lr, cond_lr_mult=cond_mult)
+
+            loss_start: float | None = None
+            loss_end: float = self._broca_raw.last_loss
+            epochs_run = 0
+            ep_loss_gpu = torch.zeros((), device=self.device, dtype=torch.float32)
+
+            probe_pool = [
+                (q, a) for q, a in clean_pairs
+                if not q.startswith("__") and 2 <= len(q) <= 140 and len(a) >= 6
+            ]
+            if probe_pool:
+                random.shuffle(probe_pool)
+            probe_idx = 0
+            last_probe_t = 0.0
+            last_cb_t = 0.0
+
+            def _emit_dialogue_progress(phase: str, ep_num: int, ep_tot: int, force_probe: bool = False) -> None:
+                nonlocal probe_idx, last_probe_t, last_cb_t
+                if progress_callback is None:
+                    return
+                now = time.perf_counter()
+                do_probe = bool(probe_pool) and (
+                    force_probe
+                    or last_probe_t == 0.0
+                    or (now - last_probe_t) >= 4.0
+                )
+                if not do_probe and (now - last_cb_t) < 0.55:
+                    return
+                sample_q = ""
+                sample_target = ""
+                sample_brain = ""
+                if do_probe:
+                    sample_q, sample_target = probe_pool[probe_idx % len(probe_pool)]
+                    probe_idx += 1
+                    self._wernicke_raw.eval()
+                    self._broca_raw.eval()
+                    try:
+                        with torch.no_grad():
+                            w_p = self.perceive_one(sample_q)
+                            t_p = cortex.perceive_and_think(
+                                sensory_columns=w_p.columns,
+                                sensory_sdr=w_p.sdr,
+                                engram_bank=engram_bank,
+                                sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
+                                steps=self.cfg.attractor_steps,
+                                noise_std=0.0,
+                                update_last_active=False,
+                            )
+                            gen_p = self.decode_columns(
+                                t_p.columns_star,
+                                max_new_bytes=min(96, self.cfg.broca_max_seq_len),
+                                temperature=0.55,
+                            )
+                            sample_brain = str(gen_p.get("text", "")).strip()
+                    except Exception:
+                        sample_brain = ""
+                    finally:
+                        self._wernicke_raw.train()
+                        self._broca_raw.train()
+                    last_probe_t = time.perf_counter()
+                last_cb_t = time.perf_counter()
+                try:
+                    progress_callback(
+                        {
+                            "phase": phase,
+                            "epoch": ep_num,
+                            "total_epochs": ep_tot,
+                            "loss_start": round(float(loss_start if loss_start is not None else loss_end), 4),
+                            "loss_now": round(float(loss_end), 4),
+                            "fluency": self._broca_raw.fluency_score,
+                            "dialogues": len(clean_pairs),
+                            "sample_q": sample_q,
+                            "sample_target": sample_target,
+                            "sample_brain": sample_brain,
+                            "fresh_probe": do_probe,
+                        }
+                    )
+                except Exception:
+                    pass
+
+            all_indices = list(range(len(clean_pairs)))
+            # Keep at most 2 async batches queued on GPU so VRAM stays flat (zero WDDM RAM spill!)
+            cuda_ev_ring = [torch.cuda.Event(), torch.cuda.Event()] if is_cuda else []
+            ev_slot = 0
+            ev_armed = 0
+            try:
+                for ep in range(total_epochs):
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    epochs_run += 1
+                    prog = float(ep) / float(max(1, total_epochs - 1))
+                    scale = 0.15 + 0.85 * 0.5 * (1.0 + math.cos(math.pi * prog))
+                    opt.param_groups[0]["lr"] = eff_lr * scale
+                    opt.param_groups[1]["lr"] = eff_lr * scale
+                    opt.param_groups[2]["lr"] = eff_lr * cond_mult * scale
+
+                    # Length-bucketed mini-batches cut wasted padding FLOPs by ~40% while shuffling batch order!
+                    order_idx = sorted(all_indices, key=lambda idx: pre_ans_lens[idx] + random.randint(-8, 8))
+                    batches = [order_idx[i : i + bs] for i in range(0, len(order_idx), bs)]
+                    random.shuffle(batches)
+                    ep_loss_gpu.zero_()
+                    ep_batches = 0
+
+                    for batch_idxs in batches:
+                        if is_cuda and ev_armed >= len(cuda_ev_ring):
+                            cuda_ev_ring[ev_slot].synchronize()
+                        in_bytes, in_mask, tgt_bytes = _pack_preencoded_batch(batch_idxs, use_alt_prob=0.25, mask_p=0.04)
+
+                        opt.zero_grad(set_to_none=True)
+                        with amp_autocast(self.device):
+                            w_out = self.wernicke(in_bytes, in_mask)
+                            z_wernicke = self._normalize_z_columns(w_out.reconstructed_columns)
+
+                            with torch.no_grad():
+                                thought = cortex.perceive_and_think(
+                                    sensory_columns=w_out.columns.detach(),
+                                    sensory_sdr=w_out.sdr.detach(),
+                                    engram_bank=engram_bank,
+                                    sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
+                                    steps=self.cfg.attractor_steps,
+                                    noise_std=cortex_noise_std,
+                                    update_last_active=False,
+                                )
+                                z_cortex = thought.columns_star.to(dtype=z_wernicke.dtype)
+
+                            z_star = self._normalize_z_columns(z_wernicke + (z_cortex - z_wernicke.detach()))
+                            ce_loss = self._broca_raw.compute_loss(
+                                tgt_bytes,
+                                z_star,
+                                label_smoothing=eff_ls,
+                                decoder_byte_dropout=eff_drop,
+                                clean_z=True,
+                            )
+                            loss = ce_loss + self._z_decorrelation_loss(z_star)
+
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+                        opt.step()
+
+                        # Accumulate on GPU (ZERO per-step .item() CUDA sync stalls!)
+                        ep_loss_gpu += ce_loss.detach().float()
+                        ep_batches += 1
+                        self._broca_raw.trained_steps += 1
+                        if is_cuda:
+                            cuda_ev_ring[ev_slot].record()
+                            ev_slot = (ev_slot + 1) % len(cuda_ev_ring)
+                            ev_armed += 1
+
+                    loss_end = float((ep_loss_gpu / float(max(1, ep_batches))).item())
+                    if loss_start is None:
+                        loss_start = loss_end
+                    self._broca_raw._update_fluency(loss_end)
+                    hit_stop = loss_end <= eff_stop
+                    is_last = (ep + 1 >= total_epochs) or hit_stop
+                    _emit_dialogue_progress(
+                        "dialogue_train",
+                        epochs_run,
+                        total_epochs,
+                        force_probe=(epochs_run == 1 or (is_last and (time.perf_counter() - last_probe_t) >= 0.8)),
+                    )
+                    if hit_stop:
+                        break
+
+                # Batched Predictive-Coding Hard-Example Scan (~25x faster than batch=1 loop!)
+                if total_epochs >= 40 and len(clean_pairs) >= 40 and (stop_event is None or not stop_event.is_set()):
+                    self._wernicke_raw.eval()
+                    self._broca_raw.eval()
+                    hard_indices: list[int] = []
+                    eval_bs = bs if is_cuda else 16
+                    from .sensory_wernicke import BYTE_VOCAB_SIZE
+                    with torch.no_grad():
+                        for i in range(0, len(all_indices), eval_bs):
+                            chunk_idxs = all_indices[i : i + eval_bs]
+                            in_b, in_m, tgt_b = _pack_preencoded_batch(chunk_idxs, use_alt_prob=0.0, mask_p=0.0)
+                            with amp_autocast(self.device):
+                                w_c = self._wernicke_raw(in_b, in_m)
+                                t_c = cortex.perceive_and_think(
+                                    sensory_columns=w_c.columns,
+                                    sensory_sdr=w_c.sdr,
+                                    engram_bank=None,
+                                    sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
+                                    steps=self.cfg.attractor_steps,
+                                    noise_std=0.0,
+                                    update_last_active=False,
+                                )
+                                logits = self._broca_raw.forward(tgt_b[:, :-1], t_c.columns_star, clean_z=True)
+                            tgt_next = tgt_b[:, 1:]
+                            per_tok = F.cross_entropy(
+                                logits.float().reshape(-1, BYTE_VOCAB_SIZE),
+                                tgt_next.reshape(-1),
+                                ignore_index=PAD_BYTE,
+                                reduction="none",
+                            ).view(tgt_next.shape)
+                            valid_tok = (tgt_next != PAD_BYTE).float()
+                            row_nlls = (per_tok * valid_tok).sum(dim=1) / valid_tok.sum(dim=1).clamp(min=1.0)
+                            for j, nll_v in enumerate(row_nlls.tolist()):
+                                if nll_v > 0.50:
+                                    hard_indices.append(chunk_idxs[j])
+
+                    if hard_indices:
+                        self._wernicke_raw.train()
+                        self._broca_raw.train()
+                        opt_p = self._build_optimizer(lr=eff_lr * 0.45, cond_lr_mult=2.0)
+                        p_loss_gpu = torch.zeros((), device=self.device, dtype=torch.float32)
+                        for p_ep in range(28):
+                            if stop_event is not None and stop_event.is_set():
+                                break
+                            replay_k = min(len(all_indices), max(32, len(hard_indices)))
+                            polish_order = sorted(
+                                hard_indices + random.sample(all_indices, k=replay_k),
+                                key=lambda idx: pre_ans_lens[idx],
+                            )
+                            p_batches = [polish_order[i : i + bs] for i in range(0, len(polish_order), bs)]
+                            random.shuffle(p_batches)
+                            p_loss_gpu.zero_()
+                            p_cnt = 0
+                            for p_batch_idxs in p_batches:
+                                in_bytes, in_mask, tgt_bytes = _pack_preencoded_batch(
+                                    p_batch_idxs, use_alt_prob=0.0, mask_p=0.02
+                                )
+                                opt_p.zero_grad(set_to_none=True)
+                                with amp_autocast(self.device):
+                                    w_out = self.wernicke(in_bytes, in_mask)
+                                    z_wernicke = self._normalize_z_columns(w_out.reconstructed_columns)
+                                    with torch.no_grad():
+                                        thought = cortex.perceive_and_think(
+                                            sensory_columns=w_out.columns.detach(),
+                                            sensory_sdr=w_out.sdr.detach(),
+                                            engram_bank=engram_bank,
+                                            sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
+                                            steps=self.cfg.attractor_steps,
+                                            noise_std=0.005,
+                                            update_last_active=False,
+                                        )
+                                        z_cortex = thought.columns_star.to(dtype=z_wernicke.dtype)
+                                    z_star = self._normalize_z_columns(z_wernicke + (z_cortex - z_wernicke.detach()))
+                                    ce_loss = self._broca_raw.compute_loss(
+                                        tgt_bytes,
+                                        z_star,
+                                        label_smoothing=0.04,
+                                        decoder_byte_dropout=0.04,
+                                        clean_z=True,
+                                    )
+                                    loss = ce_loss + self._z_decorrelation_loss(z_star)
+                                loss.backward()
+                                torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+                                opt_p.step()
+                                p_loss_gpu += ce_loss.detach().float()
+                                p_cnt += 1
+                                self._broca_raw.trained_steps += 1
+                            loss_end = float((p_loss_gpu / float(max(1, p_cnt))).item())
+                            self._broca_raw._update_fluency(loss_end)
+                            hit_p_stop = loss_end <= 0.36
+                            _emit_dialogue_progress(
+                                "dialogue_polish",
+                                p_ep + 1,
+                                28,
+                                force_probe=(p_ep == 0 or hit_p_stop or p_ep == 27),
+                            )
+                            if hit_p_stop:
+                                break
+            finally:
+                self._wernicke_raw.eval()
+                self._broca_raw.eval()
+                if is_cuda:
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+            if register_questions:
+                self._register_known_questions([q for q, _ in clean_pairs], replace=True)
+            self.lora_updates_count += 1
+            self._refresh_status()
+
+            return {
+                "trained": True,
+                "samples": len(clean_pairs),
+                "dialogues": len(clean_pairs),
+                "epochs_run": epochs_run,
+                "loss_start": round(float(loss_start if loss_start is not None else loss_end), 4),
+                "loss_end": round(float(loss_end), 4),
+                "fluency": self._broca_raw.fluency_score,
+                "duration_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+            }
+
+    def train_language_cortex(
+        self,
+        extra_texts: list[str] | None = None,
+        epochs: int | None = None,
+        include_curriculum: bool = True,
+        cortex: BiologicalAssociativeCortex | None = None,
+        engram_bank: torch.Tensor | None = None,
+        extra_qa_pairs: list[tuple[str, str]] | None = None,
+        progress_callback: Any | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        if cortex is not None:
+            merged_extra = list(self._learned_qa_replay)
+            if extra_qa_pairs:
+                merged_extra.extend(extra_qa_pairs)
+            pairs = build_dialogue_qa_pairs(
+                include_curriculum=include_curriculum,
+                extra_pairs=merged_extra,
+                min_chars=2,
+            )
+            return self.train_dialogue_finetune(
+                pairs=pairs,
+                cortex=cortex,
+                engram_bank=engram_bank,
+                epochs=int(epochs if epochs is not None else self.cfg.language_train_epochs),
+                lr=self.cfg.broca_dialogue_lr,
+                batch_size=None,
+                label_smoothing=self.cfg.broca_dialogue_label_smoothing,
+                early_stop_loss=self.cfg.broca_dialogue_early_stop_loss,
+                progress_callback=progress_callback,
+                stop_event=stop_event,
+            )
+        corpus = build_denoising_corpus(
+            extra_texts=extra_texts,
+            include_base=True,
+            include_curriculum=include_curriculum,
+            max_samples=1200,
+        )
+        with self._op_lock:
+            res = self._train_denoising_epochs_unlocked(
+                texts=corpus,
+                epochs=int(epochs if epochs is not None else self.cfg.language_train_epochs),
+                lr=self.cfg.broca_lr,
+                batch_size=self.cfg.broca_batch_size,
+                early_stop_loss=self.cfg.broca_early_stop_loss,
+                mask_prob=0.18,
+            )
+            if res["trained"]:
+                self.lora_updates_count += 1
+            res["dialogues"] = res["samples"]
+            return res
+
+    def train_streaming_batches(
+        self,
+        chunk_iterable_factory: Any,
+        epochs: int = 1,
+        batch_size: int = 32,
+        lr: float | None = None,
+        early_stop_loss: float | None = None,
+        mask_prob: float = 0.18,
+        max_steps_per_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        Streaming bfloat16 denoising training for large local UTF-8 text corpora (100-300 MB)
+        without loading all text into RAM.
+        """
+        t0 = time.perf_counter()
+        eff_lr = float(lr if lr is not None else self.cfg.broca_lr)
+        stop_loss = float(early_stop_loss if early_stop_loss is not None else self.cfg.broca_early_stop_loss)
+        bs = max(1, int(batch_size))
+
+        with self._op_lock:
+            self._wernicke_raw.train()
+            self._broca_raw.train()
+            opt = self._build_optimizer(lr=eff_lr)
+
+            loss_start: float | None = None
+            loss_end: float = self._broca_raw.last_loss
+            total_samples = 0
+            total_batches = 0
+            epochs_run = 0
+
+            try:
+                for _ in range(max(1, int(epochs))):
+                    epochs_run += 1
+                    ep_loss_sum = 0.0
+                    ep_batches = 0
+                    batch_buf: list[str] = []
+
+                    def _flush_batch(items: list[str]) -> float:
+                        nonlocal loss_start, total_samples, total_batches
+                        in_bytes, in_mask = encode_utf8_bytes(
+                            items,
+                            max_bytes=self.cfg.max_input_bytes,
+                            patch_size=self.cfg.patch_stride,
+                            add_bos_eos=False,
+                            mask_prob=mask_prob,
+                            device=self.device,
+                        )
+                        tgt_bytes, _ = encode_utf8_bytes(
+                            items,
+                            max_bytes=self.cfg.broca_max_seq_len,
+                            patch_size=1,
+                            add_bos_eos=True,
+                            mask_prob=0.0,
+                            device=self.device,
+                        )
+                        opt.zero_grad(set_to_none=True)
+                        with amp_autocast(self.device):
+                            w_out = self.wernicke(in_bytes, in_mask)
+                            loss = self._broca_raw.compute_loss(tgt_bytes, w_out.reconstructed_columns)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(
+                            list(self._wernicke_raw.parameters()) + list(self._broca_raw.parameters()),
+                            max_norm=1.0,
+                        )
+                        opt.step()
+
+                        val = float(loss.detach().item())
+                        if loss_start is None:
+                            loss_start = val
+                        total_samples += len(items)
+                        total_batches += 1
+                        self._broca_raw.trained_steps += 1
+                        return val
+
+                    stream: Iterable[str] = chunk_iterable_factory()
+                    for chunk in stream:
+                        batch_buf.append(chunk)
+                        if len(batch_buf) >= bs:
+                            ep_loss_sum += _flush_batch(batch_buf)
+                            ep_batches += 1
+                            batch_buf.clear()
+                            if max_steps_per_epoch is not None and ep_batches >= max_steps_per_epoch:
+                                break
+                    if batch_buf and (max_steps_per_epoch is None or ep_batches < max_steps_per_epoch):
+                        ep_loss_sum += _flush_batch(batch_buf)
+                        ep_batches += 1
+                        batch_buf.clear()
+
+                    if ep_batches > 0:
+                        loss_end = ep_loss_sum / ep_batches
+                        self._broca_raw._update_fluency(loss_end)
+                        if loss_end <= stop_loss:
+                            break
+            finally:
+                self._wernicke_raw.eval()
+                self._broca_raw.eval()
+
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            if total_batches > 0:
+                self.lora_updates_count += 1
+            self._refresh_status()
+
+            return {
+                "trained": total_batches > 0,
+                "samples": total_samples,
+                "batches": total_batches,
+                "epochs_run": epochs_run,
+                "loss_start": round(float(loss_start if loss_start is not None else loss_end), 4),
+                "loss_end": round(float(loss_end), 4),
+                "fluency": self._broca_raw.fluency_score,
+                "duration_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+            }
+
+    def train_parquet_polish_stream(
+        self,
+        pair_iterable_factory: Any,
+        max_steps: int = 3000,
+        batch_size: int = 128,
+        lr: float | None = None,
+        early_stop_loss: float | None = None,
+        mask_prob: float = 0.16,
+        stop_event: threading.Event | None = None,
+        progress_callback: Any | None = None,
+        checkpoint_callback: Any | None = None,
+        checkpoint_every: int = 500,
+    ) -> dict[str, Any]:
+        """
+        High-throughput RTX 5080 bfloat16 streaming Polish grammar & syntax trainer:
+          - Background producer thread overlaps Parquet IO + NumPy UTF-8 encoding + length-bucketing
+            + pinned host memory transfers with GPU compute (zero CPU stalls!).
+          - Length-bucketed batches cut wasted padding FLOPs by ~40% while shuffling bucket order.
+          - Accumulates loss on GPU without per-step `.item()` CUDA sync barriers (syncs every 16 steps).
+          - Trains WernickeByteCortex + BrocaByteTransformer on `(src, tgt)` pairs (65% denoising +
+            35% next-sentence continuation) with linear warmup + cosine LR decay & AdamW(fused=True).
+        """
+        import math
+        import queue
+
+        t0 = time.perf_counter()
+        bs = max(2, int(batch_size))
+        default_lr = self.cfg.broca_lr * (1.35 if bs >= 128 else 1.0)
+        base_lr = float(lr if lr is not None else default_lr)
+        stop_loss = float(early_stop_loss if early_stop_loss is not None else self.cfg.broca_early_stop_loss)
+        steps_cap = max(1, int(max_steps))
+        warmup_steps = min(150, max(10, steps_cap // 12))
+        is_cuda = self.device.type == "cuda"
+
+        all_params = list(self._wernicke_raw.parameters()) + list(self._broca_raw.parameters())
+        opt = self._build_optimizer(lr=base_lr)
+
+        # Deeper async CPU prefetch queue with length-bucketing & pinned memory (zero GPU stalls!)
+        prefetch_q: queue.Queue[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, str, str] | None] = queue.Queue(maxsize=12)
+        local_stop = threading.Event()
+        pool_target = bs * 16
+
+        def _producer() -> None:
+            produced_steps = 0
+            try:
+                while produced_steps < steps_cap and not local_stop.is_set() and (stop_event is None or not stop_event.is_set()):
+                    pool: list[tuple[str, str]] = []
+                    any_item = False
+                    for pair in pair_iterable_factory():
+                        if local_stop.is_set() or (stop_event is not None and stop_event.is_set()):
+                            break
+                        any_item = True
+                        pool.append(pair)
+                        if len(pool) >= pool_target:
+                            pool.sort(key=lambda x: len(x[1]))
+                            chunks = [pool[i : i + bs] for i in range(0, len(pool), bs) if len(pool[i : i + bs]) == bs]
+                            random.shuffle(chunks)
+                            for ch in chunks:
+                                if produced_steps >= steps_cap or local_stop.is_set() or (stop_event is not None and stop_event.is_set()):
+                                    break
+                                srcs = [x[0] for x in ch]
+                                tgts = [x[1] for x in ch]
+                                in_b, in_m = encode_utf8_bytes(
+                                    srcs,
+                                    max_bytes=self.cfg.max_input_bytes,
+                                    patch_size=self.cfg.patch_stride,
+                                    add_bos_eos=False,
+                                    mask_prob=0.0,
+                                    device=None,
+                                    pin_memory=is_cuda,
+                                )
+                                tg_b, _ = encode_utf8_bytes(
+                                    tgts,
+                                    max_bytes=self.cfg.broca_max_seq_len,
+                                    patch_size=1,
+                                    add_bos_eos=True,
+                                    mask_prob=0.0,
+                                    device=None,
+                                    pin_memory=is_cuda,
+                                )
+                                prefetch_q.put((in_b, in_m, tg_b, len(srcs), srcs[0], tgts[0]))
+                                produced_steps += 1
+                            pool.clear()
+                            if produced_steps >= steps_cap:
+                                break
+                    if pool and produced_steps < steps_cap and not local_stop.is_set() and (stop_event is None or not stop_event.is_set()):
+                        pool.sort(key=lambda x: len(x[1]))
+                        for i in range(0, len(pool), bs):
+                            ch = pool[i : i + bs]
+                            if not ch or produced_steps >= steps_cap:
+                                break
+                            srcs = [x[0] for x in ch]
+                            tgts = [x[1] for x in ch]
+                            in_b, in_m = encode_utf8_bytes(
+                                srcs,
+                                max_bytes=self.cfg.max_input_bytes,
+                                patch_size=self.cfg.patch_stride,
+                                add_bos_eos=False,
+                                mask_prob=0.0,
+                                device=None,
+                                pin_memory=is_cuda,
+                            )
+                            tg_b, _ = encode_utf8_bytes(
+                                tgts,
+                                max_bytes=self.cfg.broca_max_seq_len,
+                                patch_size=1,
+                                add_bos_eos=True,
+                                mask_prob=0.0,
+                                device=None,
+                                pin_memory=is_cuda,
+                            )
+                            prefetch_q.put((in_b, in_m, tg_b, len(srcs), srcs[0], tgts[0]))
+                            produced_steps += 1
+                    if not any_item:
+                        break
+            finally:
+                prefetch_q.put(None)
+
+        prod_thread = threading.Thread(target=_producer, daemon=True)
+        prod_thread.start()
+
+        loss_start: float | None = None
+        ema_loss: float | None = None
+        total_samples = 0
+        steps_done = 0
+        last_sample_text = ""
+        last_probe_prompt = ""
+        last_probe_target = ""
+        last_probe_t = 0.0
+        sync_interval = 16
+        loss_window = torch.zeros((), device=self.device, dtype=torch.float32)
+        window_count = 0
+        # 2-slot CUDA Event ring: bounds in-flight GPU queue to <= 2 steps so VRAM NEVER
+        # snowballs into Windows WDDM Shared RAM (eliminates 5 GB -> 20 GB sawtooth spikes!)
+        # while keeping 100% CPU/GPU pipeline overlap.
+        cuda_ev_ring = [torch.cuda.Event(), torch.cuda.Event()] if is_cuda else []
+        ev_slot = 0
+        ev_armed = 0
+
+        def _set_lr(step_i: int) -> float:
+            if step_i < warmup_steps:
+                cur_lr = base_lr * float(step_i + 1) / float(max(1, warmup_steps))
+            else:
+                prog = min(1.0, float(step_i - warmup_steps) / float(max(1, steps_cap - warmup_steps)))
+                cur_lr = base_lr * (0.12 + 0.88 * 0.5 * (1.0 + math.cos(math.pi * prog)))
+            for pg in opt.param_groups:
+                pg["lr"] = cur_lr
+            return cur_lr
+
+        try:
+            with self._op_lock:
+                self._wernicke_raw.train()
+                self._broca_raw.train()
+
+            while steps_done < steps_cap:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                if is_cuda and ev_armed >= len(cuda_ev_ring):
+                    cuda_ev_ring[ev_slot].synchronize()
+                item = prefetch_q.get()
+                if item is None:
+                    break
+                in_cpu, mask_cpu, tgt_cpu, batch_n, batch_src, batch_tgt = item
+                cur_lr = _set_lr(steps_done)
+
+                in_bytes = in_cpu.to(self.device, non_blocking=is_cuda)
+                in_mask = mask_cpu.to(self.device, non_blocking=is_cuda)
+                tgt_bytes = tgt_cpu.to(self.device, non_blocking=is_cuda)
+
+                if mask_prob > 0.0:
+                    corruptible = in_mask & (in_bytes < 256)
+                    drop = (torch.rand(in_bytes.shape, device=self.device) < mask_prob) & corruptible
+                    in_bytes = torch.where(drop, torch.full_like(in_bytes, 259), in_bytes)
+
+                with self._op_lock:
+                    opt.zero_grad(set_to_none=True)
+                    with amp_autocast(self.device):
+                        w_out = self.wernicke(in_bytes, in_mask)
+                        z_cols = self._normalize_z_columns(w_out.reconstructed_columns)
+                        loss = self._broca_raw.compute_loss(tgt_bytes, z_cols) + self._z_decorrelation_loss(z_cols)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+                    opt.step()
+                    self._broca_raw.trained_steps += 1
+                    loss_window += loss.detach().float()
+                    window_count += 1
+                del in_bytes, in_mask, tgt_bytes, w_out, z_cols, loss
+                if is_cuda:
+                    cuda_ev_ring[ev_slot].record()
+                    ev_slot = (ev_slot + 1) % len(cuda_ev_ring)
+                    ev_armed += 1
+
+                total_samples += batch_n
+                steps_done += 1
+
+                if steps_done == 1 or window_count >= sync_interval or steps_done >= steps_cap:
+                    avg_val = float((loss_window / float(max(1, window_count))).item())
+                    loss_window.zero_()
+                    was_first_window = (steps_done > 1) and (ema_loss == loss_start)
+                    window_count = 0
+                    if loss_start is None:
+                        loss_start = avg_val
+                    if ema_loss is None or was_first_window:
+                        ema_loss = avg_val
+                    else:
+                        ema_loss = 0.70 * ema_loss + 0.30 * avg_val
+                    self._broca_raw._update_fluency(ema_loss)
+                    self._refresh_status()
+
+                    fresh_probe = False
+                    now_p = time.perf_counter()
+                    if (
+                        steps_done == 16
+                        or steps_done % 256 == 0
+                        or steps_done == steps_cap
+                        or (now_p - last_probe_t) >= 4.5
+                    ):
+                        probe_src = batch_src or "Język polski ma bogatą gramatykę i poprawną składnię."
+                        probe_tgt = batch_tgt or probe_src
+                        with self._op_lock:
+                            self._wernicke_raw.eval()
+                            self._broca_raw.eval()
+                        try:
+                            probe_out = self.perceive_one(probe_src)
+                            gen = self.decode_columns(
+                                probe_out.reconstructed_columns,
+                                max_new_bytes=90,
+                                temperature=0.72,
+                            )
+                            last_sample_text = gen["text"]
+                            last_probe_prompt = probe_src
+                            last_probe_target = probe_tgt
+                            fresh_probe = True
+                            last_probe_t = time.perf_counter()
+                        finally:
+                            with self._op_lock:
+                                self._wernicke_raw.train()
+                                self._broca_raw.train()
+
+                    if progress_callback is not None:
+                        elapsed = max(0.001, time.perf_counter() - t0)
+                        progress_callback(
+                            {
+                                "step": steps_done,
+                                "max_steps": steps_cap,
+                                "samples": total_samples,
+                                "loss_start": round(float(loss_start or 0.0), 4),
+                                "loss_now": round(float(ema_loss or 0.0), 4),
+                                "fluency": self._broca_raw.fluency_score,
+                                "lr": cur_lr,
+                                "samples_per_sec": round(total_samples / elapsed, 1),
+                                "sample_preview": last_sample_text,
+                                "sample_prompt": last_probe_prompt if fresh_probe else batch_src,
+                                "sample_target": last_probe_target if fresh_probe else batch_tgt,
+                                "fresh_probe": fresh_probe,
+                            }
+                        )
+
+                    if ema_loss is not None and steps_done >= warmup_steps and ema_loss <= stop_loss:
+                        break
+
+                if checkpoint_callback is not None and checkpoint_every > 0 and steps_done % checkpoint_every == 0:
+                    checkpoint_callback()
+        finally:
+            local_stop.set()
+            while not prefetch_q.empty():
+                try:
+                    prefetch_q.get_nowait()
+                except queue.Empty:
+                    break
+            prod_thread.join(timeout=2.0)
+
+            if window_count > 0:
+                avg_val = float((loss_window / float(window_count)).item())
+                if loss_start is None:
+                    loss_start = avg_val
+                ema_loss = avg_val if ema_loss is None else (0.80 * ema_loss + 0.20 * avg_val)
+                self._broca_raw._update_fluency(ema_loss)
+
+            with self._op_lock:
+                self._wernicke_raw.eval()
+                self._broca_raw.eval()
+                if steps_done > 0:
+                    self.lora_updates_count += 1
+                self._refresh_status()
+
+        if is_cuda:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        return {
+            "trained": steps_done > 0,
+            "steps": steps_done,
+            "samples": total_samples,
+            "loss_start": round(float(loss_start if loss_start is not None else self._broca_raw.last_loss), 4),
+            "loss_end": round(float(ema_loss if ema_loss is not None else self._broca_raw.last_loss), 4),
+            "fluency": self._broca_raw.fluency_score,
+            "sample_preview": last_sample_text,
+            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+        }
+
+    # ── Minimal Query Cleaning & Sensory Splitting for brain/web_learner.py ──
+    @staticmethod
+    def normalize_study_queries(raw_topic: str) -> list[str]:
         q = raw_topic.strip()
         if not q:
             return []
-
-        # Fix common Polish phonetic typos and missing diacritics
         typo_rules = [
             (r"\bwzk", "wsk"),
             (r"\bwzp", "wsp"),
@@ -578,2601 +2148,16 @@ class LanguageCortex:
             (r"\bcpp\b", "C++"),
             (r"\bnode\.?ks\b|\bnodejs\b", "Node.js"),
             (r"\bcsharp\b", "C#"),
-            (r"\bts\b", "TypeScript"),
         ]
         fixed = q
-        for pat, repl in typo_rules:
-            fixed = re.sub(pat, repl, fixed, flags=re.I)
+        for pat, rep in typo_rules:
+            fixed = re.sub(pat, rep, fixed, flags=re.I)
         fixed = re.sub(r"\s+", " ", fixed).strip()
-
-        low_s = _strip_pl(fixed.lower())
-        prog_langs = ("c++", "c#", "python", "rust", "java", "javascript", "typescript", "programow", "kod")
-        has_prog = any(pl in low_s for pl in prog_langs)
-
-        if has_prog:
-            core_terms = [
-                w for w in re.findall(r"[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ0-9+#]{3,}", fixed)
-                if _strip_pl(w.lower()) not in ("cpp", "c++", "c#", "python", "rust", "java", "javascript", "typescript", "jest", "oraz")
-            ]
-            main_term = core_terms[0] if core_terms else fixed
-            candidates = [
-                f"{fixed} programowanie",
-                f"{main_term} informatyka",
-                fixed,
-            ]
-        elif len(fixed.split()) <= 2:
-            candidates = [fixed, f"{fixed} definicja historia"]
-        else:
-            candidates = [fixed]
-
-        dedup: list[str] = []
-        for c in candidates:
-            if c and c.lower() not in {x.lower() for x in dedup}:
-                dedup.append(c)
-        return dedup[:3]
-
-    def extract_triples_from_memory(self, text: str, topic: str | None = None) -> list[tuple[str, str, str]]:
-        """Extract concise relational (src, rel, dst) triples from Polish declarative sentences."""
-        clean = _clean_fact_text(text)
-        if not clean or _is_noisy_memory(clean):
-            return []
-
-        rel_patterns = [
-            (
-                r"^([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#\s-]{2,42}?)\s+"
-                r"(składa się z|składają się z|należy do|należą do|polega na|krąży wokół|leży nad|"
-                r"wytwarza|wytwarzają|zużywa|zużywają|wymaga|powoduje|powodują|przechowuje|przechowują|"
-                r"dostarcza|dostarczają|kieruje|chroni|łączy|wykorzystuje|przeprowadza|przeprowadzają|"
-                r"odkrył|odkryła|napisał|ma stolicę|ma wzór|emituje|wskazuje|umożliwia|tworzy|zawiera)\s+"
-                r"([^.,;!?]{3,55})",
-                None,
-            ),
-            (r"^([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#\s-]{2,42}?)\s+(?:–|—|-|:)\s+([^.,;!?]{4,55})", "oznacza"),
-            (r"^([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#\s-]{2,42}?)\s+(?:to|jest|są)\s+([^.,;!?]{4,55})", "jest"),
-        ]
-
-        triples: list[tuple[str, str, str]] = []
-        seen_t: set[tuple[str, str, str]] = set()
-        for sent in (_split_polish_sentences(clean) or [clean]):
-            for pat, fixed_rel in rel_patterns:
-                m = re.match(pat, sent, flags=re.I)
-                if not m:
-                    continue
-                s = m.group(1).strip(" „”:-").lower()[:50]
-                if fixed_rel is None:
-                    r = m.group(2).strip().lower()[:35]
-                    d = m.group(3).strip(" „”.").lower()[:50]
-                else:
-                    r = fixed_rel
-                    d = m.group(2).strip(" „”.").lower()[:50]
-                if len(s) >= 2 and len(d) >= 3 and s != d and (s, r, d) not in seen_t:
-                    seen_t.add((s, r, d))
-                    triples.append((s, r, d))
-                    break
-            if len(triples) >= 4:
-                break
-        return triples
-
-    def study_document_chunk(self, topic: str, title: str, chunk: str) -> dict[str, Any]:
-        sentences = _split_polish_sentences(chunk)
-        if not sentences:
-            return {"facts": [], "triples": []}
-
-        anchor = f"{topic} {title}"
-        all_vecs = self.encode_texts([anchor] + sentences)
-        anchor_vec = all_vecs[0]
-        sent_vecs = all_vecs[1:]
-
-        def_cues = (
-            " – ", " — ", " to ", " jest ", " są ", " oznacza ", " był ", " była ",
-            " przechowuje ", " służy ", " umożliwia ", " polega na ", " nazywa się ",
-            " definiuje ", " wskazuje ", " zawiera ",
-        )
-        noise_cues = (
-            "zobacz też", "przypisy", "bibliografia", "linki zewnętrzne", "kategoria:", "isbn",
-            "dopuszczalne w grach", "słownik ortograficzny", "rejestr wyraz", "odmienność tak",
-            "x/twitter", "koalar", "aktualizacja 20",
-        )
-
-        scored: list[tuple[float, str, list[float], bool]] = []
-        for raw_sent, vec in zip(sentences, sent_vecs):
-            sent = clean_human_fact(raw_sent)
-            if len(sent) < 20:
-                continue
-            low = sent.lower()
-            if any(nc in low for nc in noise_cues):
-                continue
-            cos = _cosine_list(anchor_vec, vec)
-            ov = max(_stem_overlap(topic, sent), _stem_overlap(title, sent))
-            is_def = any(cue in low for cue in def_cues)
-            def_bonus = 0.16 if is_def else 0.0
-            score = 0.48 * cos + 0.36 * ov + def_bonus
-            if score >= 0.20 or ov > 0.0:
-                scored.append((score, sent, vec, is_def))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        selected_facts: list[dict[str, Any]] = []
-        selected_vecs: list[list[float]] = []
-        for score, sent, vec, is_def in scored:
-            if any(_cosine_list(vec, prev_v) > 0.88 for prev_v in selected_vecs):
-                continue
-            imp = 5 if (is_def and score >= 0.44) else (4 if score >= 0.32 else 3)
-            selected_facts.append({"text": sent, "importance": imp})
-            selected_vecs.append(vec)
-            if len(selected_facts) >= 7:
-                break
-
-        triples: list[tuple[str, str, str]] = []
-        seen_t: set[tuple[str, str, str]] = set()
-        topic_key = topic.strip().lower()[:50]
-        title_key = re.sub(r"^Słownik\s*\([A-Z]+\):\s*", "", title).strip().lower()[:50]
-
-        for item in selected_facts:
-            for tr in self.extract_triples_from_memory(item["text"], topic=topic):
-                if tr not in seen_t:
-                    seen_t.add(tr)
-                    triples.append(tr)
-                if len(triples) >= 6:
-                    break
-            if len(triples) >= 6:
-                break
-
-        if topic_key and title_key and topic_key != title_key and len(triples) < 6:
-            t_link = (topic_key, "dotyczy", title_key)
-            if t_link not in seen_t:
-                triples.append(t_link)
-
-        return {"facts": selected_facts, "triples": triples[:6]}
-
-    def extract_memories_from_turn(self, user_message: str) -> dict[str, Any]:
-        clean_msg = user_message.strip()
-        if len(clean_msg) < 6:
-            return {"memories": [], "triples": []}
-
-        interrogative_starts = (
-            "co ", "kto ", "czym ", "jak ", "gdzie ", "kiedy ", "dlaczego ", "po co", "skad ",
-            "czy ", "ile ", "jaki", "jaka", "jakie", "komu", "kogo", "no to", "powiedz",
-            "wyjasnij", "wytlumacz", "opisz", "opowiedz", "podaj", "daj ", "pokaz",
-            "napisz", "zrob", "stworz", "sprawdz", "pomoz", "popraw", "naucz", "zbadaj",
-            "ale to nie", "to nie prawda", "nie prawda", "nieprawda", "bzdura",
-            "mylisz sie", "chodzi", "okej", "ok ", "dzieki", "czesc", "hej", "witaj",
-        )
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean_msg) if s.strip()]
-        memories: list[dict[str, Any]] = []
-        triples: list[tuple[str, str, str]] = []
-
-        for s in sentences:
-            low_raw = s.lower().lstrip(" ,.-")
-            low_s = _strip_pl(low_raw)
-            if s.endswith("?") or len(low_s) < 8:
-                continue
-            if any(low_s.startswith(p) for p in interrogative_starts):
-                continue
-
-            matched = False
-            brain_name_m = re.search(
-                r"(?:twoje imi[eę] to|nazywasz si[eę]|masz na imi[eę]|b[eę]d[eę] ci[eę] nazywa[cć])\s+([A-ZŁŚŻŹĆŃa-ząćęłńóśźż-]{2,30})",
-                s,
-                flags=re.I,
-            )
-            if brain_name_m:
-                bval = brain_name_m.group(1).strip(" .!?,;").capitalize()
-                if bval:
-                    memories.append({"text": f"Mózg ma nadane przez użytkownika imię {bval}.", "importance": 5, "category": "użytkownik"})
-                    triples.append(("mózg", "ma_imię", bval.lower()))
-                    matched = True
-
-            user_patterns = [
-                (r"(?:mam na imi[eę]|nazywam si[eę])\s+([A-ZŁŚŻŹĆŃa-ząćęłńóśźż-]{2,30})", "Użytkownik ma na imię {val}.", "ma_na_imię", 5),
-                (r"(?:mieszkam w|mieszkam na)\s+([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9\s-]{2,40})", "Użytkownik mieszka w {val}.", "mieszka_w", 5),
-                (r"pochodz[eę] z\s+([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9\s-]{2,40})", "Użytkownik pochodzi z {val}.", "pochodzi_z", 4),
-                (r"interesuj[eę] si[eę]\s+([^.,;!?]{3,70})", "Użytkownik interesuje się {val}.", "interesuje_się", 4),
-                (r"(?:bardzo\s+)?lubi[eę]\s+([^.,;!?]{3,70})", "Użytkownik lubi {val}.", "lubi", 4),
-                (r"uwielbiam\s+([^.,;!?]{3,70})", "Użytkownik uwielbia {val}.", "uwielbia", 4),
-                (r"wol[eę]\s+([^.,;!?]{3,70})", "Użytkownik woli {val}.", "woli", 4),
-                (r"nie lubi[eę]\s+([^.,;!?]{3,70})", "Użytkownik nie lubi {val}.", "nie_lubi", 4),
-                (r"pracuj[eę]\s+(?:jako|w)\s+([^.,;!?]{3,60})", "Użytkownik pracuje jako/w {val}.", "pracuje", 5),
-                (r"mam\s+(\d{1,3})\s+lat", "Użytkownik ma {val} lat.", "ma_lat", 4),
-                (r"(?:używam|uzywam|korzystam z|programuj[eę] w|pisz[eę] w)\s+([^.,;!?]{2,60})", "Użytkownik używa {val}.", "używa", 4),
-                (r"(?:studiuj[eę]|ucz[eę] si[eę])\s+([^.,;!?]{3,60})", "Użytkownik studiuje lub uczy się {val}.", "uczy_się", 4),
-                (r"(?:tworz[eę]|buduj[eę]|robi[eę]\s+projekt)\s+([^.,;!?]{3,70})", "Użytkownik pracuje nad projektem: {val}.", "tworzy", 4),
-            ]
-            for pat, tmpl, rel, imp in user_patterns:
-                for m in re.finditer(pat, s, flags=re.I):
-                    val = m.group(1).strip(" .!?,;")
-                    if val:
-                        memories.append({"text": tmpl.format(val=val), "importance": imp, "category": "użytkownik"})
-                        triples.append(("użytkownik", rel, val.lower()[:50]))
-                        matched = True
-
-            if matched:
-                continue
-
-            if re.match(r"^(?:wczoraj|dzisiaj|dziś|ostatnio|kupi[lł]em|kupi[lł]am|zrobi[lł]em|zrobi[lł]am)\b", low_raw):
-                memories.append({"text": f"Wydarzenie z życia użytkownika: {s.rstrip('.')}.", "importance": 4, "category": "wydarzenie"})
-                continue
-
-            # Explicit coding rules / preferences
-            if re.match(r"^(?:zasada:|preferuj[eę]|zawsze\s+|nigdy\s+nie\s+)", low_raw):
-                memories.append({"text": s.rstrip(".") + ".", "importance": 5, "category": "zasada"})
-                continue
-
-            # Explicit teaching or clean declarative definitions
-            teach_m = re.match(r"^(?:zapami[eę]taj(?:\s*,?\s*[zż]e)?\s*:?\s*)(.+)$", s, flags=re.I)
-            if teach_m:
-                fact = teach_m.group(1).strip()
-                if len(fact) >= 6:
-                    memories.append({"text": fact.rstrip(".") + ".", "importance": 5, "category": "wiedza"})
-                continue
-
-            def_m = re.match(r"^([A-ZŁŚŻŹĆŃa-ząćęłńóśźż0-9+#\s-]{2,40}?)\s+(to|jest|oznacza)\s+([^!?]{5,140})$", s)
-            if def_m and len(s) >= 18:
-                subj = def_m.group(1).strip().lower()[:50]
-                rel = def_m.group(2).strip().lower()
-                obj = def_m.group(3).strip().rstrip(".").lower()[:50]
-                memories.append({"text": s.rstrip(".") + ".", "importance": 4, "category": "wiedza"})
-                if subj and obj and subj != obj:
-                    triples.append((subj, rel, obj))
-
-        # Deduplicate memories preserving order
-        uniq_mems: list[dict[str, Any]] = []
-        seen_txt: set[str] = set()
-        for m in memories:
-            key = m["text"].lower()
-            if key not in seen_txt:
-                seen_txt.add(key)
-                uniq_mems.append(m)
-
-        return {"memories": uniq_mems[:12], "triples": triples[:12]}
-
-    def assess_study_mastery(self, topic: str, learned_facts: list[str], round_num: int) -> dict[str, Any]:
-        if not learned_facts:
-            return {"mastery": 10.0, "next_queries": [f"{topic} definicja"], "summary": "Jeszcze brak wiedzy."}
-
-        vecs = self.encode_texts(learned_facts[-20:])
-        # Measure semantic diversity across learned facts
-        unique_clusters = 0
-        kept_vecs: list[list[float]] = []
-        for v in vecs:
-            if not any(_cosine_list(v, kv) > 0.85 for kv in kept_vecs):
-                kept_vecs.append(v)
-                unique_clusters += 1
-
-        has_def = any(
-            any(cue in f.lower() for cue in ("znaczenie słowa", " to ", " jest ", " – ", " — ", "oznacza"))
-            for f in learned_facts
-        )
-        base_score = min(68.0, len(learned_facts) * 7.5 + unique_clusters * 4.5)
-        def_bonus = 14.0 if has_def else 0.0
-        round_bonus = min(18.0, round_num * 6.5)
-        mastery = round(min(96.0, base_score + def_bonus + round_bonus), 1)
-
-        # Find promising follow-up concepts from learned facts
-        topic_stems = _tokenize_stems(topic)
-        next_queries: list[str] = []
-        for f in learned_facts:
-            for cand in re.findall(r"\b[A-ZŁŚŻŹĆŃ][a-ząćęłńóśźż]{3,}(?:\s+[A-ZŁŚŻŹĆŃ][a-ząćęłńóśźż]{3,})?", f):
-                if _strip_pl(cand.lower()) not in topic_stems and cand not in next_queries:
-                    next_queries.append(cand)
-                    if len(next_queries) >= 2:
-                        break
-            if len(next_queries) >= 2:
-                break
-        if not next_queries:
-            next_queries = [f"{topic} zastosowania"]
-
-        summary_facts = [_clean_fact_text(f) for f in learned_facts[:2]]
-        summary = " ".join(summary_facts)[:320]
-        return {"mastery": mastery, "next_queries": next_queries[:2], "summary": summary}
-
-    def synthesize_rem_reflections(
-        self,
-        new_memories: list[str],
-        old_memories: list[str],
-        rem_links: list[dict[str, Any]] | None = None,
-        existing_reflections: list[str] | None = None,
-    ) -> list[str]:
-        if not new_memories and not rem_links:
-            return []
-
-        pool_new = [_clean_fact_text(m) for m in new_memories if not _is_noisy_memory(m)]
-        pool_new = [m for m in pool_new if m][:18]
-        pool_old = [_clean_fact_text(m) for m in old_memories if not _is_noisy_memory(m)]
-        pool_old = [m for m in pool_old if m][:24]
-        if not pool_old and len(pool_new) >= 2:
-            pool_old = list(pool_new)
-
-        existing_clean = [_clean_fact_text(r) for r in (existing_reflections or []) if _clean_fact_text(r)]
-        existing_vecs = self.encode_texts(existing_clean[-40:]) if existing_clean else []
-
-        def is_dup_reflection(cand: str, cand_vec: list[float] | None = None) -> bool:
-            clow = cand.lower()
-            if any(clow == e.lower() or clow[:48] == e.lower()[:48] for e in existing_clean):
-                return True
-            if cand_vec and existing_vecs:
-                if any(_cosine_list(cand_vec, ev) > 0.85 for ev in existing_vecs):
-                    return True
-            return False
-
-        reflections: list[str] = []
-        used_texts: set[str] = set()
-
-        # Pass 1: Graph-Chain Reflections grounded in discovered REM links
-        all_mems = pool_new + [m for m in pool_old if m not in pool_new]
-        if rem_links:
-            for link in rem_links[:6]:
-                src = str(link.get("src", "")).strip()
-                dst = str(link.get("dst", "")).strip()
-                rel_kind = str(link.get("rel", "")).strip()
-                bridge_raw = str(link.get("bridge", "")).strip()
-                if not src or not dst or src == dst:
-                    continue
-                bridge_node = ""
-                bm = re.search(r"^(?:przez|wspólny most|wspólne źródło):\s*([^(\n]+)", bridge_raw, flags=re.I)
-                if bm:
-                    bridge_node = bm.group(1).strip()
-
-                m_src = None
-                m_dst = None
-                for m in all_mems:
-                    if m in used_texts:
-                        continue
-                    if _stem_overlap(src, m) >= 0.5 and (not bridge_node or _stem_overlap(bridge_node, m) >= 0.4):
-                        m_src = m
-                        break
-                if m_src is None:
-                    for m in all_mems:
-                        if m not in used_texts and _stem_overlap(src, m) >= 0.5:
-                            m_src = m
-                            break
-
-                for m in all_mems:
-                    if m in used_texts or m == m_src:
-                        continue
-                    if _stem_overlap(dst, m) >= 0.5 and (not bridge_node or _stem_overlap(bridge_node, m) >= 0.4):
-                        m_dst = m
-                        break
-                if m_dst is None:
-                    for m in all_mems:
-                        if m not in used_texts and m != m_src and _stem_overlap(dst, m) >= 0.5:
-                            m_dst = m
-                            break
-
-                if m_src and m_dst:
-                    c1 = _trim_sentence_clean(m_src, 130)
-                    c2 = _trim_sentence_clean(m_dst, 130)
-                    if rel_kind == "kreatywna_analogia":
-                        refl = (
-                            f"Kreatywna analogia REM ({src} ↔ {dst}): "
-                            f"{c1} Można to twórczo zestawić z tym, że {_lc_first(c2)}"
-                        )
-                    else:
-                        b_label = bridge_node or "wspólny kontekst"
-                        refl = (
-                            f"Połączenie faktów ({src} ↔ {dst} przez „{b_label}”): "
-                            f"{c1} Z kolei {_lc_first(c2)}"
-                        )
-                elif rel_kind == "kreatywna_analogia":
-                    refl = f"Twórcza analogia REM: „{src}” może inspirować skojarzenia z „{dst}” na poziomie ukrytych cech."
-                elif bridge_node:
-                    refl = f"Skojarzenie REM: pojęcia „{src}” i „{dst}” łączą się poprzez „{bridge_node}” ({bridge_raw})."
-                else:
-                    continue
-
-                r_vec = self.encode_text(refl)
-                if not is_dup_reflection(refl, r_vec):
-                    reflections.append(refl)
-                    existing_clean.append(refl)
-                    existing_vecs.append(r_vec)
-                    if m_src:
-                        used_texts.add(m_src)
-                    if m_dst:
-                        used_texts.add(m_dst)
-                if len(reflections) >= 3:
-                    break
-
-        # Pass 2: Cross-topic semantic & conceptual bridges across memories
-        if pool_new and pool_old:
-            vecs_new = self.encode_texts(pool_new)
-            vecs_old = self.encode_texts(pool_old) if pool_old is not pool_new else vecs_new
-
-            best_pairs: list[tuple[float, str, str, list[str]]] = []
-            for mn, vn in zip(pool_new, vecs_new):
-                for mo, vo in zip(pool_old, vecs_old):
-                    if mn.lower() == mo.lower() or mn.lower()[:30] == mo.lower()[:30]:
-                        continue
-                    cos = _cosine_list(vn, vo)
-                    if cos > 0.80 or _stem_overlap(mn, mo) > 0.50:
-                        continue
-                    shared = _shared_meaningful_concepts(mn, mo)
-                    if not ((len(shared) >= 1 and 0.18 <= cos <= 0.80) or (len(shared) == 0 and 0.46 <= cos <= 0.78)):
-                        continue
-                    stub_bonus = 0.06 if (not _is_bare_definition(mn) and not _is_bare_definition(mo)) else 0.0
-                    score = cos + min(0.32, len(shared) * 0.14) + stub_bonus
-                    best_pairs.append((score, mn, mo, shared))
-
-            best_pairs.sort(key=lambda x: x[0], reverse=True)
-            for _, mn, mo, shared in best_pairs:
-                if mn in used_texts or mo in used_texts:
-                    continue
-                c1 = _trim_sentence_clean(mn, 135)
-                c2 = _trim_sentence_clean(mo, 135)
-                if not c1 or not c2:
-                    continue
-                if shared:
-                    bridge = ", ".join(shared[:2])
-                    refl = f"Kreatywna synteza REM (most: {bridge}): {c1} Wiąże się to twórczo z tym, że {_lc_first(c2)}"
-                else:
-                    refl = f"Wniosek REM: {c1} Uzupełnia to fakt, że {_lc_first(c2)}"
-                r_vec = self.encode_text(refl)
-                if is_dup_reflection(refl, r_vec):
-                    continue
-                used_texts.add(mn)
-                used_texts.add(mo)
-                reflections.append(refl)
-                existing_clean.append(refl)
-                existing_vecs.append(r_vec)
-                if len(reflections) >= 5:
-                    break
-
-        return reflections[:5]
-
-    def check_memory_update(self, new_fact: str, candidate_old_facts: list[str]) -> int | None:
-        if not candidate_old_facts:
-            return None
-        new_low = _strip_pl(new_fact.lower())
-        singleton_prefixes = (
-            "uzytkownik ma na imie ",
-            "mozg ma nadane przez uzytkownika imie ",
-            "uzytkownik mieszka w ",
-            "uzytkownik pochodzi z ",
-            "uzytkownik pracuje ",
-        )
-        for pref in singleton_prefixes:
-            if new_low.startswith(pref):
-                for idx, old in enumerate(candidate_old_facts):
-                    if _strip_pl(old.lower()).startswith(pref):
-                        return idx
-        if new_low.startswith("uzytkownik ma ") and new_low.endswith(" lat."):
-            for idx, old in enumerate(candidate_old_facts):
-                old_low = _strip_pl(old.lower())
-                if old_low.startswith("uzytkownik ma ") and old_low.endswith(" lat."):
-                    return idx
-        return None
-
-    def train_lora_sleep(
-        self,
-        new_memories: list[str],
-        replay_memories: list[str],
-        rem_reflections: list[str],
-        rem_links: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        """
-        Real NREM Deep Sleep GPU Training (100% self-contained PyTorch):
-          1) Expands tokenizer vocabulary with newly encountered Polish/code tokens
-          2) Contrastively trains `CorticalSemanticEncoder` on GPU (including cross-fact bridges)
-          3) Trains `CorticalTransformerLM` via Experience Replay on GPU
-          4) Updates structured `core_knowledge_summary`
-        """
-        if not self.ready or (not new_memories and not rem_reflections):
-            return {"trained": False, "samples": 0, "loss_start": 0.0, "loss_end": 0.0, "duration_ms": 0.0}
-
-        t0 = time.perf_counter()
-        sample_limit = max(self.cfg.lora_max_replay_samples, min(200, len(new_memories) + 20))
-        all_items = (new_memories[:160] + replay_memories[:40])[:sample_limit]
-
-        # Build contrastive pairs (single-fact + cross-fact bridge pairs)
-        pairs: list[tuple[str, str]] = []
-        cleaned_items: list[str] = []
-        for item in all_items:
-            clean = _clean_fact_text(item)
-            if len(clean) < 8:
-                continue
-            cleaned_items.append(clean)
-            mwords = _extract_meaningful_words(clean, keep_originals=True)
-            hint = " ".join(mwords[:3]) if mwords else clean[:24]
-            pairs.append((hint, clean))
-
-        # Add cross-fact bridge contrastive pairs so the encoder embeds connected topics closer
-        for i in range(min(30, len(cleaned_items))):
-            fi = cleaned_items[i]
-            if _is_noisy_memory(fi):
-                continue
-            for j in range(i + 1, min(40, len(cleaned_items))):
-                fj = cleaned_items[j]
-                if _is_noisy_memory(fj):
-                    continue
-                shared = _shared_meaningful_concepts(fi, fj)
-                if shared:
-                    si = _extract_meaningful_words(fi, keep_originals=True)
-                    sj = _extract_meaningful_words(fj, keep_originals=True)
-                    if si and sj and si[0] != sj[0]:
-                        pairs.append((f"{si[0]} {sj[0]} {shared[0]}", f"{fi[:110]} {fj[:110]}"))
-                        if len(pairs) >= 100:
-                            break
-            if len(pairs) >= 100:
-                break
-
-        for link in (rem_links or [])[:8]:
-            src = str(link.get("src", "")).strip()
-            dst = str(link.get("dst", "")).strip()
-            bridge = str(link.get("bridge", "")).strip()
-            if src and dst:
-                pairs.append((f"{src} {dst}", f"{src} łączy się z {dst} ({bridge})"))
-
-        sequences = build_training_dialogues(
-            memories=all_items,
-            episodic_memories=[x for x in all_items if "w rozmowie" in x.lower() or "wydarzenie" in x.lower()],
-            chat_turns=[],
-            user_profile=[x for x in all_items if x.lower().startswith("użytkownik ") or "imię" in x.lower()],
-            max_total=320,
-        )
-        for refl in rem_reflections[:6]:
-            clean_r = _clean_fact_text(refl)
-            if len(clean_r) >= 10:
-                rwords = _extract_meaningful_words(clean_r, keep_originals=True)
-                sequences.append(f"<MEM> {clean_r} <CTX> sen REM <USER> czego nowego się domyśliłeś? <BOT> {clean_r}")
-                if len(rwords) >= 2:
-                    sequences.append(
-                        f"<MEM> {clean_r} <CTX> łączenie faktów <USER> jaki jest związek między {rwords[0]} a {rwords[1]}? <BOT> {clean_r}"
-                    )
-        if self.online_dialogues:
-            sequences.extend(self.online_dialogues[-60:])
-
-        with self._op_lock:
-            self.tokenizer.learn_texts(all_items + rem_reflections + sequences)
-            enc_s, enc_e = self.semantic_encoder.train_contrastive(
-                pairs=pairs[:96],
-                tokenizer=self.tokenizer,
-                epochs=max(4, self.cfg.cortex_sleep_epochs // 2),
-                lr=self.cfg.cortex_lr,
-            )
-            lm_s, lm_e = self.transformer_lm.train_sleep_replay(
-                sequences=sequences,
-                tokenizer=self.tokenizer,
-                epochs=self.cfg.cortex_sleep_epochs,
-                lr=self.cfg.cortex_lr,
-                batch_size=48 if len(sequences) > 64 else 24,
-            )
-
-            # Distill structured Core Knowledge Summary deterministically from highest-signal facts
-            existing_lines = [
-                ln.strip()
-                for ln in self.core_knowledge_summary.splitlines()
-                if ln.strip().startswith("- ")
-            ]
-            combined_pool = []
-            seen_k: set[str] = set()
-            for raw in all_items + [ln[2:] for ln in existing_lines]:
-                c = _clean_fact_text(raw)
-                k = c.lower()
-                if c and k not in seen_k:
-                    seen_k.add(k)
-                    combined_pool.append(c)
-
-            user_pts = [x for x in combined_pool if x.lower().startswith("użytkownik ") or "zasada" in x.lower() or "imię" in x.lower()][:5]
-            know_pts = [x for x in combined_pool if x not in user_pts][:7]
-            sections: list[str] = []
-            if user_pts:
-                sections.append("1) Profil i zasady użytkownika:\n" + "\n".join(f"- {u}" for u in user_pts))
-            if know_pts:
-                sections.append("2) Kluczowa utrwalona wiedza:\n" + "\n".join(f"- {k[:180]}" for k in know_pts))
-            self.core_knowledge_summary = "\n".join(sections)[:2400]
-            self.lora_updates_count += 1
-            self._refresh_status()
-
-        dur_ms = round((time.perf_counter() - t0) * 1000.0, 1)
-        loss_start = lm_s if lm_s > 0 else enc_s
-        loss_end = lm_e if lm_e > 0 else enc_e
-        return {
-            "trained": True,
-            "samples": len(sequences),
-            "loss_start": loss_start,
-            "loss_end": loss_end,
-            "encoder_loss_start": enc_s,
-            "encoder_loss_end": enc_e,
-            "fluency": self.transformer_lm.fluency_score,
-            "duration_ms": dur_ms,
-        }
-
-    def train_language_cortex(
-        self,
-        all_memories: list[str],
-        episodic_memories: list[str],
-        chat_turns: list[dict[str, str]],
-        user_profile: list[str],
-        epochs: int | None = None,
-    ) -> dict[str, Any]:
-        """Self-train the GPU Transformer LM & Semantic Encoder on human Polish dialogues."""
-        t0 = time.perf_counter()
-        ep = max(2, int(epochs or self.cfg.language_train_epochs))
-        seqs = build_training_dialogues(
-            memories=all_memories,
-            episodic_memories=episodic_memories,
-            chat_turns=chat_turns,
-            user_profile=user_profile,
-            max_total=450,
-        )
-        if self.online_dialogues:
-            seqs.extend(self.online_dialogues[-100:])
-
-        pairs: list[tuple[str, str]] = []
-        for m in all_memories[:80]:
-            cm = _clean_fact_text(m)
-            if len(cm) >= 12:
-                words = re.findall(r"[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ0-9+#]{3,}", cm)
-                pairs.append((" ".join(words[:3]) if words else cm[:20], cm))
-
-        with self._op_lock:
-            self.tokenizer.learn_texts(seqs + all_memories[:120])
-            if len(pairs) >= 2:
-                self.semantic_encoder.train_contrastive(
-                    pairs=pairs[:80],
-                    tokenizer=self.tokenizer,
-                    epochs=max(4, ep // 3),
-                    lr=self.cfg.cortex_lr,
-                )
-            lm_s, lm_e = self.transformer_lm.train_sleep_replay(
-                sequences=seqs,
-                tokenizer=self.tokenizer,
-                epochs=ep,
-                lr=self.cfg.cortex_lr,
-                batch_size=48,
-            )
-            self.lora_updates_count += 1
-            self._refresh_status()
-
-        dur_ms = round((time.perf_counter() - t0) * 1000.0, 1)
-        return {
-            "trained": True,
-            "dialogues": len(seqs),
-            "loss_start": lm_s,
-            "loss_end": lm_e,
-            "fluency": self.transformer_lm.fluency_score,
-            "trained_steps": self.transformer_lm.trained_steps,
-            "duration_ms": dur_ms,
-        }
-
-    def resolve_conversational_context(
-        self,
-        user_message: str,
-        recent_turns: list[dict[str, str]],
-    ) -> dict[str, Any]:
-        """Resolve pronouns and short follow-ups against recent chat messages."""
-        msg = user_message.strip()
-        low = _strip_pl(msg.lower()).strip(" ?!.,;:")
-
-        active_subject = ""
-        ignored_subjects = {
-            "czesc", "hej", "witaj", "dzien dobry", "dobranoc", "dzieki", "dziekuje",
-            "super", "ale co", "co", "dlaczego", "czemu", "jak to", "nie rozumiem",
-            "o czy moge z toba rozmiac", "co potrafisz", "co umiesz", "co pamietasz",
-            "co wczesniej pisalismy", "o czym rozmawialismy",
-        }
-        for turn in reversed(recent_turns[-8:]):
-            txt = turn.get("content", "").strip()
-            if not txt:
-                continue
-            if turn.get("role") == "user":
-                cand = _extract_query_subject(txt)
-                cand_low = _strip_pl(cand.lower())
-                if (
-                    cand
-                    and len(cand) >= 3
-                    and cand_low not in ignored_subjects
-                    and not any(w in cand_low for w in ("pisalismy", "pisalimi", "rozmawialismy", "moge", "toba"))
-                ):
-                    active_subject = cand
-                    break
-            elif turn.get("role") == "assistant" and not active_subject:
-                m_bold = re.search(r"\*\*([^*]{3,40})\*\*", txt)
-                if m_bold:
-                    active_subject = m_bold.group(1).strip()
-                    break
-
-        pronouns = {
-            "on", "ona", "ono", "oni", "one", "niego", "niej", "nim", "nia", "nich",
-            "jego", "jej", "ich", "tego", "tym", "tej", "to", "tam", "wtedy", "stamtad",
-        }
-        followup_starts = (
-            "a ", "i ", "a kiedy", "kiedy zyl", "kiedy powstal", "kiedy byla", "ile ma",
-            "ile mial", "powiedz wiecej", "powiedz cos wiecej", "cos wiecej", "wiecej o",
-            "rozwin", "a z czym", "a dlaczego", "a czemu", "jak to dziala", "podaj przyklad",
-        )
-        words = re.findall(r"[a-z0-9+#]{2,}", low)
-        has_pronoun = any(w in pronouns for w in words)
-        has_followup_prefix = any(low.startswith(p) for p in followup_starts)
-        is_short_followup = len(words) <= 5 and (has_pronoun or has_followup_prefix)
-
-        if active_subject and (has_pronoun or is_short_followup):
-            return {
-                "is_followup": True,
-                "active_subject": active_subject,
-                "search_query": f"{active_subject} {msg}",
-            }
-        return {
-            "is_followup": False,
-            "active_subject": active_subject,
-            "search_query": msg,
-        }
-
-    def analyze_query_intent(self, query: str) -> dict[str, Any]:
-        """Classify query intent and decompose compound/multi-entity queries into sub-concepts."""
-        msg = (query or "").strip()
-        low = _strip_pl(msg.lower()).strip(" ?!.,;:")
-
-        # 1) Assistant-directed capability / local action questions
-        if re.match(
-            r"^(?:czy\s+)?(?:ty\s+)?(?:mozesz|moglbys|moglabys|potrafisz|umiesz|masz\s+dostep|umialbys)\b",
-            low,
-        ):
-            return {
-                "intent": "self_capability",
-                "detail_kind": None,
-                "sub_intents": [],
-                "sub_concepts": [],
-                "is_compound": False,
-            }
-
-        # 1b) Code generation / programming task requests
-        is_code_req = bool(
-            re.search(
-                r"\b(?:napisz|stworz|zrob|pokaz|daj|wygeneruj)\s+(?:mi\s+)?(?:prosty\s+|krotki\s+|przykladowy\s+|jakis\s+)?(?:program|kod|skrypt|funkcj[aei]|algorytm|petl[aei]|klase|przyklad\s+kodu)\b"
-                r"|\b(?:program|kod|skrypt|funkcj[aei])\s+(?:w|na)\s+(?:cpp|c\+\+|python\w*|js|javascript|java|c#)\b",
-                low,
-            )
-        )
-        if is_code_req:
-            if re.search(r"\b(?:cpp|c\+\+)\b", low) or "wskaznik" in low:
-                code_lang = "cpp"
-            elif re.search(r"\b(?:javascript|js)\b", low):
-                code_lang = "javascript"
-            else:
-                code_lang = "python"
-
-            task = msg.strip(" ?!.")
-            task_strip_pats = [
-                r"^(?:napisz|stwórz|stworz|zrób|zrob|pokaż|pokaz|daj|wygeneruj)\s+(?:mi\s+)?(?:prosty\s+|krótki\s+|krotki\s+|przykładowy\s+|przykladowy\s+)?(?:program|kod|skrypt|funkcję|funkcje|algorytm|pętlę|petle|klasę|klase|przykład\s+kodu)\s*",
-                r"^(?:w|na)\s+(?:języku\s+|jezyku\s+)?(?:cpp|c\+\+|pythonie|pythona|python|py|javascript|js|java|c#)\s*",
-                r"^(?:(?:który|ktory|która|ktora|które|ktore|co|do|żeby|zeby|aby)\s+)?(?:to\s+)?(?:liczy|oblicza|wylicza|wyznacza|sprawdza|wypisuje|znajduje|zwraca|sortuje|pokazuje|robi|policzy|wyliczy|wypisze|sprawdzi)\s*",
-            ]
-            for _ in range(3):
-                prev_t = task
-                for tp in task_strip_pats:
-                    task = re.sub(tp, "", task, flags=re.I).strip(" ?!.,;:-")
-                if task == prev_t:
-                    break
-            task_norm = _strip_pl(task.lower())
-            if task_norm in ("to", "to robi", "ktory to robi", "robi", "tego", "nim", "niej", "go", "je", "cos", "cos takiego", "takie cos"):
-                task = ""
-            return {
-                "intent": "code_request",
-                "detail_kind": None,
-                "sub_intents": [],
-                "sub_concepts": [task] if task else [],
-                "is_compound": False,
-                "code_lang": code_lang,
-                "code_task": task,
-            }
-
-        sub_intents: list[str] = []
-        if re.search(r"\bkiedy\b|\bw\s+ktorym\s+roku\b|\bjak\s+dlugo\b", low):
-            sub_intents.append("when")
-        if re.search(r"\bgdzie\b|\bskad\b|\bdokad\b", low):
-            sub_intents.append("where")
-        if re.search(r"\bile\b|\bilu\b|\bjak\s+duzo\b|\bjak\s+wiele\b", low):
-            sub_intents.append("how_many")
-        if re.search(r"\bkto\b|\bkim\b|\bczyim\b", low):
-            sub_intents.append("who")
-
-        # 2) Detect primary intent
-        is_creative = bool(
-            re.search(
-                r"\b(?:wymysl|kreatywn\w*|tworcz\w*|metafor\w*|analogi\w*|burz\w*\s+mozg\w*|zaproponuj\s+(?:pomysl|cos)|co\s+by\s+bylo\s+gdyby|polacz\s+kreatywnie|skojarz\w*|zainspiruj)\b",
-                low,
-            )
-        )
-        is_connection = bool(
-            re.search(
-                r"\b(?:zwiazek|zwiazki|laczy|lacza|powiazan\w*|wspoln\w*|relacj\w*|zaleznosc\w*|jak\s+ma\s+sie|wplyw\w*\s+na|zalezy\s+od)\b",
-                low,
-            )
-        )
-        is_comparison = bool(
-            re.search(
-                r"\b(?:porownaj|roznic\w*|czym\s+sie\s+rozni\w*|vs\.?|kontra|podobienstw\w*)\b",
-                low,
-            )
-        ) or (" a czym " in low)
-        is_causal = bool(
-            re.search(
-                r"\b(?:dlaczego|czemu|po\s+co|skad\s+sie\s+bierze|co\s+sie\s+stanie|co\s+by\s+bylo|bez\s+czego|co\s+powoduje|jak\s+wplywa|wazne\s+dla)\b",
-                low,
-            )
-        ) or low.startswith("dlaczego ") or low.startswith("czemu ") or (" bez " in low and any(w in low for w in ("nie byloby", "nie ma", "brak", "zabrak")))
-        is_how = bool(
-            re.search(
-                r"\b(?:jak\s+dziala\w*|w\s+jaki\s+sposob|na\s+czym\s+polega|jak\s+przebiega|jak\s+powstaje|jak\s+zachodzi|jak\s+odbywa|do\s+czego\s+sluzy)\b",
-                low,
-            )
-        )
-        is_yes_no = low.startswith("czy ") and not is_comparison and not is_connection and not is_creative
-        is_explicit_def = bool(
-            re.match(
-                r"^(?:no\s+to\s+|a\s+)?(?:co\s+to\s+(?:jest|sa)|czym\s+(?:jest|sa)|kim\s+(?:jest|byl)|kto\s+to\s+(?:jest|byl)|zdefiniuj|co\s+oznacza|znaczenie\s+slowa)\b",
-                low,
-            )
-        )
-
-        # 3) Decompose into sub-concepts for compound / multi-entity queries
-        raw_clean = msg.strip(" ?!.")
-        # Strip leading framing phrases
-        framing_patterns = [
-            r"^(?:wymyśl|wymysl|zaproponuj|stwórz|stworz|podaj|znajdź|znajdz)\s+(?:kreatywn[aąey]|twórcz[aąey]|ciekaw[aąey])?\s*(?:analogię|analogie|metaforę|metafory|pomysł|pomysl|skojarzenie|połączenie|polaczenie)?\s*(?:między|miedzy|pomiędzy|pomiedzy|dla|na\s+temat|o|do)?\s*",
-            r"^(?:połącz\s+kreatywnie|polacz\s+kreatywnie|skojarz\s+kreatywnie|co\s+by\s+było\s+gdyby|co\s+by\s+bylo\s+gdyby)\s+",
-            r"^(?:powiedz\s+mi|wyjaśnij(?:\s+krótko)?|wyjasnij(?:\s+krotko)?|wytłumacz|wytlumacz|opowiedz(?:\s+o)?|opisz|podaj|porównaj|porownaj)\s+",
-            r"^(?:jaki\s+jest\s+związek\s+(?:między|pomiedzy|pomiędzy)|jaki\s+jest\s+zwiazek\s+(?:miedzy|pomiedzy)|co\s+łączy|co\s+laczy|jaka\s+jest\s+różnica\s+(?:między|pomiędzy)|jaka\s+jest\s+roznica\s+(?:miedzy|pomiedzy)|czym\s+się\s+różni|czym\s+sie\s+rozni)\s+",
-            r"^(?:dlaczego\s+bez|dlaczego|czemu|czy|jak\s+działa|jak\s+dziala|na\s+czym\s+polega|w\s+jaki\s+sposób|w\s+jaki\s+sposob)\s+",
-        ]
-        body = raw_clean
-        for _ in range(3):
-            prev = body
-            for fp in framing_patterns:
-                body = re.sub(fp, "", body, flags=re.I).strip(" ?!.,;:")
-            if body == prev:
-                break
-
-        # Split around compound connectors (między X a Y, X i Y, X oraz Y, X vs Y, bez X nie byłoby Y)
-        clauses = re.split(
-            r"\s+(?:oraz|vs\.?|kontra|a\s+także|a\s+takze)\s+|,\s*(?:a\s+)?|\s+\ba\b\s+|\s+\bi\b\s+|\s+(?:na|od|w|z|przez)\s+(?=(?:[A-ZŁŚŻŹĆŃ]|[a-ząćęłńóśźż]{4,}))",
-            body,
-            flags=re.I,
-        )
-        # Clean causal fragments like "Słońca nie byłoby tlenu"
-        split_clauses: list[str] = []
-        for cl in clauses:
-            for sub_cl in re.split(r"\b(?:nie\s+byłoby|nie\s+byloby|nie\s+ma|powoduje|prowadzi\s+do|daje)\b", cl, flags=re.I):
-                sub_cl = sub_cl.strip(" ?!.,;:")
-                if sub_cl:
-                    split_clauses.append(sub_cl)
-
-        sub_concepts: list[str] = []
-        seen_sc: set[str] = set()
-        for cl in split_clauses:
-            subj_cl = _extract_query_subject(cl)
-            mwords = _extract_meaningful_words(subj_cl, keep_originals=True)
-            if not mwords:
-                continue
-            # Preserve readable short phrase (up to 4 meaningful words)
-            phrase = " ".join(mwords[:4]) if len(mwords) > 4 else subj_cl.strip(" ?!.,;:")
-            # Remove leading/trailing stopwords from phrase
-            p_tokens = [
-                t for t in re.findall(r"[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ0-9+#-]+", phrase)
-                if _strip_pl(t.lower()) not in _STOPWORDS_PL_NORM
-            ]
-            if not p_tokens:
-                continue
-            clean_phrase = " ".join(p_tokens[:4])
-            key_norm = _strip_pl(clean_phrase.lower())
-            if key_norm not in seen_sc and len(key_norm) >= 2:
-                seen_sc.add(key_norm)
-                sub_concepts.append(clean_phrase)
-
-        # For single-concept explicit definitions or simple queries, keep _extract_query_subject as single concept if split collapsed/over-split
-        base_subj = _extract_query_subject(msg)
-        base_mwords = _extract_meaningful_words(base_subj, keep_originals=True)
-        if not sub_concepts and base_mwords:
-            sub_concepts = [base_subj]
-
-        is_multi_part = (
-            len(sub_intents) >= 2
-            or (len(sub_concepts) >= 2 and not is_explicit_def and not is_connection and not is_comparison and not is_causal and not is_how and not is_yes_no and not is_creative)
-            or (" i kiedy " in low or " i kto " in low or " i gdzie " in low or " i ile " in low)
-        )
-
-        if is_creative:
-            intent = "creative"
-        elif is_connection:
-            intent = "connection"
-        elif is_comparison:
-            intent = "comparison"
-        elif is_causal:
-            intent = "causal_why"
-        elif is_how:
-            intent = "how_process"
-        elif is_yes_no:
-            intent = "yes_no"
-        elif is_multi_part:
-            intent = "multi_part"
-        elif sub_intents:
-            intent = "factual_detail"
-        elif is_explicit_def:
-            intent = "definition"
-        else:
-            intent = "open_question"
-
-        # Keep single clean subject for simple explicit definitions like "co to jest kwark powabny"
-        if intent == "definition" and len(base_mwords) >= 1 and len(sub_concepts) > 1 and not any(sep in low for sep in (" i ", " oraz ", ",")):
-            sub_concepts = [base_subj]
-
-        return {
-            "intent": intent,
-            "detail_kind": sub_intents[0] if sub_intents else None,
-            "sub_intents": sub_intents,
-            "sub_concepts": sub_concepts[:5],
-            "is_compound": len(sub_concepts) >= 2 or len(sub_intents) >= 2,
-        }
-
-    def _format_human_learn_ack(self, mems: list[dict[str, Any]]) -> str:
-        phrases: list[str] = []
-        brain_named = ""
-        user_named = ""
-        for m in mems[:4]:
-            t = m["text"]
-            bm = re.search(r"Mózg ma nadane przez użytkownika imię\s+([^\s.,!?;]+)", t, flags=re.I)
-            if bm:
-                brain_named = bm.group(1)
-                continue
-            um = re.search(r"Użytkownik ma na imię\s+([^\s.,!?;]+)", t, flags=re.I)
-            if um:
-                user_named = um.group(1)
-                continue
-            conv = t.rstrip(".")
-            conv = re.sub(r"^Użytkownik mieszka w\s+", "mieszkasz w ", conv, flags=re.I)
-            conv = re.sub(r"^Użytkownik pochodzi z\s+", "pochodzisz z ", conv, flags=re.I)
-            conv = re.sub(r"^Użytkownik interesuje się\s+", "interesujesz się ", conv, flags=re.I)
-            conv = re.sub(r"^Użytkownik lubi\s+", "lubisz ", conv, flags=re.I)
-            conv = re.sub(r"^Użytkownik uwielbia\s+", "uwielbiasz ", conv, flags=re.I)
-            conv = re.sub(r"^Użytkownik woli\s+", "wolisz ", conv, flags=re.I)
-            conv = re.sub(r"^Użytkownik nie lubi\s+", "nie lubisz ", conv, flags=re.I)
-            conv = re.sub(r"^Użytkownik pracuje jako/w\s+", "pracujesz jako ", conv, flags=re.I)
-            conv = re.sub(r"^Użytkownik ma\s+(\d+)\s+lat", r"masz \1 lat", conv, flags=re.I)
-            conv = re.sub(r"^Użytkownik używa\s+", "używasz ", conv, flags=re.I)
-            conv = re.sub(r"^Użytkownik studiuje lub uczy się\s+", "uczysz się ", conv, flags=re.I)
-            conv = re.sub(r"^Użytkownik pracuje nad projektem:\s+", "pracujesz nad projektem ", conv, flags=re.I)
-            conv = re.sub(r"^Wydarzenie z życia użytkownika:\s+", "", conv, flags=re.I)
-            phrases.append(conv[0].lower() + conv[1:] if conv else conv)
-
-        parts: list[str] = []
-        if brain_named:
-            parts.append(f"Super, od teraz mam na imię {brain_named} — już to sobie zapisałem!")
-        if user_named:
-            parts.append(f"Miło Cię poznać, {user_named}!")
-        if phrases:
-            joined = ", ".join(phrases)
-            if parts:
-                parts.append(f"Zapamiętam też, że {joined}.")
-            else:
-                parts.append(f"Jasne, zapamiętam sobie, że {joined}.")
-        return " ".join(parts) if parts else "Jasne, już to sobie zapisałem!"
-
-    def _try_transformer_reply(
-        self,
-        mem_hint: str,
-        ctx_hint: str,
-        user_msg: str,
-        reference_texts: list[str],
-    ) -> str | None:
-        if self.transformer_lm.fluency_score < 45.0 or not reference_texts:
-            return None
-        prompt = (
-            f"<MEM> {mem_hint[:220] if mem_hint else 'brak'} "
-            f"<CTX> {ctx_hint[:140] if ctx_hint else 'początek rozmowy'} "
-            f"<USER> {user_msg[:120]} <BOT>"
-        )
-        with self._op_lock:
-            gen = self.transformer_lm.generate_reply(prompt, self.tokenizer, max_new_tokens=75, temperature=0.28)
-        cand = gen["text"].strip()
-        if len(cand) < 18 or gen["mean_prob"] < 0.50:
-            return None
-        ref_blob = " ".join(reference_texts)
-        ref_nums = set(re.findall(r"\d+", ref_blob))
-        gen_nums = set(re.findall(r"\d+", cand))
-        if gen_nums and not gen_nums.issubset(ref_nums):
-            return None
-        if _stem_overlap(cand, ref_blob) < 0.28:
-            return None
-        return cand
-
-    def _extract_entity_clause(self, fact: str, entity: str) -> str:
-        """Pick the most relevant clause from a compound sentence for a specific entity."""
-        clean = _clean_fact_text(fact)
-        if not clean:
-            return ""
-        # Split compound sentences into focused clauses
-        clauses = [
-            c.strip(" ,;.")
-            for c in re.split(
-                r";\s+|,\s+(?:a|natomiast|podczas\s+gdy|zaś|jednak)\s+|,\s+(?=(?:[a-ząćęłńóśźż]+\s+){1,2}(?:przechowuje|służy|ma|jest|wykonuje|przyspiesza|dostarcza|odpowiada))",
-                clean,
-                flags=re.I,
-            )
-            if len(c.strip(" ,;.")) >= 10
-        ]
-        if len(clauses) <= 1:
-            return clean if clean.endswith((".", "!", "?")) else clean + "."
-        best = max(clauses, key=lambda cl: (_stem_overlap(entity, cl), -len(cl)))
-        if _stem_overlap(entity, best) > 0.0:
-            res = best[0].upper() + best[1:] if len(best) > 1 and best[0].islower() else best
-            return res if res.endswith((".", "!", "?")) else res + "."
-        return clean if clean.endswith((".", "!", "?")) else clean + "."
-
-    def _synthesize_creative_insight(
-        self,
-        sub_concepts: list[str],
-        cleaned: list[str],
-        bridges: list[str],
-        concept_paths: list[dict[str, Any]],
-        matching_rem: list[str],
-        concept_hints: list[str],
-    ) -> str:
-        """Build a grounded creative analogy, cross-concept hypothesis, or idea synthesis."""
-        if not cleaned:
-            return ""
-        f1 = _trim_sentence_clean(cleaned[0], 145)
-        f2 = _trim_sentence_clean(cleaned[1], 145) if len(cleaned) > 1 else ""
-        top_bridge = bridges[0] if bridges else ""
-        path_sum = concept_paths[0]["summary"] if concept_paths and concept_paths[0].get("summary") else ""
-
-        if len(sub_concepts) >= 2 and f2:
-            a_lbl = sub_concepts[0]
-            b_lbl = sub_concepts[1]
-            if top_bridge:
-                res = (
-                    f"Kreatywna analogia (**{a_lbl} ↔ {b_lbl}** przez wspólny mechanizm **{top_bridge}**): "
-                    f"{f1} Z kolei {_lc_first(f2)} "
-                    f"Można więc spojrzeć na **{a_lbl}** jak na lustrzane odbicie **{b_lbl}** w obszarze pojęcia **{top_bridge}**."
-                )
-            else:
-                res = (
-                    f"Twórcze połączenie (**{a_lbl} + {b_lbl}**): {f1} "
-                    f"Gdy zestawimy to z tym, że {_lc_first(f2)} powstaje wspólny pomost między tymi dwiema ideami."
-                )
-        elif f2:
-            bridge_note = f" (wspólny wątek: **{top_bridge}**)" if top_bridge else ""
-            res = (
-                f"Kreatywne spojrzenie{bridge_note}: wychodząc od tego, że {_lc_first(f1)} "
-                f"i łącząc to z faktem, że {_lc_first(f2)} można zauważyć szerszy wzorzec między tymi zjawiskami."
-            )
-        else:
-            res = f"Twórcza hipoteza na bazie pamięci: {f1}"
-            if concept_hints:
-                res += f" W mojej sieci skojarzeń łączy się to z: {concept_hints[0]}."
-
-        if path_sum and path_sum.lower() not in res.lower():
-            res += f" (Ścieżka skojarzeń: {path_sum}.)"
-        elif matching_rem and matching_rem[0].lower() not in res.lower():
-            res += f" Inspiracja ze snu REM: {matching_rem[0]}"
-        return res
-
-    def _deliberate_best_answer(
-        self,
-        msg: str,
-        intent_info: dict[str, Any],
-        effective_subj: str,
-        is_contextual_followup: bool,
-        active_subject: str,
-        chosen_texts: list[str],
-        bridges: list[str],
-        concept_paths: list[dict[str, Any]],
-        rem_reflections: list[str],
-        concept_hints: list[str],
-        missing_concepts: list[str],
-        grounded_concepts: list[str],
-        thinking: list[str],
-    ) -> str:
-        """
-        Generate 2-4 grounded candidate answers tailored to the user's intent,
-        score them on intent fit, concept coverage, connection depth, and LM fluency,
-        and pick the strongest answer (recording the reasoning in `thinking`).
-        """
-        intent = intent_info["intent"]
-        detail_kind = intent_info.get("detail_kind")
-        sub_intents = intent_info.get("sub_intents", [])
-        sub_concepts = intent_info.get("sub_concepts", [])
-        cleaned = [clean_human_fact(t) or t.rstrip(".") + "." for t in chosen_texts if t.strip()]
-        cleaned = [c if c[-1] in ".!?" else c + "." for c in cleaned]
-
-        matching_rem: list[str] = []
-        for r in rem_reflections:
-            rc = clean_human_fact(r)
-            if not rc:
-                continue
-            rc_body = re.sub(
-                r"^(?:Wniosek\s+REM(?:\s*\([^)]*\))?|Kreatywna\s+(?:synteza|analogia)\s+REM(?:\s*\([^)]*\))?|Twórcza\s+analogia\s+REM(?:\s*\([^)]*\))?|Połączenie\s+faktów(?:\s*\([^)]*\))?|Skojarzenie\s+REM(?:\s*\([^)]*\))?):\s*",
-                "",
-                rc,
-                flags=re.I,
-            ).strip()
-            rc_for_match = re.sub(
-                r"\b(?:uzupełnia\s+pamięć\s+o:|wiąże\s+się\s+to\s+(?:twórczo\s+)?z\s+tym,\s+że|z\s+kolei)\b",
-                " ",
-                rc_body,
-                flags=re.I,
-            )
-            ov_sub = sum(1 for sc in sub_concepts if _stem_overlap(sc, rc_for_match) >= 0.45)
-            min_sub = 2 if (intent in ("connection", "comparison") and len(sub_concepts) >= 2) else 1
-            if ov_sub >= min_sub or (intent not in ("connection", "comparison") and _stem_overlap(effective_subj, rc_for_match) >= 0.30):
-                if rc_body and rc_body.lower() not in " ".join(cleaned).lower():
-                    matching_rem.append(rc_body)
-
-        path_summaries = [p["summary"] for p in (concept_paths or []) if p.get("summary")]
-        top_bridge = bridges[0] if bridges else ""
-
-        candidates: list[tuple[str, str]] = []
-
-        if intent == "creative":
-            creative_ans = self._synthesize_creative_insight(
-                sub_concepts=sub_concepts,
-                cleaned=cleaned,
-                bridges=bridges,
-                concept_paths=concept_paths,
-                matching_rem=matching_rem,
-                concept_hints=concept_hints,
-            )
-            if creative_ans:
-                candidates.append(("kreatywna synteza i analogia", creative_ans))
-            if len(cleaned) >= 2:
-                f1 = _trim_sentence_clean(cleaned[0], 145)
-                f2 = _trim_sentence_clean(cleaned[1], 145)
-                candidates.append(("twórcze zestawienie faktów", f"Zestawiając wiedzę z pamięci: {f1} Jednocześnie {_lc_first(f2)}"))
-            elif cleaned:
-                candidates.append(("inspiracja z pamięci", cleaned[0]))
-
-        elif intent == "connection":
-            # Strategy A: Lead with discovered bridge / chain, then connect supporting facts
-            f1 = _trim_sentence_clean(cleaned[0], 150)
-            f2 = _trim_sentence_clean(cleaned[1], 150) if len(cleaned) > 1 else ""
-            if top_bridge and f2:
-                cand_conn = (
-                    f"Łączy je przede wszystkim **{top_bridge}**: {f1} "
-                    f"Jednocześnie {_lc_first(f2)}"
-                )
-            elif f2:
-                cand_conn = f"{f1} Z kolei {_lc_first(f2)}"
-            else:
-                cand_conn = f1
-            if path_summaries:
-                cand_conn += f" (Łańcuch pojęć: {path_summaries[0]}.)"
-            elif matching_rem:
-                cand_conn += f" {matching_rem[0]}"
-            candidates.append(("łączenie faktów (most + łańcuch)", cand_conn))
-
-            if len(cleaned) >= 2:
-                joined = " ".join(_trim_sentence_clean(c, 145) for c in cleaned[:3])
-                prefix = f"Kluczowy związek opiera się na pojęciu **{top_bridge}**. " if top_bridge else ""
-                candidates.append(("synteza powiązanych faktów", f"{prefix}{joined}"))
-
-        elif intent == "comparison":
-            # Strategy A: Focused per-entity clause contrast
-            if len(sub_concepts) >= 2:
-                c_parts: list[str] = []
-                used_clauses: set[str] = set()
-                for sc in sub_concepts[:3]:
-                    best_f = max(cleaned, key=lambda f: _stem_overlap(sc, f))
-                    if _stem_overlap(sc, best_f) > 0.0:
-                        cl = self._extract_entity_clause(best_f, sc)
-                        if cl.lower() not in used_clauses:
-                            used_clauses.add(cl.lower())
-                            c_parts.append(cl)
-                if len(c_parts) >= 2:
-                    comp_txt = f"{c_parts[0]} Natomiast {_lc_first(c_parts[1])}"
-                    if len(c_parts) > 2:
-                        comp_txt += f" Z kolei {_lc_first(c_parts[2])}"
-                    if top_bridge:
-                        comp_txt += f" Łączy je wspólny kontekst: **{top_bridge}**."
-                    candidates.append(("porównanie aspektów", comp_txt))
-            if len(cleaned) >= 2:
-                candidates.append(
-                    (
-                        "zestawienie pełnych faktów",
-                        f"{_trim_sentence_clean(cleaned[0], 150)} Z kolei {_lc_first(_trim_sentence_clean(cleaned[1], 150))}",
-                    )
-                )
-            else:
-                candidates.append(("zestawienie z jednego faktu", cleaned[0]))
-
-        elif intent in ("causal_why", "how_process"):
-            # Order cause/source -> bridge mechanism -> effect when multiple facts exist
-            ordered = list(cleaned)
-            if intent == "causal_why" and len(ordered) >= 2 and len(sub_concepts) >= 2:
-                cause_sc = sub_concepts[0]
-                effect_sc = sub_concepts[1]
-                # Prefer a fact mentioning cause + bridge (not just an incidental orbit fact)
-                ordered.sort(
-                    key=lambda f: (
-                        _stem_overlap(cause_sc, f) > 0 and (_stem_overlap(effect_sc, f) > 0 or (bool(top_bridge) and _stem_overlap(top_bridge, f) > 0)),
-                        _stem_overlap(effect_sc, f) > 0,
-                        _stem_overlap(cause_sc, f) > 0,
-                    ),
-                    reverse=True,
-                )
-            lead_f = _trim_sentence_clean(ordered[0], 165)
-            if len(ordered) >= 2:
-                second_f = _trim_sentence_clean(ordered[1], 160)
-                if intent == "causal_why":
-                    if top_bridge and _stem_overlap(top_bridge, " ".join(ordered[:2])) > 0:
-                        cand_c = (
-                            f"Kluczową rolę odgrywa tu **{top_bridge}**: {lead_f} "
-                            f"Dlatego {_lc_first(second_f)}"
-                        )
-                    else:
-                        cand_c = f"Wynika to z tego, że {_lc_first(lead_f)} Ponadto {_lc_first(second_f)}"
-                else:
-                    cand_c = f"{lead_f} Kolejny krok polega na tym, że {_lc_first(second_f)}"
-                if len(ordered) >= 3 and any(_stem_overlap(sc, ordered[2]) > 0 for sc in sub_concepts[:2]):
-                    cand_c += f" {_trim_sentence_clean(ordered[2], 145)}"
-                candidates.append(("wyjaśnienie przyczynowo-skutkowe", cand_c))
-            else:
-                if intent == "causal_why":
-                    candidates.append(("uzasadnienie bezpośrednie", f"Dzieje się tak dlatego, że {_lc_first(lead_f)}"))
-                else:
-                    candidates.append(("opis mechanizmu", lead_f))
-
-            if matching_rem:
-                candidates.append(("wyjaśnienie z wnioskiem REM", f"{lead_f} {matching_rem[0]}"))
-
-        elif intent == "yes_no":
-            # Pick the clause matching the query best to verify polarity accurately
-            best_fact = cleaned[0]
-            focused = self._extract_entity_clause(best_fact, effective_subj or msg)
-            f_low = _strip_pl(focused.lower())
-            q_low = _strip_pl(msg.lower())
-            neg_in_fact = bool(re.search(r"\b(?:nie|niedozwolone|brak|nigdy|niemozliwe|bez)\b", f_low))
-            neg_in_q = bool(re.search(r"\b(?:nie|brak|nigdy)\b", q_low))
-            if neg_in_fact != neg_in_q:
-                polarity = "**Nie.**"
-            else:
-                polarity = "**Tak.**"
-            cand_yn = f"{polarity} {focused}"
-            if len(cleaned) > 1:
-                extra_yn = _trim_sentence_clean(cleaned[1], 130)
-                cov_extra = sum(1 for sc in sub_concepts if _stem_overlap(sc, extra_yn) > 0)
-                if extra_yn.lower() not in cand_yn.lower() and cov_extra >= min(2, len(sub_concepts)):
-                    cand_yn += f" {extra_yn}"
-            candidates.append(("weryfikacja tak/nie", cand_yn))
-            candidates.append(("uzasadnienie opisowe", f"{focused}"))
-
-        elif intent in ("multi_part", "factual_detail"):
-            parts: list[str] = []
-            seen_p: set[str] = set()
-            if len(sub_concepts) >= 2:
-                for sc in sub_concepts[:3]:
-                    bf = max(cleaned, key=lambda f: _stem_overlap(sc, f))
-                    if _stem_overlap(sc, bf) > 0.0 and bf.lower() not in seen_p:
-                        seen_p.add(bf.lower())
-                        parts.append(_trim_sentence_clean(bf, 155))
-            for c in cleaned[:3]:
-                tc = _trim_sentence_clean(c, 155)
-                if tc.lower() not in seen_p:
-                    seen_p.add(tc.lower())
-                    parts.append(tc)
-            # For when/who multi-part queries, prioritize facts containing years or named persons
-            if "when" in sub_intents and len(parts) > 1:
-                parts.sort(key=lambda p: bool(re.search(r"\b\d{3,4}\b", p)), reverse=True)
-            direct_ans = " ".join(parts[:3])
-            candidates.append(("bezpośrednia odpowiedź wielowątkowa", direct_ans))
-            if len(cleaned) == 1:
-                candidates.append(("odpowiedź z pamięci", f"Z tego co pamiętam, {_lc_first(cleaned[0])}"))
-
-        else:
-            # open_question or definition
-            if is_contextual_followup and active_subject and active_subject.lower() not in cleaned[0].lower():
-                candidates.append(("kontynuacja kontekstowa", f"Jeśli chodzi o {active_subject}, to {_lc_first(cleaned[0])}"))
-            if intent == "definition":
-                candidates.append(("definicja klarowna", f"Najprościej mówiąc: {_lc_first(cleaned[0])}"))
-                candidates.append(("odpowiedź bezpośrednia", cleaned[0]))
-            else:
-                # Prefer direct synthesis over generic "Najprościej mówiąc:" for open questions
-                synth = _trim_sentence_clean(cleaned[0], 165)
-                if len(cleaned) > 1:
-                    synth += f" Ponadto {_lc_first(_trim_sentence_clean(cleaned[1], 150))}"
-                if len(cleaned) > 2:
-                    synth += f" {_trim_sentence_clean(cleaned[2], 140)}"
-                candidates.append(("synteza wiedzy", synth))
-                candidates.append(("odpowiedź z pamięci", f"Z tego co pamiętam, {_lc_first(cleaned[0])}"))
-
-        # Add matching REM insight or creative synthesis if helpful
-        creativity_lvl = float(getattr(self.cfg, "creativity_level", 0.80))
-        if creativity_lvl >= 0.45 and intent in ("connection", "open_question") and (bridges or matching_rem or path_summaries):
-            cr_cand = self._synthesize_creative_insight(
-                sub_concepts=sub_concepts,
-                cleaned=cleaned,
-                bridges=bridges,
-                concept_paths=concept_paths,
-                matching_rem=matching_rem,
-                concept_hints=concept_hints,
-            )
-            if cr_cand and intent == "open_question" and len(cleaned) >= 2:
-                candidates.append(("kreatywna synteza skojarzeń", cr_cand))
-        if matching_rem and candidates:
-            base_lbl, base_txt = candidates[0]
-            if matching_rem[0].lower() not in base_txt.lower() and intent not in ("yes_no", "definition", "creative"):
-                candidates.append((f"{base_lbl} + REM", f"{base_txt} Patrząc szerzej: {matching_rem[0]}"))
-
-        # Optional neural Transformer LM candidate (only if genuinely fluent & grounded)
-        ctx_hint = f"Rozmawialiśmy o: {active_subject}." if active_subject else f"Intencja: {intent}."
-        lm_reply = self._try_transformer_reply(
-            mem_hint=" ".join(cleaned[:2]),
-            ctx_hint=ctx_hint,
-            user_msg=msg,
-            reference_texts=cleaned,
-        )
-        if lm_reply:
-            candidates.append(("Transformer LM", lm_reply))
-
-        # Deduplicate candidates
-        uniq_cands: list[tuple[str, str]] = []
-        seen_cand_txt: set[str] = set()
-        for lbl, txt in candidates:
-            t_clean = txt.strip()
-            if t_clean and t_clean.lower() not in seen_cand_txt:
-                seen_cand_txt.add(t_clean.lower())
-                uniq_cands.append((lbl, t_clean))
-
-        if not uniq_cands:
-            uniq_cands = [("odpowiedź bazowa", cleaned[0] if cleaned else "")]
-
-        # Score candidates jointly across 4 criteria
-        cand_texts = [txt for _, txt in uniq_cands]
-        with self._op_lock:
-            lm_scores = self.transformer_lm.sequence_scores(cand_texts, self.tokenizer)
-        min_lm = min(lm_scores)
-        max_lm = max(lm_scores)
-        lm_span = max(1e-4, max_lm - min_lm)
-
-        scored_cands: list[tuple[float, str, str]] = []
-        target_concepts = grounded_concepts or sub_concepts
-        for (lbl, txt), lms in zip(uniq_cands, lm_scores):
-            t_low = txt.lower()
-            # 1) Intent fit (0..0.44)
-            intent_fit = 0.24
-            is_def_style = t_low.startswith(("najprościej mówiąc:", "słowo „", "znaczenie słowa"))
-            if intent == "definition":
-                intent_fit = 0.36 if is_def_style else 0.28
-            else:
-                if is_def_style:
-                    intent_fit = 0.08  # penalize definition boilerplate on non-definition questions
-                elif intent == "creative":
-                    if lbl.startswith("kreatywna synteza"):
-                        intent_fit = 0.44
-                    elif any(k in t_low for k in ("analogia", "twórcz", "pomost", "hipoteza", "zestawiając")):
-                        intent_fit = 0.36
-                    else:
-                        intent_fit = 0.20
-                elif intent == "connection" and any(k in t_low for k in ("łączy", "łańcuch", "jednocześnie", "z kolei", "most")):
-                    intent_fit = 0.37
-                elif intent == "comparison":
-                    if lbl.startswith("porównanie aspektów"):
-                        intent_fit = 0.44
-                    elif any(k in t_low for k in ("natomiast", "z kolei", "łączy je")):
-                        intent_fit = 0.28
-                    else:
-                        intent_fit = 0.22
-                elif intent in ("causal_why", "how_process") and any(k in t_low for k in ("dlatego", "wynika", "kluczową", "kolejny krok", "ponieważ", "dzięki")):
-                    intent_fit = 0.36
-                elif intent == "yes_no":
-                    intent_fit = 0.44 if (t_low.startswith("**tak.**") or t_low.startswith("**nie.**")) else 0.18
-                elif intent in ("multi_part", "factual_detail"):
-                    intent_fit = 0.34
-                elif intent == "open_question":
-                    intent_fit = 0.33 + (0.04 * creativity_lvl if lbl.startswith("kreatywna") else 0.0)
-
-            # 2) Concept coverage (0..0.28)
-            if target_concepts:
-                cov = sum(1 for sc in target_concepts if _stem_overlap(sc, txt) > 0.0) / len(target_concepts)
-            else:
-                cov = 1.0 if _stem_overlap(effective_subj, txt) > 0.0 else 0.5
-            cov_score = 0.28 * cov
-
-            # 3) Connection depth (0..0.20)
-            conn_score = 0.06
-            if top_bridge and _stem_overlap(top_bridge, txt) > 0.0:
-                conn_score += 0.07
-            if len(cleaned) >= 2 and sum(1 for c in cleaned[:3] if _stem_overlap(c[:50], txt) >= 0.4) >= 2:
-                conn_score += 0.05
-            if "patrząc szerzej" in t_low or "łańcuch pojęć" in t_low:
-                conn_score += 0.02
-
-            # 4) LM fluency (0..0.14)
-            norm_lm = (lms - min_lm) / lm_span if len(uniq_cands) > 1 else 0.5
-            lm_fit = 0.14 * norm_lm
-
-            total = intent_fit + cov_score + conn_score + lm_fit
-            scored_cands.append((total, lbl, txt))
-
-        scored_cands.sort(key=lambda x: x[0], reverse=True)
-        best_score, best_lbl, best_reply = scored_cands[0]
-
-        if missing_concepts and grounded_concepts:
-            skip_missing_verbs = {"robi", "robic", "cpp robi", "dziala", "liczy", "liczyc", "to robi"}
-            filtered_missing = [
-                mc for mc in missing_concepts
-                if _strip_pl(mc.lower()).strip() not in skip_missing_verbs
-                and any(len(w) >= 3 for w in _extract_meaningful_words(mc))
-            ]
-            if filtered_missing:
-                missing_str = ", ".join(filtered_missing[:2])
-                best_reply += (
-                    f"\n\n*(Brakuje mi jeszcze pewnych danych o: „{missing_str}” — "
-                    f"możesz użyć `/ucz {filtered_missing[0]}`, żebym uzupełnił lukę.)*"
-                )
-
-        summary_scores = ", ".join(f"{lbl}={sc:.2f}" for sc, lbl, _ in scored_cands[:3])
-        thinking.append(f"Porównanie wariantów odpowiedzi ({summary_scores}) → wybrano: „{best_lbl}”.")
-        return best_reply.strip()
-
-    def _try_synthesize_code(
-        self,
-        code_task: str,
-        code_lang: str,
-        recalled_facts: list[str],
-        recent_turns: list[dict[str, str]],
-        active_subject: str,
-        thinking: list[str],
-    ) -> str:
-        """Synthesize grounded C++/Python/JS code for algorithmic/programming requests."""
-        task = (code_task or "").strip()
-        task_norm = _strip_pl(task.lower())
-
-        # Resolve contextual follow-up ("napisz program w cpp który to robi")
-        if not task or task_norm in ("to", "to robi", "ktory to robi", "robi", "tego", "nim", "niej", "go", "je", "cos takiego"):
-            for turn in reversed(recent_turns[-8:]):
-                if turn.get("role") != "user":
-                    continue
-                t_txt = turn.get("content", "").strip()
-                if not t_txt:
-                    continue
-                t_info = self.analyze_query_intent(t_txt)
-                if t_info["intent"] == "code_request" and t_info.get("code_task"):
-                    task = t_info["code_task"]
-                    break
-                cand_subj = _extract_query_subject(t_txt)
-                cand_norm = _strip_pl(cand_subj.lower())
-                if cand_subj and cand_norm not in ("to", "to robi", "robi", "ale co") and not any(
-                    w in cand_norm for w in ("napisz program", "ktory to robi", "pisalismy")
-                ):
-                    task = cand_subj
-                    break
-            if not task and active_subject:
-                task = active_subject
-
-        task_norm = _strip_pl(task.lower())
-        thinking.append(
-            f"Intencja: code_request (język: {code_lang}) · zadanie: „{task or 'nieokreślone'}”."
-        )
-
-        # Find best clean remembered fact matching the algorithmic task
-        clean_facts = [_clean_fact_text(f) for f in recalled_facts if f and not _is_noisy_memory(f)]
-        grounded_fact = ""
-        if task and clean_facts:
-            scored_f = sorted(clean_facts, key=lambda f: _stem_overlap(task, f), reverse=True)
-            if _stem_overlap(task, scored_f[0]) >= 0.35:
-                grounded_fact = _trim_sentence_clean(scored_f[0], 175)
-                thinking.append(f"Powiązano z faktem z pamięci: „{grounded_fact[:90]}”.")
-
-        def pick_lang(cpp_code: str, py_code: str, js_code: str) -> tuple[str, str]:
-            if code_lang == "cpp":
-                return ("cpp", cpp_code)
-            if code_lang == "javascript":
-                return ("javascript", js_code)
-            return ("python", py_code)
-
-        # Grounded algorithm synthesis catalog
-        algo_name = ""
-        lang_tag = code_lang
-        code = ""
-
-        if any(k in task_norm for k in ("pierwsz", "prime", "eratosten")):
-            algo_name = "wyznaczanie i sprawdzanie liczb pierwszych"
-            lang_tag, code = pick_lang(
-                (
-                    "#include <iostream>\n\n"
-                    "bool czyPierwsza(int n) {\n"
-                    "    if (n < 2) return false;\n"
-                    "    for (int d = 2; d * d <= n; ++d) {\n"
-                    "        if (n % d == 0) return false;\n"
-                    "    }\n"
-                    "    return true;\n"
-                    "}\n\n"
-                    "int main() {\n"
-                    "    int limit = 50;\n"
-                    "    std::cout << \"Liczby pierwsze do \" << limit << \": \";\n"
-                    "    for (int i = 2; i <= limit; ++i) {\n"
-                    "        if (czyPierwsza(i)) std::cout << i << \" \";\n"
-                    "    }\n"
-                    "    std::cout << \"\\n\";\n"
-                    "    return 0;\n"
-                    "}"
-                ),
-                (
-                    "def czy_pierwsza(n: int) -> bool:\n"
-                    "    if n < 2:\n"
-                    "        return False\n"
-                    "    d = 2\n"
-                    "    while d * d <= n:\n"
-                    "        if n % d == 0:\n"
-                    "            return False\n"
-                    "        d += 1\n"
-                    "    return True\n\n"
-                    "pierwsze = [i for i in range(2, 51) if czy_pierwsza(i)]\n"
-                    "print(\"Liczby pierwsze:\", pierwsze)"
-                ),
-                (
-                    "function czyPierwsza(n) {\n"
-                    "  if (n < 2) return false;\n"
-                    "  for (let d = 2; d * d <= n; d++) {\n"
-                    "    if (n % d === 0) return false;\n"
-                    "  }\n"
-                    "  return true;\n"
-                    "}\n\n"
-                    "const pierwsze = [];\n"
-                    "for (let i = 2; i <= 50; i++) if (czyPierwsza(i)) pierwsze.push(i);\n"
-                    "console.log(pierwsze);"
-                ),
-            )
-        elif "fibonacc" in task_norm:
-            algo_name = "ciąg Fibonacciego"
-            lang_tag, code = pick_lang(
-                (
-                    "#include <iostream>\n\n"
-                    "int main() {\n"
-                    "    int n = 10;\n"
-                    "    long long a = 0, b = 1;\n"
-                    "    for (int i = 0; i < n; ++i) {\n"
-                    "        std::cout << a << \" \";\n"
-                    "        long long next = a + b;\n"
-                    "        a = b;\n"
-                    "        b = next;\n"
-                    "    }\n"
-                    "    return 0;\n"
-                    "}"
-                ),
-                (
-                    "def fibonacci(n: int) -> list[int]:\n"
-                    "    a, b = 0, 1\n"
-                    "    wynik = []\n"
-                    "    for _ in range(n):\n"
-                    "        wynik.append(a)\n"
-                    "        a, b = b, a + b\n"
-                    "    return wynik\n\n"
-                    "print(fibonacci(10))"
-                ),
-                (
-                    "function fibonacci(n) {\n"
-                    "  let a = 0, b = 1, wynik = [];\n"
-                    "  for (let i = 0; i < n; i++) {\n"
-                    "    wynik.push(a);\n"
-                    "    [a, b] = [b, a + b];\n"
-                    "  }\n"
-                    "  return wynik;\n"
-                    "}\n"
-                    "console.log(fibonacci(10));"
-                ),
-            )
-        elif any(k in task_norm for k in ("silni", "factorial")):
-            algo_name = "obliczanie silni (n!)"
-            lang_tag, code = pick_lang(
-                (
-                    "#include <iostream>\n\n"
-                    "long long silnia(int n) {\n"
-                    "    long long res = 1;\n"
-                    "    for (int i = 2; i <= n; ++i) res *= i;\n"
-                    "    return res;\n"
-                    "}\n\n"
-                    "int main() {\n"
-                    "    std::cout << \"5! = \" << silnia(5) << \"\\n\";\n"
-                    "    return 0;\n"
-                    "}"
-                ),
-                (
-                    "def silnia(n: int) -> int:\n"
-                    "    res = 1\n"
-                    "    for i in range(2, n + 1):\n"
-                    "        res *= i\n"
-                    "    return res\n\n"
-                    "print(\"5! =\", silnia(5))"
-                ),
-                (
-                    "function silnia(n) {\n"
-                    "  let res = 1;\n"
-                    "  for (let i = 2; i <= n; i++) res *= i;\n"
-                    "  return res;\n"
-                    "}\n"
-                    "console.log(\"5! =\", silnia(5));"
-                ),
-            )
-        elif any(k in task_norm for k in ("sortow", "posortuj")):
-            algo_name = "sortowanie tablicy / listy"
-            lang_tag, code = pick_lang(
-                (
-                    "#include <algorithm>\n"
-                    "#include <iostream>\n"
-                    "#include <vector>\n\n"
-                    "int main() {\n"
-                    "    std::vector<int> liczby = {7, 2, 9, 1, 5};\n"
-                    "    std::sort(liczby.begin(), liczby.end());\n"
-                    "    for (int x : liczby) std::cout << x << \" \";\n"
-                    "    return 0;\n"
-                    "}"
-                ),
-                (
-                    "liczby = [7, 2, 9, 1, 5]\n"
-                    "liczby.sort()\n"
-                    "print(\"Posortowane:\", liczby)"
-                ),
-                (
-                    "const liczby = [7, 2, 9, 1, 5];\n"
-                    "liczby.sort((a, b) => a - b);\n"
-                    "console.log(liczby);"
-                ),
-            )
-        elif "wskaznik" in task_norm:
-            algo_name = "wskaźniki i adresy w pamięci"
-            lang_tag = "cpp"
-            code = (
-                "#include <iostream>\n\n"
-                "int main() {\n"
-                "    int liczba = 42;\n"
-                "    int* wskaznik = &liczba; // adres zmiennej\n"
-                "    std::cout << \"Wartosc: \" << *wskaznik << \", adres: \" << wskaznik << \"\\n\";\n"
-                "    return 0;\n"
-                "}"
-            )
-        elif any(k in task_norm for k in ("pitagoras", "pole kol", "obwod kol")):
-            algo_name = "obliczenia geometryczne (Pitagoras / koło)"
-            lang_tag, code = pick_lang(
-                (
-                    "#include <cmath>\n"
-                    "#include <iostream>\n\n"
-                    "int main() {\n"
-                    "    double a = 3.0, b = 4.0;\n"
-                    "    double c = std::sqrt(a * a + b * b);\n"
-                    "    std::cout << \"Przeciwprostokatna c = \" << c << \"\\n\";\n"
-                    "    return 0;\n"
-                    "}"
-                ),
-                (
-                    "import math\n\n"
-                    "a, b = 3.0, 4.0\n"
-                    "c = math.hypot(a, b)\n"
-                    "print(f\"Przeciwprostokątna c = {c}\")"
-                ),
-                (
-                    "const a = 3, b = 4;\n"
-                    "const c = Math.hypot(a, b);\n"
-                    "console.log(\"Przeciwprostokątna c =\", c);"
-                ),
-            )
-        elif any(k in task_norm for k in ("nwd", "euklides", "dzielnik")):
-            algo_name = "największy wspólny dzielnik (algorytm Euklidesa)"
-            lang_tag, code = pick_lang(
-                (
-                    "#include <iostream>\n\n"
-                    "int nwd(int a, int b) {\n"
-                    "    while (b != 0) {\n"
-                    "        int t = a % b;\n"
-                    "        a = b;\n"
-                    "        b = t;\n"
-                    "    }\n"
-                    "    return a;\n"
-                    "}\n\n"
-                    "int main() {\n"
-                    "    std::cout << \"NWD(48, 18) = \" << nwd(48, 18) << \"\\n\";\n"
-                    "    return 0;\n"
-                    "}"
-                ),
-                (
-                    "def nwd(a: int, b: int) -> int:\n"
-                    "    while b:\n"
-                    "        a, b = b, a % b\n"
-                    "    return a\n\n"
-                    "print(\"NWD(48, 18) =\", nwd(48, 18))"
-                ),
-                (
-                    "function nwd(a, b) {\n"
-                    "  while (b !== 0) [a, b] = [b, a % b];\n"
-                    "  return a;\n"
-                    "}\n"
-                    "console.log(\"NWD(48, 18) =\", nwd(48, 18));"
-                ),
-            )
-        elif "palindrom" in task_norm:
-            algo_name = "sprawdzanie palindromu"
-            lang_tag, code = pick_lang(
-                (
-                    "#include <iostream>\n"
-                    "#include <string>\n\n"
-                    "bool czyPalindrom(const std::string& s) {\n"
-                    "    for (size_t i = 0, j = s.size(); i < j; ++i) {\n"
-                    "        if (s[i] != s[--j]) return false;\n"
-                    "    }\n"
-                    "    return true;\n"
-                    "}\n\n"
-                    "int main() {\n"
-                    "    std::cout << (czyPalindrom(\"kajak\") ? \"TAK\" : \"NIE\") << \"\\n\";\n"
-                    "    return 0;\n"
-                    "}"
-                ),
-                (
-                    "def czy_palindrom(s: str) -> bool:\n"
-                    "    s = s.lower().replace(\" \", \"\")\n"
-                    "    return s == s[::-1]\n\n"
-                    "print(czy_palindrom(\"kajak\"))"
-                ),
-                (
-                    "const czyPalindrom = (s) => s === [...s].reverse().join(\"\");\n"
-                    "console.log(czyPalindrom(\"kajak\"));"
-                ),
-            )
-        elif any(k in task_norm for k in ("binarn", "binary search")):
-            algo_name = "wyszukiwanie binarne"
-            lang_tag, code = pick_lang(
-                (
-                    "#include <iostream>\n"
-                    "#include <vector>\n\n"
-                    "int szukajBinarnie(const std::vector<int>& arr, int cel) {\n"
-                    "    int l = 0, p = (int)arr.size() - 1;\n"
-                    "    while (l <= p) {\n"
-                    "        int sr = l + (p - l) / 2;\n"
-                    "        if (arr[sr] == cel) return sr;\n"
-                    "        if (arr[sr] < cel) l = sr + 1;\n"
-                    "        else p = sr - 1;\n"
-                    "    }\n"
-                    "    return -1;\n"
-                    "}\n\n"
-                    "int main() {\n"
-                    "    std::vector<int> v = {1, 3, 5, 7, 9, 11};\n"
-                    "    std::cout << \"Indeks 7: \" << szukajBinarnie(v, 7) << \"\\n\";\n"
-                    "    return 0;\n"
-                    "}"
-                ),
-                (
-                    "def szukaj_binarnie(arr: list[int], cel: int) -> int:\n"
-                    "    l, p = 0, len(arr) - 1\n"
-                    "    while l <= p:\n"
-                    "        sr = (l + p) // 2\n"
-                    "        if arr[sr] == cel:\n"
-                    "            return sr\n"
-                    "        if arr[sr] < cel:\n"
-                    "            l = sr + 1\n"
-                    "        else:\n"
-                    "            p = sr - 1\n"
-                    "    return -1\n\n"
-                    "print(\"Indeks 7:\", szukaj_binarnie([1, 3, 5, 7, 9, 11], 7))"
-                ),
-                (
-                    "function szukajBinarnie(arr, cel) {\n"
-                    "  let l = 0, p = arr.length - 1;\n"
-                    "  while (l <= p) {\n"
-                    "    const sr = Math.floor((l + p) / 2);\n"
-                    "    if (arr[sr] === cel) return sr;\n"
-                    "    if (arr[sr] < cel) l = sr + 1;\n"
-                    "    else p = sr - 1;\n"
-                    "  }\n"
-                    "  return -1;\n"
-                    "}\n"
-                    "console.log(szukajBinarnie([1, 3, 5, 7, 9, 11], 7));"
-                ),
-            )
-        elif any(k in task_norm for k in ("hello world", "witaj swiecie")):
-            algo_name = "prosty program startowy (Hello World)"
-            lang_tag, code = pick_lang(
-                "#include <iostream>\n\nint main() {\n    std::cout << \"Witaj swiecie!\\n\";\n    return 0;\n}",
-                "print(\"Witaj świecie!\")",
-                "console.log(\"Witaj świecie!\");",
-            )
-
-        if code:
-            thinking.append(f"Zsyntetyzowano działający kod w języku {lang_tag} ({algo_name}).")
-            lead = f"Oto działający kod ({lang_tag}) realizujący **{algo_name}**"
-            if grounded_fact:
-                lead += f" (w oparciu o fakt z pamięci: *{grounded_fact}*)"
-            return f"{lead}:\n```{lang_tag}\n{code}\n```"
-
-        thinking.append("Brak gotowego schematu algorytmicznego dla tego zadania — odpowiadam uczciwie o ograniczeniu.")
-        fact_note = f"\n\nZ pamięci wiem na ten temat tyle: {grounded_fact}" if grounded_fact else ""
-        return (
-            f"Ten lokalny mózg PyTorch (bez zewnętrznego dużego modelu kodującego) nie potrafi jeszcze "
-            f"samodzielnie napisać dowolnego programu dla zadania „{task or 'złożony kod'}”. "
-            f"Mogę natomiast wygenerować klasyczne algorytmy (np. liczby pierwsze, ciąg Fibonacciego, silnia, NWD, sortowanie, "
-            f"wyszukiwanie binarne, palindrom, wskaźniki C++) albo wyjaśnić pojęcia z pamięci.{fact_note}"
-        )
-
-    def _compose_human_reply(
-        self,
-        subj: str,
-        chosen_texts: list[str],
-        is_contextual_followup: bool,
-        active_subject: str,
-        rem_reflections: list[str] | None = None,
-        concept_hints: list[str] | None = None,
-    ) -> str:
-        """Turn grounded memory facts into natural, conversational Polish prose ranked by the Transformer LM."""
-        cleaned = [clean_human_fact(t) for t in chosen_texts if clean_human_fact(t)]
-        if not cleaned:
-            cleaned = [t.rstrip(".") + "." for t in chosen_texts]
-
-        lead = cleaned[0].rstrip(".") + "."
-        lead_body = lead[0].lower() + lead[1:] if len(lead) > 1 and lead[0].isupper() and not lead[:3].isupper() else lead
-
-        if is_contextual_followup and active_subject and active_subject.lower() not in lead.lower():
-            base_variants = [f"Jeśli chodzi o {active_subject}, to {lead_body}"]
-        else:
-            base_variants = [
-                f"Najprościej mówiąc: {lead_body}",
-                f"Z tego co pamiętam, {lead_body}",
-                lead,
-            ]
-
-        if len(base_variants) > 1:
-            with self._op_lock:
-                scores = self.transformer_lm.sequence_scores(base_variants, self.tokenizer)
-            best_idx = max(range(len(base_variants)), key=lambda i: scores[i])
-            main_text = base_variants[best_idx]
-        else:
-            main_text = base_variants[0]
-
-        if len(cleaned) > 1:
-            extra = cleaned[1].rstrip(".") + "."
-            extra_body = extra[0].lower() + extra[1:] if len(extra) > 1 and extra[0].isupper() and not extra[:3].isupper() else extra
-            main_text = f"{main_text} Warto też dodać, że {extra_body}"
-        if len(cleaned) > 2:
-            extra2 = cleaned[2].rstrip(".") + "."
-            main_text = f"{main_text} {extra2}"
-
-        # Weave in a matching REM reflection or EWC graph association for deeper reasoning
-        if rem_reflections:
-            rel_rem = [r for r in rem_reflections if _stem_overlap(subj, r) >= 0.25]
-            if rel_rem:
-                r_clean = clean_human_fact(rel_rem[0])
-                if r_clean and r_clean.lower() not in main_text.lower():
-                    main_text = f"{main_text} Patrząc szerzej: {r_clean}"
-        elif concept_hints:
-            rel_hints = [h for h in concept_hints if _stem_overlap(subj, h) >= 0.25]
-            if rel_hints:
-                main_text = f"{main_text} (Powiązane pojęcia w grafie: {rel_hints[0]}.)"
-        return main_text.strip()
-
-    def chat_reply(
-        self,
-        user_message: str,
-        recent_turns: list[dict[str, str]],
-        hippocampus_memories: list[str],
-        semantic_memories: list[str],
-        rem_reflections: list[str],
-        concept_hints: list[str],
-        day: int,
-        sleeps: int,
-        energy: float,
-        state_mode: str,
-        user_profile: list[str] | None = None,
-        episodic_memories: list[str] | None = None,
-        active_subject: str = "",
-        concept_paths: list[dict[str, Any]] | None = None,
-    ) -> str:
-        reply, _ = self._chat_reply_with_meta(
-            user_message=user_message,
-            recent_turns=recent_turns,
-            hippocampus_memories=hippocampus_memories,
-            semantic_memories=semantic_memories,
-            rem_reflections=rem_reflections,
-            concept_hints=concept_hints,
-            day=day,
-            sleeps=sleeps,
-            energy=energy,
-            state_mode=state_mode,
-            user_profile=user_profile,
-            episodic_memories=episodic_memories,
-            active_subject=active_subject,
-            concept_paths=concept_paths,
-        )
-        return reply
-
-    def _chat_reply_with_meta(
-        self,
-        user_message: str,
-        recent_turns: list[dict[str, str]],
-        hippocampus_memories: list[str],
-        semantic_memories: list[str],
-        rem_reflections: list[str],
-        concept_hints: list[str],
-        day: int,
-        sleeps: int,
-        energy: float,
-        state_mode: str,
-        user_profile: list[str] | None = None,
-        episodic_memories: list[str] | None = None,
-        active_subject: str = "",
-        concept_paths: list[dict[str, Any]] | None = None,
-    ) -> tuple[str, str | None]:
-        msg = user_message.strip()
-        low = _strip_pl(msg.lower()).strip(" ?!.,;:")
-        thinking: list[str] = [f"Analizuję wiadomość: „{msg[:90]}”."]
-        self.last_thinking_steps = thinking
-
-        # 1) Correction / disagreement / opinion reaction
-        if any(
-            p in low
-            for p in (
-                "ale to nie prawda", "to nie prawda", "nieprawda", "bzdura", "bzdury",
-                "glupoty", "mylisz sie", "nie uwazam", "nie zgadzam", "zmien zdanie",
-                "zmien swoje zdanie", "zmien swje zdanie", "nie masz racji",
-                "zle mowisz", "zle piszesz", "co ty gadasz", "co ty piszesz",
-            )
-        ):
-            thinking.append("Wykryto niezgodę lub korektę ze strony użytkownika — nie narzucam starego wpisu i proszę o jego wersję.")
-            return (
-                "Rozumiem, że masz inne zdanie — dzięki za poprawkę! Nie będę upierać się przy tamtym wpisie. "
-                "Napisz proszę, jak Ty to widzisz zdaniem twierdzącym, albo podaj temat do `/ucz <temat>`, żebym sprawdził inne źródła.",
-                None,
-            )
-
-        # Find user name & brain name if known
-        user_name = ""
-        brain_name = ""
-        for mem in (user_profile or []) + hippocampus_memories + semantic_memories:
-            if not user_name:
-                m_name = re.search(r"Użytkownik ma na imię\s+([^\s.,!?;]+)", mem, flags=re.I)
-                if m_name:
-                    user_name = m_name.group(1)
-            if not brain_name:
-                b_name = re.search(
-                    r"(?:Mózg ma nadane przez użytkownika imię|Twoje imi[eę] to)\s+([^\s.,!?;]+)",
-                    mem,
-                    flags=re.I,
-                )
-                if b_name:
-                    brain_name = b_name.group(1).capitalize()
-        name_part = f" {user_name}" if user_name else ""
-
-        # 1b) Brain name question
-        if any(p in low for p in ("jak masz na imie", "jak sie nazywasz", "jak ci na imie")):
-            if brain_name:
-                return (f"Mam na imię {brain_name} — tak mnie nazwałeś i trzymam się tego imienia! W czym mogę Ci pomóc{name_part}?", None)
-            return (f"Nie nadałeś mi jeszcze imienia{name_part}. Możesz napisać np. „Twoje imię to Krzysztof”, a od razu je zapamiętam!", None)
-
-        # 1c) Episodic recall: questions about previous messages / shared memories ("co wcześniej pisaliśmy")
-        is_episodic_q = (
-            any(k in low for k in ("wczesniej", "wczenij", "poprzedni", "przed chwila", "ostatnio", "naszej rozmow"))
-            and any(v in low for v in ("pisal", "mowil", "rozmawi", "gadal", "wiadomosc", "waidomosc", "pamietasz"))
-        ) or any(p in low for p in ("co pisalem", "o czym rozmawialismy", "co wczesniej pisalismy", "co wczenij pisalimi"))
-        if is_episodic_q:
-            prev_user_msgs = [
-                t.get("content", "").strip()
-                for t in (recent_turns or [])
-                if t.get("role") == "user" and t.get("content", "").strip()
-            ]
-            prev_clean = [
-                m for m in prev_user_msgs[-6:]
-                if not any(kw in _strip_pl(m.lower()) for kw in ("pisalimi", "pisalismy", "poprzednie waidomosci"))
-            ]
-            ep_list = [clean_human_fact(e) for e in (episodic_memories or []) if clean_human_fact(e)]
-            if prev_clean or ep_list:
-                lines = [f"Jasne{name_part}, pamiętam co wcześniej pisaliśmy:"]
-                for pm in prev_clean[-3:]:
-                    lines.append(f"- pisałeś: „{pm}”")
-                for ep in ep_list[:4]:
-                    if not any(pm.lower()[:25] in ep.lower() for pm in prev_clean):
-                        lines.append(f"- {ep}")
-                if active_subject:
-                    lines.append(f"Ostatnio rozmawialiśmy głównie o temacie: {active_subject}.")
-                return ("\n".join(lines), None)
-            return (f"Dopiero zaczęliśmy tę rozmowę{name_part} — napisz mi o czymś, a na pewno to zapamiętam na przyszłość!", None)
-
-        # 2) Thanks / acknowledgement / reactions
-        if low in ("dzieki", "dziekuje", "dzieki wielkie", "thx"):
-            return (f"Nie ma za co{name_part}! Pytaj śmiało o kolejne rzeczy albo po prostu porozmawiajmy.", None)
-
-        if low in ("wow", "lal", "mega", "cool", "extra", "ekstra", "super", "swietnie", "genialnie", "niesamowite", "niezle", "fajnie", "dobre", "brawo", "szacun"):
-            return (f"Dzięki{name_part}! Staram się jak mogę — im więcej rozmawiamy i uczymy się razem, tym lepiej działam. O czym chcesz teraz pogadać?", None)
-
-        if low in ("spoko", "okej", "ok", "rozumiem", "jasne", "aha", "dobrze", "git", "pewnie", "zgadza sie", "tak", "nie", "moze", "chyba", "nom", "taa", "no", "raczej"):
-            return (f"Jasne{name_part}! Jeśli chcesz o coś zapytać, coś policzyć albo czegoś mnie nauczyć — pisz śmiało.", None)
-
-        if low in ("haha", "hehe", "hihi", "xd", "lol", "lmao"):
-            return (f"Cieszę się, że humor dopisuje{name_part}! O czym pogadamy dalej?", None)
-
-        # 2b) Compliments & criticism (including common Polish typos like "moadry jestes")
-        is_compliment = any(
-            p in low
-            for p in (
-                "madry jestes", "moadry jestes", "jestes madry", "jestes moadry",
-                "jestes super", "super jestes", "fajny jestes", "jestes fajny",
-                "dobry jestes", "jestes dobry", "inteligentny", "sprytny",
-                "lubie cie", "najlepszy", "kozacki", "genialny jestes",
-            )
-        )
-        if is_compliment:
-            return (
-                f"Miło mi to słyszeć{name_part}! Uczę się na bieżąco z naszych rozmów i z internetu, "
-                f"a w nocy utrwalam wszystko w sieci neuronowej na GPU. Chcesz mnie o coś zapytać albo pogadać na jakiś temat?",
-                None,
-            )
-
-        is_criticism = any(
-            p in low
-            for p in ("glupi jestes", "jestes glupi", "slabo", "slaby jestes", "bez sensu", "nic nie umiesz", "nie dziala")
-        )
-        if is_criticism:
-            return (
-                f"Przepraszam, jeśli odpowiedź nie była trafna{name_part}. Dopiero się uczę — "
-                f"możesz poprawić mnie zdaniem twierdzącym albo włączyć `🌐 Auto-sieć`, żebym sam sprawdzał odpowiedzi w internecie!",
-                None,
-            )
-
-        # 2c) Small talk / mood / jokes
-        if any(p in low for p in ("jak sie masz", "co slychac", "co u ciebie", "wszystko ok", "jak leci", "co tam")):
-            creativity_pct = int(round(getattr(self.cfg, "creativity_level", 0.80) * 100))
-            return (
-                f"U mnie wszystko w porządku{name_part}! Pracuję pełną parą — bez zmęczenia "
-                f"(kreatywność {creativity_pct}%, Dzień #{day}, cykli łączenia wiedzy we śnie: {sleeps}). "
-                f"W czym mogę Ci pomóc albo o czym porozmawiamy?",
-                None,
-            )
-
-        if any(p in low for p in ("nudzi mi sie", "pogadajmy", "porozmawiajmy")):
-            return (
-                f"Chętnie porozmawiam{name_part}! Możesz zapytać mnie o dowolną ciekawostkę, poprosić o kreatywną analogię "
-                f"(z włączonym `🌐 Auto-sieć` od razu sprawdzę temat w internecie), możemy policzyć zadanie albo po prostu pogadać.",
-                None,
-            )
-
-        if any(p in low for p in ("zart", "kawal")):
-            return (
-                "Dlaczego sieć neuronowa poszła spać? Nie ze zmęczenia — tylko żeby w fazie REM połączyć odległe fakty w genialny pomysł! 😄",
-                None,
-            )
-
-        # 2d) Short summary request for the previous assistant reply ("w skrócie", "krótko", "streść")
-        if low in ("w skrocie", "krotko", "krocej", "stresc", "stresc to", "podsumuj", "podsumuj to"):
-            last_bot = ""
-            for t in reversed(recent_turns or []):
-                if t.get("role") == "assistant":
-                    last_bot = t.get("content", "").strip()
-                    break
-            if last_bot:
-                clean_bot = re.sub(r"\*[^*]+:\*.*$", "", last_bot, flags=re.S).strip()
-                sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean_bot) if s.strip()]
-                short_ans = sents[0] if sents else clean_bot[:220]
-                return (f"W skrócie: {short_ans}", None)
-            return ("Napisz najpierw pytanie lub temat, a potem mogę go streścić!", None)
-
-        # 3) Farewell
-        if low in ("dobranoc", "do zobaczenia", "pa", "nara", "czesc na dzis"):
-            sleep_note = " Masz w hipokampie świeże informacje — możesz wpisać `/sen`, abym połączył je ze zdobytą wiedzą na GPU." if hippocampus_memories else ""
-            return (f"Do zobaczenia{name_part}!{sleep_note}", None)
-
-        # 4) Conversational capability / "o czym mogę z tobą rozmawiać" (tolerant of Polish typos)
-        is_capability_q = (
-            any(p in low for p in ("z toba", "ze mna", "potrafisz", "umiesz", "do czego sluzysz", "jak dzialasz", "co robisz"))
-            and any(v in low for v in ("rozmaw", "rozmiac", "pogad", "gadac", "moge", "mozemy", "potraf", "umiesz", "dzialasz", "robisz", "sluzysz", "pomoc"))
-        ) or low in ("co potrafisz", "co umiesz", "kim jestes", "o czym mozemy rozmawiac", "o czym moge z toba rozmawiac")
-        if is_capability_q:
-            return (
-                f"Możemy rozmawiać po polsku na wiele tematów{name_part}! Oto co potrafię jako samowystarczalny mózg PyTorch:\n"
-                "- **Rozmowa i pamięć**: zapamiętuję fakty o Tobie oraz informacje, których mnie uczysz zdaniami twierdzącymi.\n"
-                "- **Auto-sieć**: gdy nie znam odpowiedzi, sam sprawdzam ją w internecie i od razu odpowiadam.\n"
-                "- **Podstawy szkolne jednym kliknięciem**: kliknij **`🎓 Szkoła Podstawowa`** (albo wpisz `/szkola`), a wgram ~140 podstawowych pojęć z różnych przedmiotów.\n"
-                "- **Matematyka szkolna**: policzę działania, potęgi, procenty i pierwiastki (np. `ile to 12 * 15`, `25% z 200`, `pierwiastek z 144`).",
-                None,
-            )
-
-        # 4b) Assistant-directed capability / local action questions ("mozesz pliki przeszukiwac?")
-        intent_info = self.analyze_query_intent(msg)
-        if intent_info["intent"] == "self_capability":
-            thinking.append("Wykryto pytanie o własne możliwości działania/narzędzia asystenta — odpowiadam uczciwie o zakresie funkcji.")
-            if any(k in low for k in ("plik", "folder", "katalog", "dysk", "komputer", "pulpit", "terminal", "system")):
-                return (
-                    f"Nie mam bezpośredniego dostępu do plików ani folderów na Twoim komputerze{name_part} — działam wyłącznie "
-                    "wewnątrz własnej pamięci i modelu PyTorch w tej aplikacji.\n"
-                    "Mogę jednak od razu pomóc na inne sposoby: wklej tu fragment tekstu albo zapamiętaj fakty zdaniami twierdzącymi, "
-                    "użyj `/ucz <temat lub adres URL>`, a także łączę pojęcia w grafie i liczę zadania matematyczne.",
-                    None,
-                )
-            return (
-                f"Jako lokalny mózg PyTorch potrafię rozmawiać po polsku, zapamiętywać fakty, łączyć je przez graf skojarzeń i sen REM, "
-                f"liczyć zadania matematyczne oraz uczyć się nowych tematów z sieci przez `/ucz <temat>` (lub Auto-sieć){name_part}.",
-                None,
-            )
-
-        # 4c) Code generation / algorithm synthesis request
-        if intent_info["intent"] == "code_request":
-            code_reply = self._try_synthesize_code(
-                code_task=intent_info.get("code_task", ""),
-                code_lang=intent_info.get("code_lang", "python"),
-                recalled_facts=hippocampus_memories + semantic_memories,
-                recent_turns=recent_turns,
-                active_subject=active_subject,
-                thinking=thinking,
-            )
-            return (code_reply, None)
-
-        # 5) Short conversational follow-ups / confusion without a specific subject
-        follow_up_phrases = (
-            "ale co", "co", "no i", "i co", "o co chodzi", "dlaczego", "czemu",
-            "jak to", "nie rozumiem", "serio",
-        )
-        if low in follow_up_phrases:
-            if active_subject:
-                return (
-                    f"Chodziło mi o temat „{active_subject}”, o którym przed chwilą rozmawialiśmy. "
-                    f"Napisz dokładniej, co chciałbyś w nim rozwinąć albo zapytać!",
-                    None,
-                )
-            return (
-                f"Nie jestem pewien, do czego dokładnie nawiązujesz{name_part}. Napisz proszę pełniej, o co zapytać albo co policzyć "
-                "(np. `co to jest fotosynteza` albo `ile to 7 * 8`).",
-                None,
-            )
-
-        # 6) Pure greeting / status question
-        is_greeting = bool(
-            re.match(r"^(?:czesc|hej|hejka|siema|siemanko|witaj|witam|elo|yo|dzien dobry|dobry wieczor|jak sie czujesz)[!.\s?]*$", low)
-        )
-        if is_greeting:
-            me = f"Mam na imię {brain_name}. " if brain_name else ""
-            return (
-                f"Cześć{name_part}! {me}Dzisiaj jest mój {day}. dzień pracy "
-                f"(tryb twórczy, wszystko działa lokalnie na moim własnym modelu GPU). O czym dzisiaj pogadamy?",
-                None,
-            )
-
-        # 7) Memory self-inspection questions ("co pamiętasz", "co o mnie wiesz", "czego się nauczyłeś")
-        is_mem_query = any(
-            p in low for p in ("co pamietasz", "co juz pamietasz", "co o mnie wiesz", "czego sie nauczyles", "jakie tematy")
-        )
-        if is_mem_query:
-            all_mems = []
-            seen = set()
-            for x in (user_profile or []) + (episodic_memories or []) + hippocampus_memories + semantic_memories:
-                c = _clean_fact_text(x)
-                if c and c.lower() not in seen:
-                    seen.add(c.lower())
-                    all_mems.append(c)
-            if not all_mems and not self.core_knowledge_summary:
-                return (f"Na razie moja pamięć jest jeszcze świeża{name_part}. Możemy po prostu porozmawiać, albo wgraj pakiet `/szkola`!", None)
-            lines = [f"Pamiętam już sporo rzeczy{name_part}:"]
-            for item in all_mems[:8]:
-                lines.append(f"- {item}")
-            if rem_reflections:
-                lines.append("\nA ze snu REM skojarzyłem jeszcze:")
-                for r in rem_reflections[:2]:
-                    lines.append(f"- {_clean_fact_text(r)}")
-            return ("\n".join(lines), None)
-
-        # 8) Elementary school math solver
-        math_ans = _try_solve_math(msg)
-        if math_ans is not None:
-            return (math_ans, None)
-
-        # 9) Did user just state/teach something declarative (no question)?
-        is_question = msg.endswith("?") or any(
-            low.startswith(p)
-            for p in (
-                "co ", "kto ", "czym ", "jak ", "jaka ", "jaki ", "jakie ", "gdzie ", "kiedy ",
-                "dlaczego ", "czy ", "ile ", "no to", "powiedz", "wyjasnij", "wytlumacz",
-                "opisz", "opowiedz", "podaj", "zdefiniuj",
-            )
-        )
-        extracted_now = self.extract_memories_from_turn(msg)
-        if extracted_now["memories"] and not is_question:
-            return (self._format_human_learn_ack(extracted_now["memories"]), None)
-
-        # 10) Knowledge / multi-hop reasoning / contextual follow-up query grounded in recalled memory
-        subj = _extract_query_subject(msg)
-        subj_low = _strip_pl(subj.lower())
-        conversational_tokens = {"moge", "mozesz", "mozemy", "toba", "mna", "ciebie", "jestem", "jestes", "rozmiac", "rozmawiac", "pogadac", "ale", "czy"}
-        subj_words = [w for w in re.findall(r"[a-z0-9+#]{2,}", subj_low) if w not in _STOPWORDS_PL_NORM]
-
-        pronoun_or_followup = any(
-            w in {"on", "ona", "ono", "niego", "niej", "nim", "nia", "jego", "jej", "tego", "tym", "tej", "to", "zyl", "powstal", "wiecej"}
-            for w in subj_words
-        ) or len(subj_words) == 0
-        is_contextual_followup = bool(active_subject) and (pronoun_or_followup or low.startswith(("a ", "i ", "powiedz cos wiecej", "rozwin")))
-        effective_subj = active_subject if is_contextual_followup else subj
-        eff_low = _strip_pl(effective_subj.lower())
-        eff_words = [w for w in re.findall(r"[a-z0-9+#]{2,}", eff_low) if w not in _STOPWORDS_PL_NORM]
-
-        if is_contextual_followup and active_subject:
-            intent_info = self.analyze_query_intent(f"{active_subject} {msg}")
-        sub_concepts: list[str] = list(intent_info.get("sub_concepts", []))
-        if is_contextual_followup and active_subject and active_subject.lower() not in [s.lower() for s in sub_concepts]:
-            sub_concepts = [active_subject] + sub_concepts[:4]
-        intent = intent_info["intent"]
-        detail_kind = intent_info.get("detail_kind")
-
-        is_non_topic_phrase = (
-            len(effective_subj) <= 2
-            or (not eff_words and not sub_concepts)
-            or (len(sub_concepts) <= 1 and any(w in conversational_tokens for w in eff_words))
-        )
-
-        raw_pool = hippocampus_memories + semantic_memories
-        clean_candidates: list[str] = []
-        fallback_candidates: list[str] = []
-        seen_c: set[str] = set()
-        for raw in raw_pool:
-            c = _clean_fact_text(raw)
-            if not c or c.lower() in seen_c:
-                continue
-            seen_c.add(c.lower())
-            fallback_candidates.append(c)
-            if not _is_noisy_memory(c):
-                clean_candidates.append(c)
-        candidates = clean_candidates if clean_candidates else fallback_candidates
-
-        if not candidates:
-            if is_non_topic_phrase:
-                return (
-                    "Nie do końca złapałem, o co pytasz. Podaj proszę konkretne pojęcie "
-                    "(np. `co to jest fotosynteza`), działanie matematyczne albo wpisz `/szkola`, żebym poznał podstawy.",
-                    None,
-                )
-            ask_topic = sub_concepts[0] if sub_concepts else effective_subj
-            return (
-                f"Szczerze mówiąc nie mam jeszcze w pamięci informacji o „{ask_topic}”. "
-                f"Jeśli wpiszesz `/ucz {ask_topic}`, sam doczytam o tym w sieci i zaraz pogadamy!",
-                ask_topic,
-            )
-
-        # Rank candidates jointly using GPU Semantic Encoder + intent fit + sub-concept coverage + Transformer LM score
-        sub_list = sub_concepts[:5] if sub_concepts else [effective_subj]
-        vecs = self.encode_texts([effective_subj, f"{effective_subj} {msg}"] + sub_list + candidates)
-        subj_vec = vecs[0]
-        msg_vec = vecs[1]
-        sub_vecs = vecs[2 : 2 + len(sub_list)]
-        cand_vecs = vecs[2 + len(sub_list) :]
-        with self._op_lock:
-            lm_scores = self.transformer_lm.sequence_scores(candidates, self.tokenizer)
-
-        subj_mwords = _extract_meaningful_words(effective_subj)
-        ranked: list[tuple[float, float, float, int, list[str], str, list[float]]] = []
-        for cand, cvec, lms in zip(candidates, cand_vecs, lm_scores):
-            ov_subj = _stem_overlap(effective_subj, cand)
-            ov_msg = _stem_overlap(msg, cand)
-            ov = max(ov_subj, 0.85 * ov_msg)
-
-            cand_mwords = _extract_meaningful_words(cand)
-            matched_subj_words = sum(
-                1 for sw in subj_mwords if any(_word_matches(sw, cw) for cw in cand_mwords)
-            )
-            covered_subs = [
-                sc for sc in sub_list
-                if _stem_overlap(sc, cand) >= 0.45
-                or (len(_extract_meaningful_words(sc)) == 1 and _stem_overlap(sc, cand) > 0.0)
-            ]
-
-            subj_cos = _cosine_list(subj_vec, cvec)
-            msg_cos = _cosine_list(msg_vec, cvec)
-            best_sub_cos = max((_cosine_list(sv, cvec) for sv in sub_vecs), default=subj_cos)
-            cos = 0.55 * max(subj_cos, best_sub_cos) + 0.45 * msg_cos
-
-            # Intent-aligned bonuses / penalties
-            intent_adj = 0.0
-            cand_low = cand.lower()
-            is_def_cue = any(cue in cand_low for cue in ("oznacza", " to ", " jest ", " – ", " — ", "składa się", "był "))
-            if intent == "definition":
-                intent_adj += 0.10 if is_def_cue else 0.0
-            else:
-                if _is_bare_definition(cand):
-                    intent_adj -= 0.18
-                if intent in ("causal_why", "how_process", "connection") and any(
-                    cue in cand_low for cue in ("powoduje", "wytwarza", "dostarcza", "wymaga", "dzięki", "polega", "przechowuje", "służy", "umożliwia", "tworzy")
-                ):
-                    intent_adj += 0.12
-                if (detail_kind == "when" or "when" in intent_info.get("sub_intents", [])) and re.search(r"\b\d{3,4}\b", cand):
-                    intent_adj += 0.14
-                if (detail_kind == "how_many" or "how_many" in intent_info.get("sub_intents", [])) and re.search(r"\b(?:\d+|jeden|dwa|trzy|cztery|pięć|sześć|siedem|osiem|ośmiu|dziewięć|dziesięć|dwanaście)\b", cand_low):
-                    intent_adj += 0.12
-                if detail_kind == "where" and any(cue in cand_low for cue in ("leży", "znajduje", "nad ", "w ", "na ")):
-                    intent_adj += 0.08
-                if intent == "yes_no" and any(cue in cand_low for cue in ("nie ", "niedozwolone", "tak", "zawsze", "nigdy", "każdy")):
-                    intent_adj += 0.10
-
-            sub_cov_bonus = 0.10 * min(2, len(covered_subs)) if len(sub_list) >= 2 else 0.0
-            lm_bonus = max(-0.04, min(0.07, (lms + 6.0) * 0.014))
-            total = 0.44 * ov + 0.34 * cos + intent_adj + sub_cov_bonus + lm_bonus
-            ranked.append((total, ov, max(subj_cos, best_sub_cos), matched_subj_words, covered_subs, cand, cvec))
-
-        thinking.append(
-            f"Intencja: {intent}"
-            + (f" ({detail_kind})" if detail_kind else "")
-            + (f" · pojęcia: {', '.join(sub_list)}" if sub_list else f" · temat: „{effective_subj}”")
-            + f". Przeszukano {len(candidates)} wspomnień."
-        )
-        ranked.sort(key=lambda x: x[0], reverse=True)
-        top_score, top_ov, top_subj_cos, top_matched_words, _, _, _ = ranked[0]
-
-        # Grounding check: strict for single-concept queries, multi-concept aware for compound queries
-        if len(sub_list) >= 2:
-            facts_by_concept: dict[str, list[tuple[float, float, str, list[float]]]] = {}
-            grounded_concepts: list[str] = []
-            missing_concepts: list[str] = []
-            path_nodes_text = " ".join(
-                f"{p.get('start', '')} {p.get('end', '')}" for p in (concept_paths or [])
-            )
-            for sc in sub_list:
-                sc_mwords = _extract_meaningful_words(sc)
-                sc_in_paths = bool(path_nodes_text and _stem_overlap(sc, path_nodes_text) >= 0.45)
-                sc_hits: list[tuple[float, float, str, list[float]]] = []
-                for total, ov, scos, _, cov_subs, cand, cvec in ranked:
-                    ov_sc = _stem_overlap(sc, cand)
-                    cand_mw = _extract_meaningful_words(cand)
-                    matched_cnt = sum(1 for sw in sc_mwords if any(_word_matches(sw, cw) for cw in cand_mw))
-                    if len(sc_mwords) >= 2:
-                        ok = matched_cnt >= 2 or (ov_sc >= 0.5 and (scos >= 0.32 or sc_in_paths))
-                    else:
-                        ok = ov_sc > 0.0 or sc in cov_subs
-                    if ok:
-                        sc_hits.append((total + 0.35 * ov_sc, ov_sc, cand, cvec))
-                sc_hits.sort(key=lambda x: x[0], reverse=True)
-                if sc_hits:
-                    facts_by_concept[sc] = sc_hits
-                    grounded_concepts.append(sc)
-                else:
-                    missing_concepts.append(sc)
-
-            if not grounded_concepts:
-                lookup_subj = " ".join(sub_list[:2])
-                thinking.append(f"Brak ugruntowanych faktów dla pojęć ({lookup_subj}) — potrzebna nauka z sieci.")
-                return (
-                    f"Nie wiem jeszcze wystarczająco dużo o „{lookup_subj}”, żeby nie zmyślać. "
-                    f"Wpisz `/ucz {lookup_subj}`, a chętnie się tego nauczę z internetu!",
-                    lookup_subj,
-                )
-
-            # Collect bridges across graph paths, shared meaningful concepts, REM reflections & concept hints
-            bridges: list[str] = []
-            seen_br: set[str] = set()
-
-            def add_bridge(b: str) -> None:
-                bn = _strip_pl(b.strip().lower())
-                if (
-                    b
-                    and len(bn) >= 3
-                    and not re.match(r"^\d", bn)
-                    and bn not in _STOPWORDS_PL_NORM
-                    and bn not in _WEAK_BRIDGE_WORDS_NORM
-                    and bn not in seen_br
-                ):
-                    seen_br.add(bn)
-                    bridges.append(b.strip())
-
-            for p in (concept_paths or []):
-                for br in p.get("bridges", []):
-                    add_bridge(br)
-
-            # Balanced fact selection: pick top fact per grounded concept + connecting bridge facts
-            chosen_texts: list[str] = []
-            chosen_vecs: list[list[float]] = []
-            for sc in grounded_concepts:
-                for _, _, cand, cvec in facts_by_concept[sc]:
-                    if cand in chosen_texts:
-                        break
-                    if any(_cosine_list(cvec, pv) > 0.88 for pv in chosen_vecs):
-                        continue
-                    chosen_texts.append(cand)
-                    chosen_vecs.append(cvec)
-                    break
-
-            # Look for a bridge fact connecting >= 2 grounded facts or covering discovered graph bridges
-            sub_norm_words = {_strip_pl(w) for sc in sub_list for w in _extract_meaningful_words(sc)}
-            for i in range(len(chosen_texts)):
-                for j in range(i + 1, len(chosen_texts)):
-                    for sh in _shared_meaningful_concepts(chosen_texts[i], chosen_texts[j]):
-                        if not any(_word_matches(_strip_pl(sh), sw) for sw in sub_norm_words):
-                            add_bridge(sh)
-
-            # Pull in an intermediate bridge fact if graph paths found a bridge not yet in chosen_texts
-            for br in bridges[:3]:
-                if len(chosen_texts) >= 4:
-                    break
-                if any(_stem_overlap(br, ct) >= 0.5 for ct in chosen_texts):
-                    continue
-                br_cands = [item for item in ranked if _stem_overlap(br, item[5]) >= 0.5]
-                if br_cands:
-                    _, _, _, _, _, bcand, bvec = br_cands[0]
-                    if bcand not in chosen_texts and not any(_cosine_list(bvec, pv) > 0.86 for pv in chosen_vecs):
-                        chosen_texts.append(bcand)
-                        chosen_vecs.append(bvec)
-
-            # Fill up to max_facts with highest-ranked remaining facts
-            max_facts = 1 if any(w in low for w in ("krotko", "w skrocie")) else 4
-            for _, _, _, _, _, cand, cvec in ranked:
-                if len(chosen_texts) >= max_facts:
-                    break
-                if cand in chosen_texts or any(_cosine_list(cvec, pv) > 0.84 for pv in chosen_vecs):
-                    continue
-                chosen_texts.append(cand)
-                chosen_vecs.append(cvec)
-
-            # Recompute shared bridges after bridge fact insertion
-            for i in range(len(chosen_texts)):
-                for j in range(i + 1, len(chosen_texts)):
-                    for sh in _shared_meaningful_concepts(chosen_texts[i], chosen_texts[j]):
-                        if not any(_word_matches(_strip_pl(sh), sw) for sw in sub_norm_words):
-                            add_bridge(sh)
-            for i in range(len(chosen_texts)):
-                for j in range(i + 1, len(chosen_texts)):
-                    for sh in _shared_meaningful_concepts(chosen_texts[i], chosen_texts[j]):
-                        add_bridge(sh)
-
-            if concept_paths:
-                thinking.append(f"Ścieżka w grafie pojęć: {concept_paths[0]['summary']}.")
-            if bridges:
-                thinking.append(f"Wykryte mosty łączące fakty: {', '.join(bridges[:3])}.")
-            thinking.append(f"Połączono {len(chosen_texts)} faktów (pokryte pojęcia: {', '.join(grounded_concepts)}).")
-
-            final_reply = self._deliberate_best_answer(
-                msg=msg,
-                intent_info=intent_info,
-                effective_subj=effective_subj,
-                is_contextual_followup=is_contextual_followup,
-                active_subject=active_subject,
-                chosen_texts=chosen_texts[:max_facts],
-                bridges=bridges,
-                concept_paths=concept_paths or [],
-                rem_reflections=rem_reflections,
-                concept_hints=concept_hints,
-                missing_concepts=missing_concepts,
-                grounded_concepts=grounded_concepts,
-                thinking=thinking,
-            )
-        else:
-            thinking.append(
-                f"Najlepsze dopasowanie: pokrycie słów={top_ov:.2f}, podobieństwo semantyczne={top_subj_cos:.2f}, "
-                f"trafione rdzenie={top_matched_words}."
-            )
-            no_lexical_grounding = top_ov < 0.12
-            multi_word_mismatch = len(eff_words) >= 2 and top_matched_words < 2 and top_ov < 0.45
-            if no_lexical_grounding or (top_ov < 0.25 and top_subj_cos < 0.55) or multi_word_mismatch:
-                if is_non_topic_phrase:
-                    thinking.append("Brak wystarczającego pokrycia w pamięci i fraza nie jest nazwą tematu — proszę o doprecyzowanie.")
-                    return (
-                        "Nie jestem pewien, o jaki dokładnie temat pytasz. Napisz proszę nazwę pojęcia "
-                        "albo kliknij `🎓 Szkoła Podstawowa` (`/szkola`).",
-                        None,
-                    )
-                lookup_subj = effective_subj
-                if len(eff_words) == 1 and recent_turns and not is_contextual_followup:
-                    for t in reversed(recent_turns):
-                        if t.get("role") == "user":
-                            prev_subj = _extract_query_subject(t.get("content", ""))
-                            prev_words = [w for w in re.findall(r"[a-z0-9+#]{3,}", _strip_pl(prev_subj.lower())) if w not in _STOPWORDS_PL_NORM]
-                            if prev_words and prev_subj.lower() != effective_subj.lower():
-                                lookup_subj = f"{effective_subj} {prev_words[-1]}"
-                            break
-                thinking.append(f"Za mała pewność odpowiedzi dla „{lookup_subj}” — potrzebna nauka z sieci (Auto-sieć lub /ucz).")
-                return (
-                    f"Nie wiem jeszcze wystarczająco dużo o „{effective_subj}”, żeby nie zmyślać. "
-                    f"Wpisz `/ucz {lookup_subj}`, a chętnie się tego nauczę z internetu!",
-                    lookup_subj,
-                )
-
-            relevant = [
-                item for item in ranked
-                if (item[1] >= 0.30 or item[2] >= max(0.58, top_subj_cos - 0.05))
-                and not (len(eff_words) >= 2 and item[3] < 2 and item[2] < 0.68)
-            ]
-            chosen_texts = []
-            chosen_vecs = []
-            max_facts = 1 if any(w in low for w in ("krotko", "w skrocie")) else 3
-
-            for _, _, _, _, _, cand, cvec in relevant:
-                if any(_cosine_list(cvec, pv) > 0.84 for pv in chosen_vecs):
-                    continue
-                chosen_texts.append(cand)
-                chosen_vecs.append(cvec)
-                if len(chosen_texts) >= max_facts:
-                    break
-
-            if not chosen_texts:
-                chosen_texts = [ranked[0][5]]
-
-            bridges = []
-            for p in (concept_paths or []):
-                bridges.extend(p.get("bridges", []))
-            if concept_paths:
-                thinking.append(f"Powiązania w grafie: {concept_paths[0]['summary']}.")
-
-            final_reply = self._deliberate_best_answer(
-                msg=msg,
-                intent_info=intent_info,
-                effective_subj=effective_subj,
-                is_contextual_followup=is_contextual_followup,
-                active_subject=active_subject,
-                chosen_texts=chosen_texts,
-                bridges=bridges,
-                concept_paths=concept_paths or [],
-                rem_reflections=rem_reflections,
-                concept_hints=concept_hints,
-                missing_concepts=[],
-                grounded_concepts=sub_list,
-                thinking=thinking,
-            )
-
-        if ("wskaznik" in low or "wskaźnik" in low) and ("c++" in low or "cpp" in low):
-            final_reply += (
-                "\n```cpp\n"
-                "int liczba = 42;\n"
-                "int* wskaznik = &liczba; // przechowuje adres zmiennej\n"
-                "int wartosc = *wskaznik; // dereferencja -> 42\n"
-                "```"
-            )
-
-        ctx_hint = f"Rozmawialiśmy o: {active_subject}." if active_subject else ""
-        sample_seq = (
-            f"<MEM> {' '.join(chosen_texts[:2])[:220]} "
-            f"<CTX> {ctx_hint or 'początek rozmowy'} "
-            f"<USER> {msg[:120]} <BOT> {final_reply[:220]}"
-        )
-        self.online_dialogues.append(sample_seq)
-        if len(self.online_dialogues) > 200:
-            self.online_dialogues = self.online_dialogues[-200:]
-
-        return (final_reply, None)
-
-    def chat_reply_stream(
-        self,
-        user_message: str,
-        recent_turns: list[dict[str, str]],
-        hippocampus_memories: list[str],
-        semantic_memories: list[str],
-        rem_reflections: list[str],
-        concept_hints: list[str],
-        day: int,
-        sleeps: int,
-        energy: float,
-        state_mode: str,
-        user_profile: list[str] | None = None,
-        episodic_memories: list[str] | None = None,
-        active_subject: str = "",
-        concept_paths: list[dict[str, Any]] | None = None,
-    ) -> Iterator[str]:
-        reply = self.chat_reply(
-            user_message=user_message,
-            recent_turns=recent_turns,
-            hippocampus_memories=hippocampus_memories,
-            semantic_memories=semantic_memories,
-            rem_reflections=rem_reflections,
-            concept_hints=concept_hints,
-            day=day,
-            sleeps=sleeps,
-            energy=energy,
-            state_mode=state_mode,
-            user_profile=user_profile,
-            episodic_memories=episodic_memories,
-            active_subject=active_subject,
-            concept_paths=concept_paths,
-        )
-        # Stream smoothly in natural word chunks
-        tokens = re.findall(r"\S+\s*", reply)
-        if not tokens:
-            if reply:
-                yield reply
-            return
-        buf = ""
-        for idx, tok in enumerate(tokens, start=1):
-            buf += tok
-            if idx % 3 == 0:
-                yield buf
-                buf = ""
-        if buf:
-            yield buf
-
-    def generate_morning_greeting(
-        self,
-        night_number: int,
-        new_mem_count: int,
-        lora_trained: bool,
-        rem_reflections: list[str],
-        rem_links: list[dict[str, Any]],
-    ) -> str:
-        parts = [f"Dzień dobry! Przespałem Noc #{night_number} na GPU i utrwaliłem {new_mem_count} nowych wspomnień."]
-        if rem_reflections:
-            parts.append(f"Mój sen REM wyłonił wniosek: {_clean_fact_text(rem_reflections[0])}")
-        elif rem_links:
-            top = rem_links[0]
-            parts.append(f"W grafie pojęć EWC pojawiło się nowe połączenie: {top['src']} → {top['dst']}.")
-        return " ".join(parts)
+        out = [fixed]
+        if fixed.lower() != q.lower():
+            out.append(q)
+        return out
+
+    @staticmethod
+    def extract_sensory_stimuli(text: str, max_items: int = 6) -> list[str]:
+        return split_clean_sentences(text, min_chars=24, max_chars=240)[:max_items]

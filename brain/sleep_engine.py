@@ -1,18 +1,17 @@
 from __future__ import annotations
 
 import contextlib
-import re
 import threading
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 import torch
-import torch.nn.functional as F
 
 from .config import BrainConfig
-from .hippocampus import ConceptFact, Hippocampus, _cosine, _keyword_overlap
-from .neural_cortex import AssociativeConceptCortex
+from .hippocampus import Hippocampus
+from .neural_cortex import BiologicalAssociativeCortex
+from .sensory_wernicke import k_wta
 
 
 def _locked(lock: threading.RLock | None):
@@ -25,12 +24,21 @@ class SleepReport:
     duration_ms: float
     device_name: str
     # Stage 1: NREM Light
+    new_memories: int = 0
+    updated_memories: int = 0  # merged into generalized SDR prototypes
+    forgotten_memories: int = 0
     new_facts: int = 0
     reinforced_facts: int = 0
-    new_memories: int = 0
-    updated_memories: int = 0
-    forgotten_memories: int = 0
-    # Stage 2: NREM Deep
+    # Stage 2: NREM Deep (Local Predictive Coding + Hebb + SHY + optional Broca)
+    prediction_error_start: float = 0.0
+    prediction_error_end: float = 0.0
+    sdr_sparsity_pct: float = 4.0
+    pruned_synapses: int = 0
+    active_synapses: int = 0
+    attractor_steps: int = 4
+    broca_loss_start: float = 0.0
+    broca_loss_end: float = 0.0
+    # Backwards-compatible UI/API aliases
     concept_loss_start: float = 0.0
     concept_loss_end: float = 0.0
     lora_trained: bool = False
@@ -38,7 +46,7 @@ class SleepReport:
     lora_loss_start: float = 0.0
     lora_loss_end: float = 0.0
     lora_duration_ms: float = 0.0
-    # Stage 3: REM Dreaming
+    # Stage 3: Vectorized GPU REM Dreaming
     rem_new_links: list[dict[str, Any]] = field(default_factory=list)
     rem_reflections: list[str] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
@@ -49,22 +57,27 @@ class SleepReport:
 
 class SleepEngine:
     """
-    Executes the 3 biological sleep stages entirely on GPU:
-      1) NREM Light  : Salience staging, contradiction resolution, biological forgetting curve.
-      2) NREM Deep   : Concept Cortex consolidation (EWC) + Language Cortex LoRA Replay training on GPU.
-      3) REM Dreaming: Multi-hop neural graph dreaming + Polish REM reflection synthesis.
+    Fully Vectorized GPU Sleep Engine (zero nested Python loops, zero string templates):
+      1) NREM Light  : GPU engram similarity matmul, prototype merging (no duplicates), forgetting curve.
+      2) NREM Deep   : Experience Replay (~30% fresh + ~70% long-term) -> 100% local cortical plasticity
+                       (@torch.no_grad() Predictive Coding + Hebb + threshold homeostasis) ->
+                       Synaptic Homeostasis Hypothesis (SHY: W_rec *= 0.94 + weak weight pruning) ->
+                       optional short Broca denoising autoencoder refinement with early stopping.
+      3) REM Dreaming: Vectorized GPU sampling of distant long-term engram pairs -> random neuron mask
+                       + Gaussian noise -> parallel Modern Hopfield + W_rec attractor settling ->
+                       store hybrid REM engrams -> decode short thought labels via BrocaByteTransformer.
     """
 
     def __init__(
         self,
         cfg: BrainConfig,
-        concept_cortex: AssociativeConceptCortex,
+        cortex: BiologicalAssociativeCortex,
         hippocampus: Hippocampus,
         device: torch.device,
         language_cortex: Any | None = None,
     ) -> None:
         self.cfg = cfg
-        self.concept_cortex = concept_cortex
+        self.cortex = cortex
         self.hippocampus = hippocampus
         self.device = device
         self.language_cortex = language_cortex
@@ -75,170 +88,137 @@ class SleepEngine:
         stage_callback: Callable[[str], None] | None = None,
         visual_pacing: bool = False,
         state_lock: threading.RLock | None = None,
+        wake_texts_for_broca: list[str] | None = None,
     ) -> SleepReport:
         t0 = time.perf_counter()
         dev_name = torch.cuda.get_device_name(0) if self.device.type == "cuda" else "CPU"
-        report = SleepReport(night_number=night_number, duration_ms=0.0, device_name=dev_name)
+        report = SleepReport(
+            night_number=night_number,
+            duration_ms=0.0,
+            device_name=dev_name,
+            sdr_sparsity_pct=round(100.0 * (self.cfg.sdr_k / float(self.cfg.num_neurons)), 2),
+            attractor_steps=self.cfg.attractor_steps,
+        )
 
-        # ── STAGE 1: NREM LIGHT ──────────────────────────────────────────────
+        # ── STAGE 1: NREM LIGHT (GPU prototype merging + forgetting) ─────────
         if stage_callback:
             stage_callback("NREM_LIGHT")
 
-        # Precompute contradiction checks outside state_lock so Ollama HTTP never blocks /api/state
-        precomputed_updates: dict[tuple[str, tuple[str, ...]], int | None] = {}
-        if self.language_cortex is not None and self.language_cortex.ready:
-            with _locked(state_lock):
-                stm_snap = [
-                    m for m in self.hippocampus.short_term_memories
-                    if m.category in ("użytkownik", "zasada", "wydarzenie")
-                ]
-                sem_snap = [m for m in self.hippocampus.semantic_memories if not m.superseded]
-            for m in stm_snap:
-                if not sem_snap:
-                    break
-                if any(
-                    old.text.lower() == m.text.lower()
-                    or (m.embedding and old.embedding and _cosine(m.embedding, old.embedding) > 0.91)
-                    for old in sem_snap
-                ):
-                    continue
-                candidates = sorted(
-                    sem_snap,
-                    key=lambda o: 0.65 * _cosine(m.embedding, o.embedding) + 0.35 * _keyword_overlap(m.text, o.text),
-                    reverse=True,
-                )[:3]
-                close_cands = [
-                    c
-                    for c in candidates
-                    if (0.65 * _cosine(m.embedding, c.embedding) + 0.35 * _keyword_overlap(m.text, c.text)) >= 0.36
-                ]
-                if close_cands:
-                    cand_texts = [c.text for c in close_cands]
-                    precomputed_updates[(m.text, tuple(cand_texts))] = self.language_cortex.check_memory_update(
-                        m.text, cand_texts
-                    )
-
         with _locked(state_lock):
-            stage1 = self.hippocampus.nrem_stage_facts()
-            report.new_facts = stage1["new_facts"]
-            report.reinforced_facts = stage1["reinforced_facts"]
-
-            mem_stage1 = self.hippocampus.consolidate_declarative_memories(
-                language_cortex=self.language_cortex,
+            light_res = self.hippocampus.consolidate_nrem_light_gpu(
+                merge_threshold=self.cfg.engram_merge_threshold,
                 decay=self.cfg.memory_decay_per_night,
                 prune_threshold=self.cfg.memory_prune_threshold,
                 current_day=night_number,
-                contradiction_checker=(
-                    (lambda mt, cts: precomputed_updates.get((mt, tuple(cts))))
-                    if self.language_cortex is not None and self.language_cortex.ready
-                    else None
-                ),
             )
-            report.new_memories = mem_stage1["new_memories"]
-            report.updated_memories = mem_stage1["updated_memories"]
-            report.forgotten_memories = mem_stage1["forgotten_memories"]
-
-            # Automatic relational triple distillation from declarative memories
-            if self.language_cortex is not None and hasattr(self.language_cortex, "extract_triples_from_memory"):
-                distill_texts: list[str] = list(mem_stage1["new_texts"][:60])
-                active_sem = [m for m in self.hippocampus.semantic_memories if not m.superseded]
-                if len(self.hippocampus.consolidated_facts) < min(120, len(active_sem)):
-                    seen_dt = {t.lower() for t in distill_texts}
-                    for sm in sorted(active_sem, key=lambda x: (x.importance, x.strength), reverse=True):
-                        if sm.text.lower() not in seen_dt:
-                            distill_texts.append(sm.text)
-                            seen_dt.add(sm.text.lower())
-                        if len(distill_texts) >= 100:
-                            break
-                distilled_count = 0
-                for dtxt in distill_texts:
-                    for s, r, d in self.language_cortex.extract_triples_from_memory(dtxt):
-                        cf = ConceptFact(
-                            src=s.strip().lower()[:60],
-                            rel=r.strip().lower()[:40],
-                            dst=d.strip().lower()[:60],
-                            strength=1.1,
-                            day=night_number,
-                            source="CONSOLIDATED",
-                            consolidated=True,
-                        )
-                        if cf.src and cf.dst and cf.src != cf.dst and cf.key() not in self.hippocampus.consolidated_facts:
-                            self.hippocampus.consolidated_facts[cf.key()] = cf
-                            distilled_count += 1
-                report.new_facts += distilled_count
-
-            for fact in self.hippocampus.consolidated_facts.values():
-                self.concept_cortex.ensure_concept(fact.src)
-                self.concept_cortex.ensure_concept(fact.dst)
-                self.concept_cortex.ensure_relation(fact.rel)
+            report.new_memories = int(light_res["new_memories"])
+            report.updated_memories = int(light_res["merged_memories"])
+            report.reinforced_facts = int(light_res["merged_memories"])
+            report.new_facts = int(light_res["new_memories"])
+            report.forgotten_memories = int(light_res["forgotten_memories"])
+            fresh_engrams: torch.Tensor = light_res["fresh_engrams"]
 
         if visual_pacing:
-            time.sleep(0.35)
+            time.sleep(0.20)
 
-        # ── STAGE 2: NREM DEEP (Concept EWC Consolidation) ───────────────────
+        # ── STAGE 2: NREM DEEP (Experience Replay + Local Plasticity + SHY) ──
         if stage_callback:
             stage_callback("NREM_DEEP")
-        with _locked(state_lock):
-            c_stats = self._consolidate_concept_cortex()
-        report.concept_loss_start = c_stats["loss_start"]
-        report.concept_loss_end = c_stats["loss_end"]
 
-        # ── STAGE 3: REM DREAMING (Neural Graph + Polish REM Reflections) ────
-        if stage_callback:
-            stage_callback("REM_DREAMING")
         with _locked(state_lock):
-            report.rem_new_links = self._rem_concept_dreaming(day=night_number)
-            existing_refls = [r.text for r in self.hippocampus.rem_reflections]
-            if not mem_stage1["new_texts"] and len(self.hippocampus.semantic_memories) >= 3:
-                active_pool = sorted(
-                    [m for m in self.hippocampus.semantic_memories if not m.superseded],
-                    key=lambda m: (m.importance, m.strength, m.last_recalled_day),
-                    reverse=True,
-                )
-                refl_new_pool = [m.text for m in active_pool[:16]]
-                refl_old_pool = [m.text for m in active_pool[16:32]] or [m.text for m in active_pool[:16]]
-            else:
-                refl_new_pool = list(mem_stage1["new_texts"])
-                refl_old_pool = list(mem_stage1["replay_texts"])
-
-        new_rem_reflections: list[str] = []
-        if self.language_cortex is not None and self.language_cortex.ready and refl_new_pool:
-            new_rem_reflections = self.language_cortex.synthesize_rem_reflections(
-                new_memories=refl_new_pool,
-                old_memories=refl_old_pool,
-                rem_links=report.rem_new_links,
-                existing_reflections=existing_refls,
+            replay_batch = self.hippocampus.sample_nrem_replay_batch(
+                fresh_engrams=fresh_engrams,
+                batch_size=self.cfg.nrem_replay_batch_size,
+                fresh_ratio=0.30,
             )
-            if new_rem_reflections:
-                if hasattr(self.language_cortex, "encode_texts"):
-                    rem_embs = self.language_cortex.encode_texts(new_rem_reflections)
+            if replay_batch.shape[0] > 0:
+                if self.language_cortex is not None:
+                    with torch.no_grad():
+                        target_cols = self.language_cortex.wernicke.sdr_to_columns(
+                            replay_batch.to(device=self.device, dtype=torch.float32)
+                        )
                 else:
-                    rem_embs = [self.language_cortex.encode_text(r) for r in new_rem_reflections]
-                with _locked(state_lock):
-                    for refl, emb in zip(new_rem_reflections, rem_embs):
-                        self.hippocampus.add_rem_reflection(refl, day=night_number, embedding=emb)
-            report.rem_reflections = new_rem_reflections
+                    target_cols = (replay_batch @ self.cortex.W_in).view(
+                        replay_batch.shape[0], self.cfg.num_columns, self.cfg.column_dim
+                    )
+                pc_stats = self.cortex.learn_local(
+                    sensory_columns=target_cols,
+                    z_batch=replay_batch,
+                    steps=self.cfg.nrem_sleep_steps,
+                    noise_std=0.04,
+                )
+                report.prediction_error_start = float(pc_stats["prediction_error_start"])
+                report.prediction_error_end = float(pc_stats["prediction_error_end"])
+                report.concept_loss_start = report.prediction_error_start
+                report.concept_loss_end = report.prediction_error_end
+
+            # Synaptic Homeostasis Hypothesis (SHY): W_rec *= 0.94 + weak synapse pruning
+            shy_stats = self.cortex.apply_synaptic_homeostasis(
+                downscale=self.cfg.shy_downscale,
+                prune_eps=self.cfg.shy_prune_eps,
+            )
+            report.pruned_synapses = int(shy_stats["pruned_synapses"])
+            report.active_synapses = int(shy_stats["active_synapses"])
+
+        # Optional short Broca denoising autoencoder refinement (outside state_lock)
+        if self.language_cortex is not None and self.language_cortex.ready:
+            broca_texts = [t for t in (wake_texts_for_broca or []) if t and len(t.strip()) >= 8]
+            if broca_texts or getattr(self.language_cortex, "_learned_qa_replay", None):
+                b_stats = self.language_cortex.train_denoising_sleep(
+                    texts=broca_texts,
+                    epochs=self.cfg.cortex_sleep_epochs,
+                    cortex=self.cortex,
+                )
+                report.lora_trained = bool(b_stats.get("trained", False))
+                report.lora_samples = int(b_stats.get("samples", 0))
+                report.broca_loss_start = float(b_stats.get("loss_start", 0.0))
+                report.broca_loss_end = float(b_stats.get("loss_end", 0.0))
+                report.lora_loss_start = report.broca_loss_start
+                report.lora_loss_end = report.broca_loss_end
+                report.lora_duration_ms = float(b_stats.get("duration_ms", 0.0))
 
         if visual_pacing:
-            time.sleep(0.35)
+            time.sleep(0.20)
 
-        # ── STAGE 2/3 REPLAY: GPU Language Cortex Replay Training ────────────
-        if self.language_cortex is not None and self.language_cortex.ready and (mem_stage1["new_texts"] or new_rem_reflections):
-            if stage_callback:
-                stage_callback("NREM_DEEP")
-            train_new = mem_stage1["new_texts"] if mem_stage1["new_texts"] else mem_stage1["replay_texts"][:12]
-            train_replay = mem_stage1["replay_texts"] if mem_stage1["new_texts"] else mem_stage1["replay_texts"][12:28]
-            lora_stats = self.language_cortex.train_lora_sleep(
-                new_memories=train_new,
-                replay_memories=train_replay,
-                rem_reflections=new_rem_reflections,
-                rem_links=report.rem_new_links,
-            )
-            report.lora_trained = bool(lora_stats.get("trained", False))
-            report.lora_samples = int(lora_stats.get("samples", 0))
-            report.lora_loss_start = float(lora_stats.get("loss_start", 0.0))
-            report.lora_loss_end = float(lora_stats.get("loss_end", 0.0))
-            report.lora_duration_ms = float(lora_stats.get("duration_ms", 0.0))
+        # ── STAGE 3: VECTORIZED GPU REM DREAMING ─────────────────────────────
+        if stage_callback:
+            stage_callback("REM_DREAMING")
+
+        rem_cols: torch.Tensor | None = None
+        rem_sdrs: torch.Tensor | None = None
+        rem_pairs_meta: list[dict[str, Any]] = []
+
+        with _locked(state_lock):
+            sem_n = len(self.hippocampus.semantic)
+            if sem_n >= 2:
+                rem_sdrs, rem_cols, rem_pairs_meta = self._run_vectorized_rem_gpu()
+
+        decoded_rem_labels: list[str] = []
+        if rem_sdrs is not None and rem_cols is not None and rem_sdrs.shape[0] > 0:
+            if self.language_cortex is not None and self.language_cortex.ready:
+                for i in range(rem_cols.shape[0]):
+                    gen = self.language_cortex.decode_columns(
+                        rem_cols[i : i + 1],
+                        max_new_bytes=72,
+                        temperature=min(0.92, max(0.78, self.cfg.broca_temperature + 0.05)),
+                    )
+                    decoded_rem_labels.append(gen["text"] or "REM-attractor")
+            else:
+                decoded_rem_labels = [f"REM-hybrid-{night_number}-{i + 1}" for i in range(rem_sdrs.shape[0])]
+
+            with _locked(state_lock):
+                rem_ids = self.hippocampus.record_rem_engrams(
+                    sdrs=rem_sdrs,
+                    decoded_labels=decoded_rem_labels,
+                    day=night_number,
+                    sparsity_pct=report.sdr_sparsity_pct,
+                )
+                for idx_r, r_id in enumerate(rem_ids):
+                    if idx_r < len(rem_pairs_meta):
+                        rem_pairs_meta[idx_r]["rem_id"] = r_id
+
+            report.rem_reflections = decoded_rem_labels
+            report.rem_new_links = rem_pairs_meta
 
         with _locked(state_lock):
             self.hippocampus.clear_short_term()
@@ -248,289 +228,78 @@ class SleepEngine:
         report.duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return report
 
-    def _consolidate_concept_cortex(self) -> dict[str, float]:
-        facts = list(self.hippocampus.consolidated_facts.values())
-        if not facts or len(self.concept_cortex.id_to_concept) < 2:
-            return {"loss_start": 0.0, "loss_end": 0.0}
-
-        src_ids = torch.tensor(
-            [self.concept_cortex.concept_to_id[f.src] for f in facts],
-            dtype=torch.long,
-            device=self.device,
-        )
-        rel_ids = torch.tensor(
-            [self.concept_cortex.relation_to_id[f.rel] for f in facts],
-            dtype=torch.long,
-            device=self.device,
-        )
-        dst_ids = torch.tensor(
-            [self.concept_cortex.concept_to_id[f.dst] for f in facts],
-            dtype=torch.long,
-            device=self.device,
-        )
-        weights = torch.tensor(
-            [max(0.5, f.strength) for f in facts],
-            dtype=torch.float32,
-            device=self.device,
-        )
-        weights = weights / weights.mean().clamp(min=1e-4)
-
-        self.concept_cortex.train()
-        loss_start = 0.0
-        loss_end = 0.0
-
-        for epoch in range(self.cfg.nrem_concept_epochs):
-            all_emb = self.concept_cortex.normalized_concept_matrix()
-            src_v = all_emb[src_ids]
-            dst_v = all_emb[dst_ids]
-
-            pred_v = self.concept_cortex.predict_target_vec(src_v, rel_ids)
-            rel_logits = (pred_v @ all_emb.T) * 7.5
-            rel_loss = (F.cross_entropy(rel_logits, dst_ids, reduction="none") * weights).mean()
-
-            dream_v = self.concept_cortex.predict_dream_vec(src_v)
-            dream_logits = (dream_v @ all_emb.T) * 6.0
-            dream_loss = (F.cross_entropy(dream_logits, dst_ids, reduction="none") * weights).mean()
-
-            pair_cos = (src_v * dst_v).sum(dim=-1)
-            prox_loss = (1.0 - pair_cos).clamp(min=0.25).mean()
-
-            ewc = self.concept_cortex.ewc_penalty()
-            loss = rel_loss + 0.55 * dream_loss + 0.25 * prox_loss + ewc
-
-            self.concept_cortex.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.concept_cortex.parameters(), 2.0)
-            self.concept_cortex.optimizer.step()
-
-            val = float(loss.item())
-            if epoch == 0:
-                loss_start = val
-            loss_end = val
-
-        self.concept_cortex.update_fisher(src_ids, rel_ids, dst_ids)
-        return {"loss_start": round(loss_start, 4), "loss_end": round(loss_end, 4)}
-
     @torch.no_grad()
-    def _rem_concept_dreaming(self, day: int) -> list[dict[str, Any]]:
-        all_facts = list(self.hippocampus.consolidated_facts.values())
-        if len(all_facts) < 2 or len(self.concept_cortex.id_to_concept) < 3:
-            return []
+    def _run_vectorized_rem_gpu(self) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        """
+        Fully vectorized GPU REM dreaming:
+          1. Sample distant engram pairs from Pamięć trwała on GPU (low cosine similarity).
+          2. Blend each pair with random binary neuron mask + Gaussian noise.
+          3. Run parallel attractor settling (Modern Hopfield + W_rec + k-WTA) to novel hybrid z_rem.
+        """
+        sem = self.hippocampus.semantic.engrams  # [M, N] bfloat16
+        m = int(sem.shape[0])
+        pool_n = min(m, 128)
+        if pool_n < m:
+            pool_idx = torch.randperm(m, device=self.device)[:pool_n]
+            pool = sem.index_select(0, pool_idx).float()
+        else:
+            pool_idx = torch.arange(m, device=self.device)
+            pool = sem.float()
 
-        # Cap to top 180 strongest facts so REM dreaming stays fast even on huge graphs
-        facts = (
-            sorted(all_facts, key=lambda f: f.strength, reverse=True)[:180]
-            if len(all_facts) > 180
-            else all_facts
+        # Pairwise cosine similarity on GPU: pick the most distant pairs for creative synthesis
+        sim = pool @ pool.T  # [P, P]
+        eye = torch.eye(pool_n, device=self.device, dtype=torch.bool)
+        # Mask diagonal and lower triangle so each unordered pair appears once
+        upper_mask = torch.triu(torch.ones((pool_n, pool_n), dtype=torch.bool, device=self.device), diagonal=1)
+        masked_sim = sim.masked_fill(~upper_mask | eye, 2.0)
+
+        b_rem = min(int(self.cfg.rem_batch_size), max(1, (pool_n * (pool_n - 1)) // 2))
+        flat_sim = masked_sim.reshape(-1)
+        # Smallest similarities = most distant engrams
+        pair_vals, flat_idx = torch.topk(flat_sim, k=b_rem, largest=False)
+        row_i = flat_idx // pool_n
+        col_j = flat_idx % pool_n
+
+        e_a = pool.index_select(0, row_i)  # [B_rem, N]
+        e_b = pool.index_select(0, col_j)  # [B_rem, N]
+
+        # Random neuron masking + Gaussian noise
+        mask = (torch.rand_like(e_a) > 0.5).float()
+        noise = torch.randn_like(e_a) * float(self.cfg.rem_noise_std)
+        mixed_raw = mask * e_a + (1.0 - mask) * e_b + noise
+        z_seed, _, _ = k_wta(mixed_raw, k=self.cfg.sdr_k, normalize=True)
+
+        sdr_to_col = self.language_cortex.wernicke.sdr_to_columns if self.language_cortex is not None else None
+        if sdr_to_col is not None:
+            s_seed = sdr_to_col(z_seed)
+        else:
+            s_seed = (z_seed @ self.cortex.W_in).view(b_rem, self.cfg.num_columns, self.cfg.column_dim)
+
+        thought = self.cortex.perceive_and_think(
+            sensory_columns=s_seed,
+            sensory_sdr=z_seed,
+            engram_bank=sem,
+            sdr_to_columns_fn=sdr_to_col,
+            steps=self.cfg.attractor_steps,
+            noise_std=float(self.cfg.rem_noise_std) * 0.5,
+            update_last_active=False,
+            force_hopfield=True,
         )
 
-        self.concept_cortex.eval()
-        all_emb = self.concept_cortex.normalized_concept_matrix()
-
-        known_pairs: set[tuple[str, str]] = set()
-        outgoing: dict[str, list[ConceptFact]] = {}
-        incoming: dict[str, list[ConceptFact]] = {}
-        deg: dict[str, int] = {}
-        for f in facts:
-            known_pairs.add((f.src, f.dst))
-            known_pairs.add((f.dst, f.src))
-            outgoing.setdefault(f.src, []).append(f)
-            incoming.setdefault(f.dst, []).append(f)
-            deg[f.src] = deg.get(f.src, 0) + 1
-            deg[f.dst] = deg.get(f.dst, 0) + 1
-        for d in self.hippocampus.rem_dream_links.values():
-            known_pairs.add((d.src, d.dst))
-            known_pairs.add((d.dst, d.src))
-
-        def is_informative_node(name: str) -> bool:
-            n = name.strip().lower()
-            if len(n) < 3:
-                return False
-            if re.fullmatch(r"\d+(?:[.,-]\d+)*\s*(?:rok|lat|lata|stopni|metrów|metr|gramów|minut|godzin|dni|miesięcy|bitów|planet|przypadków)?", n):
-                return False
-            if re.match(r"^\d", n):
-                return False
-            return True
-
-        candidates: list[tuple[float, str, str, str, str]] = []
-
-        # 1) Transitive 2-hop chains: A -(r1)-> B -(r2)-> C
-        for f1 in facts:
-            a, r1, b = f1.src, f1.rel, f1.dst
-            aid = self.concept_cortex.concept_to_id.get(a)
-            bid = self.concept_cortex.concept_to_id.get(b)
-            r1_idx = self.concept_cortex.relation_to_id.get(r1)
-            if aid is None or bid is None or r1_idx is None:
-                continue
-            v_a = all_emb[aid : aid + 1]
-            v_b = all_emb[bid : bid + 1]
-            r1_id = torch.tensor([r1_idx], device=self.device)
-            z1 = self.concept_cortex.predict_target_vec(v_a, r1_id)
-            z1_dream = F.normalize(0.70 * z1 + 0.30 * v_b + torch.randn_like(z1) * 0.03, dim=-1)
-
-            for f2 in outgoing.get(b, []):
-                c = f2.dst
-                r2 = f2.rel
-                if c == a or (a, c) in known_pairs:
-                    continue
-                cid = self.concept_cortex.concept_to_id.get(c)
-                r2_idx = self.concept_cortex.relation_to_id.get(r2)
-                if cid is None or r2_idx is None:
-                    continue
-                v_c = all_emb[cid : cid + 1]
-                r2_id = torch.tensor([r2_idx], device=self.device)
-                z2 = self.concept_cortex.predict_target_vec(z1_dream, r2_id)
-                dream_free = self.concept_cortex.predict_dream_vec(z1_dream)
-
-                score = 0.65 * float((z2 * v_c).sum().item()) + 0.35 * float((dream_free * v_c).sum().item())
-                if score >= self.cfg.rem_similarity_threshold:
-                    bridge_desc = f"przez: {b} ({a} → {r1} → {b} → {r2} → {c})"[:120]
-                    candidates.append((score, a, "skojarzenie_rem", c, bridge_desc))
-
-        # 2) Convergent shared-target bridges: A -(r1)-> B <-(r2)- C
-        for b, in_edges in incoming.items():
-            if len(in_edges) < 2 or deg.get(b, 0) > 10:
-                continue
-            bid = self.concept_cortex.concept_to_id.get(b)
-            if bid is None:
-                continue
-            v_b = all_emb[bid : bid + 1]
-            for i in range(len(in_edges)):
-                f1 = in_edges[i]
-                a, r1 = f1.src, f1.rel
-                if not is_informative_node(a):
-                    continue
-                aid = self.concept_cortex.concept_to_id.get(a)
-                r1_idx = self.concept_cortex.relation_to_id.get(r1)
-                if aid is None or r1_idx is None:
-                    continue
-                v_a = all_emb[aid : aid + 1]
-                p_a = self.concept_cortex.predict_target_vec(v_a, torch.tensor([r1_idx], device=self.device))
-                s_ab = float((p_a * v_b).sum().item())
-                d_a = self.concept_cortex.predict_dream_vec(v_a)
-
-                for j in range(i + 1, len(in_edges)):
-                    f2 = in_edges[j]
-                    c, r2 = f2.src, f2.rel
-                    if c == a or (a, c) in known_pairs or not is_informative_node(c):
-                        continue
-                    cid = self.concept_cortex.concept_to_id.get(c)
-                    r2_idx = self.concept_cortex.relation_to_id.get(r2)
-                    if cid is None or r2_idx is None:
-                        continue
-                    v_c = all_emb[cid : cid + 1]
-                    p_c = self.concept_cortex.predict_target_vec(v_c, torch.tensor([r2_idx], device=self.device))
-                    s_cb = float((p_c * v_b).sum().item())
-                    score = (
-                        0.45 * float((v_a * v_c).sum().item())
-                        + 0.35 * float((d_a * v_c).sum().item())
-                        + 0.20 * min(s_ab, s_cb)
-                    )
-                    if score >= self.cfg.rem_similarity_threshold:
-                        bridge_desc = f"wspólny most: {b} ({a} [{r1}] ↔ {c} [{r2}])"[:120]
-                        candidates.append((score, a, "skojarzenie_rem", c, bridge_desc))
-
-        # 3) Divergent shared-source bridges: B -(r1)-> A and B -(r2)-> C
-        for b, out_edges in outgoing.items():
-            if len(out_edges) < 2 or deg.get(b, 0) > 8:
-                continue
-            for i in range(len(out_edges)):
-                f1 = out_edges[i]
-                a, r1 = f1.dst, f1.rel
-                if not is_informative_node(a):
-                    continue
-                aid = self.concept_cortex.concept_to_id.get(a)
-                if aid is None:
-                    continue
-                v_a = all_emb[aid : aid + 1]
-                d_a = self.concept_cortex.predict_dream_vec(v_a)
-                for j in range(i + 1, len(out_edges)):
-                    f2 = out_edges[j]
-                    c, r2 = f2.dst, f2.rel
-                    if c == a or (a, c) in known_pairs or r1 == r2 or not is_informative_node(c):
-                        continue
-                    cid = self.concept_cortex.concept_to_id.get(c)
-                    if cid is None:
-                        continue
-                    v_c = all_emb[cid : cid + 1]
-                    score = 0.50 * float((v_a * v_c).sum().item()) + 0.50 * float((d_a * v_c).sum().item())
-                    if score >= self.cfg.rem_similarity_threshold:
-                        bridge_desc = f"wspólne źródło: {b} ({r1} / {r2})"[:120]
-                        candidates.append((score, a, "skojarzenie_rem", c, bridge_desc))
-
-        # 4) Creative cross-domain analogies via latent dream projection
-        creative_candidates: list[tuple[float, str, str, str, str]] = []
-        creativity_level = float(getattr(self.cfg, "creativity_level", 0.80))
-        creative_sparks_limit = int(getattr(self.cfg, "rem_creative_sparks_per_night", 4))
-        if creativity_level >= 0.25 and creative_sparks_limit > 0:
-            info_nodes = [
-                n for n in self.concept_cortex.id_to_concept
-                if is_informative_node(n) and deg.get(n, 0) >= 1
-            ][:60]
-            if len(info_nodes) >= 4:
-                node_ids = [self.concept_cortex.concept_to_id[n] for n in info_nodes]
-                node_vecs = all_emb[node_ids]
-                dream_vecs = self.concept_cortex.predict_dream_vec(node_vecs)
-                dream_sim_mat = dream_vecs @ node_vecs.T
-                direct_sim_mat = node_vecs @ node_vecs.T
-                min_creative_sim = max(0.32, self.cfg.rem_similarity_threshold - 0.14 * creativity_level)
-
-                for idx_i, a in enumerate(info_nodes):
-                    for idx_j in range(idx_i + 1, len(info_nodes)):
-                        c = info_nodes[idx_j]
-                        if (a, c) in known_pairs:
-                            continue
-                        d_sim = float(dream_sim_mat[idx_i, idx_j].item())
-                        r_sim = float(dream_sim_mat[idx_j, idx_i].item())
-                        dir_sim = float(direct_sim_mat[idx_i, idx_j].item())
-                        # Favor surprising cross-domain associations (high dream projection, moderate direct distance)
-                        novelty_bonus = 0.10 * creativity_level if 0.10 <= dir_sim <= 0.72 else 0.0
-                        c_score = 0.5 * (d_sim + r_sim) + novelty_bonus
-                        if c_score >= min_creative_sim:
-                            bridge_desc = f"kreatywna analogia: {a} ↔ {c}"[:120]
-                            creative_candidates.append((c_score, a, "kreatywna_analogia", c, bridge_desc))
-
-        creative_candidates.sort(key=lambda x: x[0], reverse=True)
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        discovered: list[dict[str, Any]] = []
-        used_pairs: set[tuple[str, str]] = set()
-
-        # Reserve up to `creative_sparks_limit` slots for creative cross-domain analogies
-        for score, a, rel, c, bridge in creative_candidates:
-            if len(discovered) >= creative_sparks_limit or len(discovered) >= self.cfg.rem_max_new_links_per_night:
-                break
-            if (a, c) in used_pairs or (c, a) in used_pairs:
-                continue
-            used_pairs.add((a, c))
-            dream_fact = ConceptFact(
-                src=a,
-                rel=rel,
-                dst=c,
-                strength=round(score, 3),
-                day=day,
-                source="REM_DREAM",
-                bridge=bridge,
-                consolidated=True,
+        # Record purely numeric/structural REM link telemetry (no string templates)
+        links: list[dict[str, Any]] = []
+        src_ids = pool_idx.index_select(0, row_i).cpu().tolist()
+        dst_ids = pool_idx.index_select(0, col_j).cpu().tolist()
+        sims_cpu = pair_vals.cpu().tolist()
+        for a_i, b_i, s_val in zip(src_ids, dst_ids, sims_cpu):
+            links.append(
+                {
+                    "src_engram": self.hippocampus.semantic.meta[a_i].id,
+                    "dst_engram": self.hippocampus.semantic.meta[b_i].id,
+                    "pair_similarity": round(float(s_val), 4),
+                    "hopfield_energy": thought.hopfield_energy,
+                    "source": "REM_DREAM",
+                }
             )
-            self.hippocampus.rem_dream_links[dream_fact.key()] = dream_fact
-            discovered.append({"src": a, "rel": rel, "dst": c, "score": round(score, 3), "bridge": bridge})
 
-        for score, a, rel, c, bridge in candidates:
-            if len(discovered) >= self.cfg.rem_max_new_links_per_night:
-                break
-            if (a, c) in used_pairs or (c, a) in used_pairs:
-                continue
-            used_pairs.add((a, c))
-            dream_fact = ConceptFact(
-                src=a,
-                rel=rel,
-                dst=c,
-                strength=round(score, 3),
-                day=day,
-                source="REM_DREAM",
-                bridge=bridge,
-                consolidated=True,
-            )
-            self.hippocampus.rem_dream_links[dream_fact.key()] = dream_fact
-            discovered.append({"src": a, "rel": rel, "dst": c, "score": round(score, 3), "bridge": bridge})
-        return discovered
+        return thought.z_star.to(torch.bfloat16), thought.columns_star, links

@@ -5,9 +5,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+import torch
 
 from brain.agent import SleepingBrain
+from brain.teacher_distill import load_teacher_dialogues
 
 
 class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -60,6 +63,23 @@ class BrainServer:
                 parsed = urlparse(self.path)
                 if parsed.path == "/api/state":
                     self._send_json(brain.snapshot())
+                    return
+
+                if parsed.path == "/api/teacher_dialogues":
+                    qs = parse_qs(parsed.query)
+                    try:
+                        limit = max(1, min(500, int(qs.get("limit", ["80"])[0])))
+                    except Exception:
+                        limit = 80
+                    all_pairs = load_teacher_dialogues(brain.state_dir)
+                    shown = all_pairs[-limit:]
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "total": len(all_pairs),
+                            "dialogues": [{"q": q, "a": a} for q, a in shown],
+                        }
+                    )
                     return
 
                 if parsed.path == "/api/export":
@@ -139,9 +159,40 @@ class BrainServer:
                         return
 
                     if parsed.path == "/api/train_language":
-                        epochs = int(body.get("epochs", 22))
+                        epochs = int(body.get("epochs", brain.cfg.language_train_epochs))
                         res = brain.train_language_now(epochs=epochs)
                         self._send_json({"ok": True, **res})
+                        return
+
+                    if parsed.path == "/api/train_parquet":
+                        filename = str(body.get("filename", "__ALL__"))
+                        max_steps = int(body.get("max_steps", 5000))
+                        batch_size = body.get("batch_size")
+                        lr = body.get("lr")
+                        res = brain.start_parquet_polish_async(
+                            filename=filename,
+                            max_steps=max_steps,
+                            batch_size=int(batch_size) if batch_size is not None else None,
+                            lr=float(lr) if lr is not None else None,
+                        )
+                        self._send_json({"ok": True, **res})
+                        return
+
+                    if parsed.path == "/api/train_teacher":
+                        num_dialogues = int(body.get("num_dialogues", 80))
+                        train_epochs = int(body.get("train_epochs", 160))
+                        skip_generation = bool(body.get("skip_generation", False))
+                        res = brain.start_teacher_distill_async(
+                            num_dialogues=num_dialogues,
+                            train_epochs=train_epochs,
+                            skip_generation=skip_generation,
+                        )
+                        self._send_json({"ok": True, **res})
+                        return
+
+                    if parsed.path == "/api/training_feed/clear":
+                        brain.clear_training_dialogue_feed()
+                        self._send_json({"ok": True})
                         return
 
                     if parsed.path == "/api/study/continuous":
@@ -198,6 +249,38 @@ class BrainServer:
                         })
                         return
 
+                    if parsed.path == "/api/living/budget":
+                        b_mb = body.get("memory_budget_mb")
+                        t_dev = body.get("target_device")
+                        res = brain.living_brain.set_memory_budget(
+                            budget_mb=float(b_mb) if b_mb is not None else None,
+                            target_device=str(t_dev) if t_dev is not None else None,
+                        )
+                        self._send_json({"ok": True, **res})
+                        return
+
+                    if parsed.path == "/api/living/stimulate":
+                        steps = max(1, min(20, int(body.get("steps", 5))))
+                        force_grow = bool(body.get("force_grow", False))
+                        born_total = 0
+                        for _ in range(steps):
+                            stim = torch.randn(brain.living_brain.sensory_dim)
+                            tel = brain.living_brain.cognitive_step(
+                                sensory_vec=stim,
+                                external_valence=0.30,
+                                allow_growth=True,
+                                spontaneous=False,
+                            )
+                            born_total += tel.neurons_added
+                        if force_grow and born_total == 0:
+                            born_total += brain.living_brain.grow_structure()
+                        self._send_json({
+                            "ok": True,
+                            "neurons_added": born_total,
+                            "living_brain": brain.living_brain.snapshot(),
+                        })
+                        return
+
                     if parsed.path == "/api/save":
                         path = brain.save_state()
                         self._send_json({"ok": True, "path": str(path)})
@@ -219,6 +302,7 @@ class BrainServer:
 
     def start(self) -> None:
         httpd = self.create_server()
+        self.brain.living_brain.start_spontaneous_clock(interval_sec=0.65)
         print("============================================================")
         print("  SLEEPING NEURAL BRAIN — CZAT + NAUKA Z SIECI (PyTorch GPU)")
         print(f"  GPU   : {self.brain.gpu_info()['device_name']}")
@@ -229,6 +313,7 @@ class BrainServer:
             httpd.serve_forever()
         except KeyboardInterrupt:
             print("\nZapisywanie stanu mózgu...")
+            self.brain.living_brain.stop_spontaneous_clock()
             self.brain.stop_study()
             self.brain.save_state()
             self.brain.language_cortex.shutdown()

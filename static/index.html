@@ -142,6 +142,105 @@
     }
     .study-progress.visible { display: flex; }
 
+    /* Live Training Dialogue Feed */
+    .train-feed-wrap {
+      display: none;
+      flex-direction: column;
+      gap: 6px;
+      background: #070d1a;
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      border-radius: 10px;
+      padding: 8px 10px;
+    }
+    .train-feed-wrap.visible { display: flex; }
+    .train-feed-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .train-feed-head strong {
+      color: #e2e8f0;
+      font-size: 12.5px;
+    }
+    .train-feed-live {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 999px;
+      font-size: 10.5px;
+      font-weight: 700;
+      background: rgba(52, 211, 153, 0.16);
+      color: #6ee7b7;
+      border: 1px solid rgba(52, 211, 153, 0.4);
+      margin-left: 4px;
+    }
+    .train-feed-box {
+      max-height: 250px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding-right: 4px;
+    }
+    .train-feed-box.collapsed { display: none; }
+    .tf-card {
+      background: rgba(15, 23, 42, 0.85);
+      border: 1px solid #1e293b;
+      border-radius: 9px;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      font-size: 12.5px;
+      line-height: 1.42;
+    }
+    .tf-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: #94a3b8;
+    }
+    .tf-tag {
+      font-weight: 600;
+      color: #7dd3fc;
+    }
+    .tf-bubble {
+      padding: 5px 8px;
+      border-radius: 7px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .tf-role {
+      font-weight: 700;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      margin-right: 6px;
+    }
+    .tf-prompt {
+      background: rgba(37, 99, 235, 0.16);
+      border-left: 3px solid #60a5fa;
+      color: #dbeafe;
+    }
+    .tf-prompt .tf-role { color: #93c5fd; }
+    .tf-teacher {
+      background: rgba(168, 85, 247, 0.14);
+      border-left: 3px solid #c084fc;
+      color: #f3e8ff;
+    }
+    .tf-teacher .tf-role { color: #d8b4fe; }
+    .tf-brain {
+      background: rgba(16, 185, 129, 0.14);
+      border-left: 3px solid #34d399;
+      color: #d1fae5;
+    }
+    .tf-brain .tf-role { color: #6ee7b7; }
+
     /* Chat */
     .llm-banner {
       padding: 8px 11px;
@@ -407,151 +506,253 @@
 <body>
   <header>
     <div class="brand">
-      <h1>🧠 Sleeping Neural Brain</h1>
+      <h1>Sleeping Neural Brain</h1>
       <span id="stateBadge" class="badge state-AWAKE">CZUWANIE</span>
       <span id="gpuBadge" class="badge">GPU...</span>
-      <span id="nnBadge" class="badge">🧬 Sieć PyTorch...</span>
+      <span id="nnBadge" class="badge">Sieć...</span>
     </div>
     <div class="controls">
-      <button id="sleepBtn" class="primary" onclick="triggerSleep()" title="Uruchamia sen wyłącznie do połączenia i skonsolidowania nowych informacji">🌙 Połącz informacje (Sen NREM+REM)</button>
-      <button id="autoWebBtn" class="active" onclick="toggleAutoWeb()" title="Gdy nie znam odpowiedzi, automatycznie sprawdzę ją w internecie">🌐 Auto-sieć: WŁ</button>
-      <button id="autoSleepBtn" class="active" onclick="toggleAutoSleep()" title="Automatycznie uruchamia sen gdy w hipokampie zbierze się partia nowych faktów do połączenia">Auto-sen (łączenie): WŁ</button>
-      <button onclick="saveBrain()">💾 Zapisz</button>
-      <button onclick="exportBrain()" title="Pobierz bazę wiedzy jako JSON">📥 Eksport</button>
-      <button class="danger" onclick="resetBrain()">↺ Reset</button>
+      <button id="sleepBtn" class="primary" onclick="triggerSleep()" title="Konsolidacja pamięci i trening kory we śnie (NREM + REM)">Sen</button>
+      <button id="autoWebBtn" class="active" onclick="toggleAutoWeb()" title="Sprawdzaj fakty w Wikipedii gdy nie znam odpowiedzi">Auto-sieć: WŁ</button>
+      <button id="autoSleepBtn" class="active" onclick="toggleAutoSleep()" title="Automatyczny sen po zebraniu partii wspomnień">Auto-sen: WŁ</button>
+      <button onclick="saveBrain()">Zapisz</button>
+      <button onclick="exportBrain()">Eksport</button>
+      <button class="danger" onclick="resetBrain()">Reset</button>
     </div>
   </header>
 
   <section class="top-stats">
     <div class="stat-card">
-      <div class="stat-label">Kreatywność &amp; Bufor Snu (Łączenie Wiedzy)</div>
-      <div class="stat-val"><span id="energyVal">44%</span> <span class="sub" id="pressureVal">(do połączenia: 0/24)</span></div>
+      <div class="stat-label">Kreatywność</div>
+      <div class="stat-val"><span id="energyVal">44%</span> <span class="sub" id="pressureVal">(bufor snu: 0/24)</span></div>
       <div class="bar-bg"><div id="energyBar" class="bar-fill" style="width:44%;background:var(--purple)"></div></div>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:6px;font-size:11px;color:var(--muted)">
+        <input id="creativitySlider" type="range" min="0" max="100" value="80" style="flex:1;accent-color:var(--purple);cursor:pointer" oninput="onCreativityInput(this.value)" onchange="applyCreativity(this.value)" />
+        <strong id="creativitySliderVal" style="color:var(--text);min-width:32px;text-align:right">80%</strong>
+      </div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Życie Mózgu & Konsolidacja NREM</div>
+      <div class="stat-label">Cykl &amp; Pamięć robocza</div>
       <div class="stat-val">Dzień <span id="dayVal">1</span> · <span id="sleepsVal">0</span> nocy</div>
-      <div class="sub">Konsolidacje rdzenia NREM: <strong id="loraUpdatesVal">0</strong> · Kontekst: <span id="winLimVal">24</span> tur</div>
+      <div class="sub">SDR: <strong id="wmSdrVal">0</strong>/<span id="wmSdrLimVal">64</span> · Kontekst: <span id="winLimVal">128</span> · Cykle: <strong id="loraUpdatesVal">0</strong></div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Hipokamp (Krótkotrwała)</div>
-      <div class="stat-val"><span id="stMemVal">0</span> <span class="sub">/ <span id="stLimVal">5000</span></span></div>
-      <div class="sub">Pojęcia przed snem: <span id="stFactVal">0</span></div>
+      <div class="stat-label">Hipokamp (krótkotrwała)</div>
+      <div class="stat-val"><span id="stMemVal">0</span> <span class="sub">/ <span id="stLimVal">50000</span></span></div>
+      <div class="sub">Synapsy W_rec: <span id="stFactVal">0</span></div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Kora (Trwała pamięć po śnie)</div>
-      <div class="stat-val"><span id="semMemVal">0</span> <span class="sub">/ <span id="semLimVal">50000</span></span></div>
-      <div class="sub" style="color:var(--purple)">✨ REM: <strong id="remReflVal">0</strong> refleksji · <strong id="remGraphVal">0</strong> połączeń</div>
+      <div class="stat-label">Pamięć trwała &amp; REM</div>
+      <div class="stat-val"><span id="semMemVal">0</span> <span class="sub">/ <span id="semLimVal">200000</span></span></div>
+      <div class="sub" style="color:var(--purple)">REM: <strong id="remReflVal">0</strong> · <strong id="remGraphVal">0</strong></div>
+    </div>
+  </section>
+
+  <!-- LIVING BRAIN (M1/M2/M4) & DYNAMIC MEMORY BUDGET SLIDER (68 MB - 32 GB) -->
+  <section style="padding:10px 18px 0">
+    <div class="panel" style="gap:8px;padding:11px 14px">
+      <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <strong style="font-size:13px">Living Brain (M1/M2/M4 · bez backprop)</strong>
+          <span id="lbStatusBadge" class="badge state-AWAKE">ROŚNIE</span>
+          <span id="lbMemSummary" class="sub">0.0 / 4096 MB · Zapas: 4096 MB</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">
+          <select id="lbDeviceSel" onchange="applyLivingBudget()" title="Docelowe urządzenie dla rosnących tensorów Living Brain">
+            <option value="gpu">GPU (VRAM)</option>
+            <option value="ram">RAM systemu (CPU)</option>
+          </select>
+          <button onclick="stimulateLivingBrain(true)" style="padding:5px 10px;font-size:12px" title="Wyślij nowe bodźce poznawcze i pobudź neurogenezę M1/M2/M4">Impuls neurogenezy</button>
+        </div>
+      </div>
+
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span class="sub" style="min-width:96px">Limit pamięci:</span>
+        <input id="lbBudgetSlider" type="range" min="68" max="32768" step="32" value="4096" style="flex:1;min-width:180px;accent-color:var(--cyan);cursor:pointer" oninput="onLivingBudgetInput(this.value)" onchange="applyLivingBudget()" />
+        <strong id="lbBudgetVal" style="font-size:12.5px;min-width:82px;text-align:right">4.00 GB</strong>
+        <div style="display:flex;gap:4px">
+          <button onclick="setLivingBudgetPreset(68)" style="padding:3px 7px;font-size:11px">68 MB</button>
+          <button onclick="setLivingBudgetPreset(512)" style="padding:3px 7px;font-size:11px">512 MB</button>
+          <button onclick="setLivingBudgetPreset(4096)" style="padding:3px 7px;font-size:11px">4 GB</button>
+          <button onclick="setLivingBudgetPreset(16384)" style="padding:3px 7px;font-size:11px">16 GB</button>
+          <button onclick="setLivingBudgetPreset(32768)" style="padding:3px 7px;font-size:11px">32 GB</button>
+        </div>
+      </div>
+
+      <div class="bar-bg" style="margin-top:0"><div id="lbMemBar" class="bar-fill" style="width:2%;background:var(--cyan)"></div></div>
+
+      <div style="display:flex;flex-wrap:wrap;gap:12px;font-size:11.5px;color:var(--muted)" id="lbTelemetryRow">
+        <span>Neurony M1/M4: <strong id="lbNeuronsVal" style="color:var(--text)">0</strong> (<span id="lbLayersVal">L1/L2/L3/A/M4</span>)</span>
+        <span>Synapsy: <strong id="lbSynVal" style="color:var(--text)">0</strong></span>
+        <span>Epizody M2: <strong id="lbM2Val" style="color:var(--text)">0</strong></span>
+        <span>Zaskoczenie PE: <strong id="lbPeVal" style="color:var(--amber)">0.00</strong></span>
+        <span>Ciekawość M4: <strong id="lbCurVal" style="color:var(--purple)">0.00</strong></span>
+        <span>NA/DA/ACh: <strong id="lbNmVal" style="color:var(--cyan)">0.35 / 0.50 / 0.55</strong></span>
+        <span>Tło θ/γ: <strong id="lbTickVal" style="color:var(--green)">0</strong> · Zmęczenie: <span id="lbFatVal">0.00</span></span>
+      </div>
     </div>
   </section>
 
   <main class="layout">
-    <!-- LEFT: WEB STUDY + STREAMING POLISH CHAT -->
+    <!-- LEFT: CLEAN TABBED TRAINING CENTER + DISTRACTION-FREE CHAT -->
     <div class="col">
       <section class="panel">
-        <h2>
-          <span>🌐 Autonomiczna Nauka z Sieci (Temat lub bezpośredni link URL)</span>
-          <span class="sub">Wikipedia + DuckDuckGo + URL → GPU → NREM/REM</span>
-        </h2>
-        <div class="study-row">
-          <input id="studyInput" type="text" placeholder="Temat lub adres https://..., np. czarne dziury, Rust, https://pl.wikipedia.org/..." onkeydown="if(event.key==='Enter') startStudy()" />
-          <select id="studyRounds" title="Maksymalna liczba rund pogłębiania wiedzy">
-            <option value="2">2 rundy (szybko)</option>
-            <option value="4" selected>4 rundy (dokładnie)</option>
-            <option value="6">6 rund (głębokie studium)</option>
-          </select>
-          <button id="studyBtn" class="study-btn" onclick="startStudy()">🌐 Ucz się z sieci</button>
-          <button id="stopStudyBtn" class="danger" onclick="stopStudy()" style="display:none">⏹ Stop</button>
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <div class="tabs" style="margin:0">
+            <button id="trTab-teacher" class="tab-btn active" onclick="setTrainTab('teacher')">Nauczyciel (Bielik → Mózg)</button>
+            <button id="trTab-parquet" class="tab-btn" onclick="setTrainTab('parquet')">Korpus Parquet</button>
+            <button id="trTab-web" class="tab-btn" onclick="setTrainTab('web')">Sieć i podstawy</button>
+          </div>
+          <button id="stopStudyBtn" class="danger" onclick="stopStudy()" style="display:none;padding:5px 10px;font-size:12px">Stop</button>
         </div>
-        <div class="chips" style="margin-top:2px">
-          <button id="schoolBtn" class="primary" onclick="installSchoolFoundation()" style="padding:5px 10px;font-size:12px">🎓 Szkoła Podstawowa (Wgraj podstawy + GPU)</button>
-          <button id="turboStudyBtn" class="study-btn" onclick="startTurboLearn(200)" style="padding:5px 10px;font-size:12px" title="Równolegle (10 wątków) uczy się 200+ tematów z sieci, zasypia i trenuje model językowy na GPU">⚡ Mega Turbo-nauka (200+ tematów + język)</button>
-          <button id="trainLangBtn" class="study-btn" onclick="trainLanguageNow()" style="padding:5px 10px;font-size:12px" title="Wytrenuj własny model językowy na wszystkich wspomnieniach i rozmowach na GPU">🗣️ Wykształć język (GPU)</button>
-          <button id="schoolWebBtn" onclick="startSchoolWebCourse()" style="padding:5px 10px;font-size:12px">📚 Kurs szkolny z Wikipedii</button>
-          <button id="continuousStudyBtn" class="study-btn" onclick="startContinuousLearning(60)" style="padding:5px 10px;font-size:12px" title="Zostaw mózg na godzinę — sam będzie uczyć się kolejnych tematów z sieci i konsolidować wiedzę we śnie na GPU">⏱️ Auto-nauka 1h (z netu + sen GPU)</button>
+
+        <!-- TAB 1: Bielik Teacher -> Self-Sufficient Brain Distillation -->
+        <div id="trPane-teacher" style="display:flex;flex-direction:column;gap:8px">
+          <div class="study-row">
+            <select id="teacherDialoguesCount" title="Ile nowych naturalnych polskich dialogów ma wygenerować Bielik dla Twojego mózgu">
+              <option value="40">40 nowych dialogów (szybka sesja ~1 min)</option>
+              <option value="100" selected>100 nowych dialogów (~2–3 min)</option>
+              <option value="250">250 nowych dialogów (solidna baza)</option>
+              <option value="500">500 nowych dialogów (długa sesja)</option>
+            </select>
+            <button id="teacherBtn" class="primary" onclick="startBielikTeacher(false)" style="flex:1">Ucz mój mózg z Bielikiem</button>
+            <button id="teacherRetrainBtn" onclick="startBielikTeacher(true)" title="Wytrenuj własny mózg na już zapisanych dialogach bez ładowania Bielika">Trenuj na zebranych</button>
+            <button id="teacherPreviewBtn" onclick="loadSavedTeacherDialogues()" title="Pokaż zapisane rozmowy wygenerowane przez Bielika">Podgląd dialogów</button>
+          </div>
+          <div class="sub" id="teacherInfo">Bielik generuje naturalne polskie dialogi na GPU, po czym zostaje wyładowany z VRAM, a Twój własny mózg uczy się z nich samodzielnie pisać.</div>
         </div>
+
+        <!-- TAB 2: Parquet Corpus GPU Pre-Training -->
+        <div id="trPane-parquet" style="display:none;flex-direction:column;gap:8px">
+          <div class="study-row">
+            <select id="parquetFile" title="Wybierz plik Parquet lub wszystkie naraz">
+              <option value="__ALL__" selected>Wszystkie pliki Parquet</option>
+            </select>
+            <select id="parquetSteps" title="Liczba kroków treningu polskiego na GPU">
+              <option value="1000">1 000 kroków</option>
+              <option value="5000" selected>5 000 kroków</option>
+              <option value="25000">25 000 kroków</option>
+              <option value="50000">50 000 kroków</option>
+              <option value="100000">100 000 kroków</option>
+              <option value="250000">250 000 kroków</option>
+              <option value="500000">500 000 kroków</option>
+            </select>
+            <button id="parquetBtn" class="primary" onclick="trainPolishParquet()" style="flex:1">Trenuj z Parquet</button>
+          </div>
+        </div>
+
+        <!-- TAB 3: Web Study & Foundations -->
+        <div id="trPane-web" style="display:none;flex-direction:column;gap:8px">
+          <div class="study-row">
+            <input id="studyInput" type="text" placeholder="Temat lub URL (np. czarne dziury, Rust, https://pl.wikipedia.org/...)" onkeydown="if(event.key==='Enter') startStudy()" />
+            <select id="studyRounds">
+              <option value="2">2 rundy</option>
+              <option value="4" selected>4 rundy</option>
+              <option value="6">6 rund</option>
+            </select>
+            <button id="studyBtn" class="study-btn" onclick="startStudy()">Ucz z sieci</button>
+          </div>
+          <div class="chips">
+            <button id="schoolBtn" onclick="installSchoolFoundation()" style="padding:5px 10px;font-size:12px">Podstawy szkolne</button>
+            <button id="trainLangBtn" onclick="trainLanguageNow()" style="padding:5px 10px;font-size:12px">Wykształć dialogi</button>
+            <button id="continuousStudyBtn" onclick="startContinuousLearning(60)" style="padding:5px 10px;font-size:12px">Auto-nauka 1h</button>
+            <button id="schoolWebBtn" onclick="startSchoolWebCourse()" style="padding:5px 10px;font-size:12px">Kurs z Wikipedii</button>
+            <button id="turboStudyBtn" onclick="startTurboLearn(200)" style="padding:5px 10px;font-size:12px">Turbo-nauka (200)</button>
+          </div>
+        </div>
+
         <div id="studyProgress" class="study-progress">
           <div style="display:flex;justify-content:space-between;align-items:center">
-            <strong id="studyTitle">Badam temat...</strong>
-            <span id="studyStats" class="sub">Runda 0/4 · Opanowanie 0%</span>
+            <strong id="studyTitle">Trening...</strong>
+            <span id="studyStats" class="sub">0%</span>
           </div>
           <div class="bar-bg"><div id="studyBar" class="bar-fill" style="width:0%;background:var(--cyan)"></div></div>
           <div id="studyAction" class="sub">Inicjalizacja...</div>
         </div>
+
+        <div id="trainingFeedWrap" class="train-feed-wrap">
+          <div class="train-feed-head">
+            <div>
+              <strong>💬 Co do siebie piszą podczas nauki</strong>
+              <span id="trainingFeedLiveBadge" class="train-feed-live" style="display:none">NA ŻYWO</span>
+              <span id="trainingFeedCount" style="margin-left:6px"></span>
+            </div>
+            <div style="display:flex;gap:6px">
+              <button id="trainingFeedToggleBtn" onclick="toggleTrainingFeed()" style="padding:3px 8px;font-size:11px">Zwiń</button>
+              <button onclick="clearTrainingFeed()" style="padding:3px 8px;font-size:11px">Wyczyść</button>
+            </div>
+          </div>
+          <div id="trainingFeedBox" class="train-feed-box"></div>
+        </div>
       </section>
 
-      <section class="panel">
+      <section class="panel" style="flex:1">
         <h2>
-          <span>💬 Rozmowa z Mózgiem (Strumieniowanie na żywo)</span>
+          <span>Rozmowa</span>
           <span class="sub">Enter = wyślij · Shift+Enter = nowa linia · /ucz · /sen</span>
         </h2>
-        <div id="llmBanner" class="llm-banner">⏳ Ładowanie Kory Językowej na GPU...</div>
-        <div id="chatBox" class="chat-box"></div>
+        <div id="llmBanner" class="llm-banner">Ładowanie kory...</div>
+        <div id="chatBox" class="chat-box" style="height:480px"></div>
         <div class="chat-input-row">
-          <textarea id="chatInput" rows="1" placeholder="Napisz wiadomość po polsku, naucz go czegoś albo wpisz '/ucz <temat>' lub '/sen'..." oninput="autoResizeChatInput(this)" onkeydown="handleChatKey(event)"></textarea>
+          <textarea id="chatInput" rows="1" placeholder="Napisz wiadomość po polsku..." oninput="autoResizeChatInput(this)" onkeydown="handleChatKey(event)"></textarea>
           <button id="sendBtn" class="send-btn" onclick="sendChat()">Wyślij</button>
-        </div>
-        <div class="chips">
-          <span class="chip" onclick="fillChat('/szkola')">🎓 /szkola (Podstawy szkolne)</span>
-          <span class="chip" onclick="fillChat('Ile to 12 * 15?')">🧮 Ile to 12 * 15?</span>
-          <span class="chip" onclick="fillChat('Cześć! Mam na imię Kuba, mieszkam w Gliwicach i interesuję się programowaniem AI w Pythonie.')">👤 Przedstaw się</span>
-          <span class="chip" onclick="fillChat('Wymyśl kreatywną analogię między fotosyntezą a oddychaniem')">✨ Kreatywna analogia</span>
-          <span class="chip" onclick="fillChat('/ucz jak działają komputery kwantowe')">🌐 /ucz komputery kwantowe</span>
-          <span class="chip" onclick="fillChat('Co już pamiętasz i jakich tematów ostatnio się nauczyłeś?')">🧠 Sprawdź pamięć</span>
-          <span class="chip" onclick="fillChat('/sen')">🌙 /sen (Połącz wiedzę)</span>
         </div>
       </section>
     </div>
 
-    <!-- RIGHT: EXPANDED MEMORY INSPECTOR + INTERACTIVE GRAPH + SLEEP HISTORY -->
+    <!-- RIGHT: MEMORY INSPECTOR + SYNAPTIC GRAPH + TABBED SLEEP/LOGS -->
     <div class="col">
       <section class="panel">
-        <h2><span>🧠 Inspektor Pamięci Mózgu</span></h2>
+        <h2><span>Pamięć</span></h2>
         <div class="tabs">
-          <button id="tab-hippo" class="tab-btn active" onclick="setMemTab('hippo')">🟡 Hipokamp (<span id="tc-hippo">0</span>)</button>
-          <button id="tab-sem" class="tab-btn" onclick="setMemTab('sem')">🔵 Pamięć trwała (<span id="tc-sem">0</span>)</button>
-          <button id="tab-rem" class="tab-btn" onclick="setMemTab('rem')">✨ REM (<span id="tc-rem">0</span>)</button>
-          <button id="tab-topics" class="tab-btn" onclick="setMemTab('topics')">📚 Tematy (<span id="tc-topics">0</span>)</button>
-          <button id="tab-core" class="tab-btn" onclick="setMemTab('core')">🧬 Rdzeń Wiedzy</button>
+          <button id="tab-hippo" class="tab-btn active" onclick="setMemTab('hippo')">Hipokamp (<span id="tc-hippo">0</span>)</button>
+          <button id="tab-sem" class="tab-btn" onclick="setMemTab('sem')">Trwała (<span id="tc-sem">0</span>)</button>
+          <button id="tab-rem" class="tab-btn" onclick="setMemTab('rem')">REM (<span id="tc-rem">0</span>)</button>
+          <button id="tab-topics" class="tab-btn" onclick="setMemTab('topics')">Tematy (<span id="tc-topics">0</span>)</button>
+          <button id="tab-core" class="tab-btn" onclick="setMemTab('core')">Rdzeń</button>
         </div>
         <div class="teach-row">
-          <input id="manualMemInput" type="text" placeholder="➕ Dodaj ręcznie fakt lub zasadę do hipokampu..." onkeydown="if(event.key==='Enter') addManualMemory()" />
-          <select id="manualMemCat" title="Kategoria wspomnienia">
+          <input id="manualMemInput" type="text" placeholder="Dodaj fakt do hipokampu..." onkeydown="if(event.key==='Enter') addManualMemory()" />
+          <select id="manualMemCat">
             <option value="wiedza">wiedza</option>
             <option value="użytkownik">użytkownik</option>
             <option value="zasada">zasada</option>
           </select>
           <button onclick="addManualMemory()">Dodaj</button>
         </div>
-        <input id="memFilter" type="text" placeholder="Filtruj wspomnienia..." oninput="if(latestState) renderMemoryTab(latestState)" style="padding:7px 10px;font-size:12px" />
+        <input id="memFilter" type="text" placeholder="Filtruj..." oninput="if(latestState) renderMemoryTab(latestState)" style="padding:6px 10px;font-size:12px" />
         <div id="memListBox" class="mem-list"></div>
       </section>
 
       <section class="panel">
         <h2>
-          <span>🕸️ Graf Synaptyczny Kory (PCA 2D z GPU)</span>
-          <span class="sub">Najedź lub kliknij węzeł · Żółte = hipokamp · Niebieskie = kora · Fioletowe = REM</span>
+          <span>Graf Synaptyczny W_rec</span>
+          <span class="sub">Zielone = aktywne SDR · Niebieskie = huby</span>
         </h2>
         <div class="graph-wrap">
-          <canvas id="graphCanvas" width="520" height="280"></canvas>
+          <canvas id="graphCanvas" width="520" height="260"></canvas>
           <div id="graphTooltip" class="graph-tooltip"></div>
         </div>
       </section>
 
       <section class="panel">
-        <h2><span>📊 Historia Nocy (Trening Sieci PyTorch na GPU)</span></h2>
-        <div style="overflow-x:auto">
+        <div class="tabs">
+          <button id="auxTab-sleep" class="tab-btn active" onclick="setAuxTab('sleep')">Historia snu</button>
+          <button id="auxTab-log" class="tab-btn" onclick="setAuxTab('log')">Dziennik</button>
+        </div>
+        <div id="auxPane-sleep" style="overflow-x:auto">
           <table class="sleep-table">
             <thead>
-              <tr><th>Noc</th><th>Czas</th><th>Wspomn.</th><th>EWC Graf Loss</th><th>Kora Językowa Loss</th><th>REM</th></tr>
+              <tr><th>Noc</th><th>Czas</th><th>Engramy</th><th>Err</th><th>SHY</th><th>Loss</th><th>REM</th></tr>
             </thead>
             <tbody id="sleepTableBody">
-              <tr><td colspan="6" class="sub">Brak przespanych nocy.</td></tr>
+              <tr><td colspan="7" class="sub">Brak przespanych nocy.</td></tr>
             </tbody>
           </table>
         </div>
-        <h2 style="margin-top:4px"><span>📜 Dziennik Mózgu</span></h2>
-        <div id="logBox" class="log-box"></div>
+        <div id="auxPane-log" style="display:none">
+          <div id="logBox" class="log-box" style="height:170px"></div>
+        </div>
       </section>
     </div>
   </main>
@@ -560,6 +761,10 @@
     let latestState = null;
     let chatBusy = false;
     let lastChatHash = "";
+    let lastTrainingFeedHash = "";
+    let lastLiveFeedSeq = 0;
+    let trainingFeedCollapsed = false;
+    let savedDialoguesPreview = null;
     let activeMemTab = "hippo";
     const openRecallBoxes = new Set();
 
@@ -701,35 +906,47 @@
       const q = (document.getElementById("memFilter").value || "").trim().toLowerCase();
       const box = document.getElementById("memListBox");
       if (activeMemTab === "hippo") {
-        const arr = s.memory.short_term_memories.slice().reverse().filter(m => !q || m.text.toLowerCase().includes(q) || (m.topic || "").toLowerCase().includes(q));
+        const arr = s.memory.short_term_memories.slice().reverse().filter(m => {
+          const lbl = (m.preview_label || m.text || "").toLowerCase();
+          return !q || lbl.includes(q) || (m.topic || "").toLowerCase().includes(q) || (m.id || "").toLowerCase().includes(q);
+        });
         box.innerHTML = arr.length ? arr.map(m => {
+          const lbl = m.preview_label || m.text || "(brak etykiety diagnostycznej)";
           const urlPart = m.source_url ? ` · <a class="md-link" href="${escapeHtml(m.source_url)}" target="_blank" rel="noopener noreferrer">źródło</a>` : "";
-          return `<div class="mem-item hippo"><div class="mem-item-body"><strong>[${escapeHtml(m.category)}]</strong> ${escapeHtml(m.text)} <span class="sub">(ważność ${m.importance}/5${m.topic ? " · temat: " + escapeHtml(m.topic) : ""}${urlPart})</span></div><button class="del-btn" title="Usuń" onclick="deleteMemoryItem('${escapeHtml(m.id)}')">✕</button></div>`;
-        }).join("") : `<div class="sub">Brak świeżych wspomnień w hipokampie — wszystko utrwalone lub jeszcze nie rozmawialiście.</div>`;
+          return `<div class="mem-item hippo"><div class="mem-item-body"><strong>[${escapeHtml(m.category)}]</strong> ${escapeHtml(lbl)} <span class="sub">(siła ${m.strength} · SDR ${Number(m.sparsity_pct ?? 4.0).toFixed(2)}% · ważność ${m.importance}/5${m.topic ? " · " + escapeHtml(m.topic) : ""}${urlPart})</span></div><button class="del-btn" title="Usuń" onclick="deleteMemoryItem('${escapeHtml(m.id)}')">✕</button></div>`;
+        }).join("") : `<div class="sub">Brak świeżych engramów SDR w hipokampie.</div>`;
       } else if (activeMemTab === "sem") {
-        const arr = s.memory.semantic_memories.filter(m => !q || m.text.toLowerCase().includes(q) || (m.topic || "").toLowerCase().includes(q));
+        const arr = s.memory.semantic_memories.filter(m => {
+          const lbl = (m.preview_label || m.text || "").toLowerCase();
+          return !q || lbl.includes(q) || (m.topic || "").toLowerCase().includes(q) || (m.id || "").toLowerCase().includes(q);
+        });
         box.innerHTML = arr.length ? arr.map(m => {
+          const lbl = m.preview_label || m.text || "(engram bez etykiety)";
           const urlPart = m.source_url ? ` · <a class="md-link" href="${escapeHtml(m.source_url)}" target="_blank" rel="noopener noreferrer">źródło</a>` : "";
-          return `<div class="mem-item sem"><div class="mem-item-body"><strong>[${escapeHtml(m.category)}]</strong> ${escapeHtml(m.text)} <span class="sub">(siła ${m.strength} · przypomnień ${m.recall_count} · D${m.day_created}${urlPart})</span></div><button class="del-btn" title="Usuń" onclick="deleteMemoryItem('${escapeHtml(m.id)}')">✕</button></div>`;
-        }).join("") : `<div class="sub">Brak trwałych wspomnień (wyślij mózg spać po rozmowie lub nauce).</div>`;
+          return `<div class="mem-item sem"><div class="mem-item-body"><strong>[${escapeHtml(m.category)}]</strong> ${escapeHtml(lbl)} <span class="sub">(siła ${m.strength} · SDR ${Number(m.sparsity_pct ?? 4.0).toFixed(2)}% · przypomnień ${m.recall_count} · D${m.day_created}${urlPart})</span></div><button class="del-btn" title="Usuń" onclick="deleteMemoryItem('${escapeHtml(m.id)}')">✕</button></div>`;
+        }).join("") : `<div class="sub">Brak trwałych engramów SDR (uruchom sen NREM+SHY+REM).</div>`;
       } else if (activeMemTab === "rem") {
-        const arr = s.memory.rem_reflections.slice().reverse().filter(r => !q || r.text.toLowerCase().includes(q));
-        box.innerHTML = arr.length ? arr.map(r =>
-          `<div class="mem-item rem"><div class="mem-item-body">✨ ${escapeHtml(r.text)} <span class="sub">(Noc D${r.day_created})</span></div><button class="del-btn" title="Usuń" onclick="deleteMemoryItem('${escapeHtml(r.id)}')">✕</button></div>`
-        ).join("") : `<div class="sub">Refleksje REM pojawią się po przespanej nocy.</div>`;
+        const arr = s.memory.rem_reflections.slice().reverse().filter(r => {
+          const lbl = (r.preview_label || r.text || "").toLowerCase();
+          return !q || lbl.includes(q);
+        });
+        box.innerHTML = arr.length ? arr.map(r => {
+          const lbl = r.preview_label || r.text || "(stan hybrydowy REM)";
+          return `<div class="mem-item rem"><div class="mem-item-body">✨ ${escapeHtml(lbl)} <span class="sub">(siła ${r.strength} · SDR ${Number(r.sparsity_pct ?? 4.0).toFixed(2)}% · Noc D${r.day_created})</span></div><button class="del-btn" title="Usuń" onclick="deleteMemoryItem('${escapeHtml(r.id)}')">✕</button></div>`;
+        }).join("") : `<div class="sub">Ślady hybrydowe REM pojawią się po przespanej nocy na GPU.</div>`;
       } else if (activeMemTab === "topics") {
         const arr = (s.studied_topics || []).slice().reverse().filter(t => !q || t.topic.toLowerCase().includes(q));
         box.innerHTML = arr.length ? arr.map(t => {
           const srcLinks = (t.sources || []).slice(0, 3).map(src =>
             `<a class="md-link" href="${escapeHtml(src.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(src.title)}</a>`
           ).join(" · ");
-          return `<div class="mem-item topic"><div class="mem-item-body"><strong>🌐 ${escapeHtml(t.topic)}</strong> — opanowanie <strong>${Number(t.mastery || 0).toFixed(0)}%</strong> (${t.facts_learned} faktów, ${t.pages_read} źródeł)<div class="sub" style="margin-top:3px">${escapeHtml(t.summary || "")}</div>${srcLinks ? `<div class="sub" style="margin-top:3px">Źródła: ${srcLinks}</div>` : ""}</div><button class="del-btn" title="Usuń temat" onclick="deleteTopicItem('${escapeHtml(t.topic).replace(/'/g, "\\'")}')">✕</button></div>`;
+          return `<div class="mem-item topic"><div class="mem-item-body"><strong>🌐 ${escapeHtml(t.topic)}</strong> — opanowanie <strong>${Number(t.mastery || 0).toFixed(0)}%</strong> (${t.facts_learned} engramów SDR, ${t.pages_read} źródeł)<div class="sub" style="margin-top:3px">${escapeHtml(t.summary || "")}</div>${srcLinks ? `<div class="sub" style="margin-top:3px">Źródła: ${srcLinks}</div>` : ""}</div><button class="del-btn" title="Usuń temat" onclick="deleteTopicItem('${escapeHtml(t.topic).replace(/'/g, "\\'")}')">✕</button></div>`;
         }).join("") : `<div class="sub">Jeszcze nie badano żadnego tematu w sieci. Użyj paska powyżej!</div>`;
       } else {
         const core = (s.language_cortex && s.language_cortex.core_knowledge_summary) || "";
         box.innerHTML = core
           ? `<div class="mem-item core"><div class="mem-item-body">${formatMessage(core)}</div></div>`
-          : `<div class="sub">Skondensowany rdzeń wiedzy NREM powstaje automatycznie podczas snu po zapisaniu nowych wspomnień.</div>`;
+          : `<div class="sub">Podsumowanie konsolidacji NREM/SHY powstaje automatycznie podczas snu na GPU.</div>`;
       }
     }
 
@@ -744,7 +961,8 @@
       if (!meta) return "";
       const p = [];
       if (meta.learned && meta.learned.length) {
-        p.push(`<span class="pill pill-hippo" onclick="toggleRecallBox('${msgKey}')">🟡 Hipokamp +${meta.learned.length}: ${escapeHtml(meta.learned[0].slice(0, 48))}</span>`);
+        const firstLearned = String(meta.learned[0] || "SDR");
+        p.push(`<span class="pill pill-hippo" onclick="toggleRecallBox('${msgKey}')">🟡 Hipokamp +${meta.learned.length}: ${escapeHtml(firstLearned.slice(0, 48))}</span>`);
       }
       if (meta.recalled_semantic && meta.recalled_semantic.length) {
         p.push(`<span class="pill pill-sem" onclick="toggleRecallBox('${msgKey}')">🔵 Pamięć trwała (${meta.recalled_semantic.length})</span>`);
@@ -817,7 +1035,13 @@
           recalled_hippocampus: (streamState.meta.recalled_memories && streamState.meta.recalled_memories.hippocampus || []).slice(0, 8),
           recalled_rem: (streamState.meta.recalled_memories && streamState.meta.recalled_memories.rem || []).slice(0, 6),
           concept_hints: streamState.meta.concept_hints || [],
-          learned: (streamState.meta.learned_memories || []).map(x => x.text)
+          thinking: streamState.meta.thinking || [],
+          learned: (streamState.meta.learned_memories || []).map(x => {
+            if (typeof x === "string") return x;
+            if (x && x.text) return String(x.text);
+            if (x && x.id) return `engram:${x.id} (SDR ${Number(x.sparsity_pct ?? 4.0).toFixed(1)}%)`;
+            return "engram SDR";
+          })
         } : null;
         const bodyHtml = streamState.replyText
           ? formatMessage(streamState.replyText)
@@ -845,8 +1069,15 @@
 
       const lc = s.language_cortex;
       const fluency = Number(lc.fluency || 0).toFixed(0);
+      const fmtParams = (n) => {
+        const v = Number(n || 0);
+        return v >= 1e9 ? `${(v / 1e9).toFixed(2)}B` : `${(v / 1e6).toFixed(2)}M`;
+      };
+      const totalLbl = fmtParams(lc.total_params);
+      const sdrPct = Number(lc.sdr_sparsity_pct ?? 4.0).toFixed(2);
+      const colsN = lc.num_columns || 16;
       document.getElementById("nnBadge").textContent =
-        `🧬 ${(Number(lc.total_params || 0) / 1e6).toFixed(2)}M param · słownik ${lc.vocab_used || 0}/${lc.vocab_size || 16384} · 🗣️ ${fluency}%`;
+        `🧬 ${totalLbl} (W+K+B) · SDR ${sdrPct}% · ${colsN} kolumn · 🗣️ ${fluency}%`;
 
       const banner = document.getElementById("llmBanner");
       if (lc.error) {
@@ -854,7 +1085,13 @@
         banner.textContent = `❌ ${lc.status}`;
       } else if (lc.ready) {
         banner.className = "llm-banner ready";
-        banner.textContent = `✅ ${lc.status} · ${lc.lora_updates} cykli treningu NREM`;
+        const wLbl = fmtParams(lc.wernicke_params);
+        const cLbl = fmtParams(lc.cortex_params);
+        const bLbl = fmtParams(lc.broca_params);
+        banner.textContent =
+          `✅ ${lc.architecture || "Bajty UTF-8 · Modern Hopfield · SDR k-WTA"} · ` +
+          `Wernicke ${wLbl} + Kora ${cLbl} + Broca ${bLbl} · ` +
+          `SDR ${sdrPct}% · ${colsN}×${lc.column_dim || 256} · LoRA ${lc.lora_updates || 0}`;
       } else {
         banner.className = "llm-banner";
         banner.textContent = `⏳ ${lc.status}`;
@@ -871,20 +1108,80 @@
       document.getElementById("schoolWebBtn").disabled = !lc.ready || studying;
       const contBtn = document.getElementById("continuousStudyBtn");
       if (contBtn) contBtn.disabled = !lc.ready || studying;
+
+      const tBtn = document.getElementById("teacherBtn");
+      const tRetrainBtn = document.getElementById("teacherRetrainBtn");
+      const tInfo = document.getElementById("teacherInfo");
+      const td = s.teacher_distill || {};
+      const savedDial = Number(td.saved_dialogues || 0);
+      if (tBtn) tBtn.disabled = !lc.ready || studying;
+      if (tRetrainBtn) {
+        tRetrainBtn.disabled = !lc.ready || studying || savedDial === 0;
+        tRetrainBtn.textContent = savedDial > 0 ? `Trenuj na zebranych (${savedDial})` : "Trenuj na zebranych";
+      }
+      if (tInfo) {
+        tInfo.textContent = savedDial > 0
+          ? `Zapisanych dialogów od Bielika: ${savedDial} · Samokorekta słuchowa: WŁ (mózg sam słyszy i poprawia swoje odpowiedzi)`
+          : "Bielik wygeneruje naturalne polskie dialogi na GPU, zostanie wyładowany z VRAM, a Twój własny mózg nauczy się z nich pisać.";
+      }
+
+      const pqBtn = document.getElementById("parquetBtn");
+      const pqFileSel = document.getElementById("parquetFile");
+      if (pqBtn) {
+        const pq = s.parquet_corpus || {};
+        if (pqFileSel) {
+          const sig = files.length > 0
+            ? files.map(f => `${f.filename}:${f.size_mb}:${f.num_rows}`).join("|")
+            : "__EMPTY__";
+          if (pqFileSel.dataset.sig !== sig) {
+            const prevVal = pqFileSel.value || "__ALL__";
+            const opts = [];
+            if (files.length > 0) {
+              if (files.length > 1) {
+                opts.push(`<option value="__ALL__">Wszystkie (${files.length} pliki · ${pq.total_size_mb} MB)</option>`);
+              }
+              for (const f of files) {
+                opts.push(`<option value="${escapeHtml(f.filename)}">${escapeHtml(f.filename)} (${f.size_mb} MB)</option>`);
+              }
+            } else {
+              opts.push(`<option value="__ALL__">Wszystkie (pobierz z HuggingFace · ~1.5 GB)</option>`);
+              opts.push(`<option value="train-00000-of-00006.parquet">train-00000-of-00006.parquet (Wikipedia PL · ~431 MB)</option>`);
+              opts.push(`<option value="000_00000.parquet">000_00000.parquet (FineWeb2-HQ PL · ~1.1 GB)</option>`);
+            }
+            pqFileSel.innerHTML = opts.join("");
+            if ([...pqFileSel.options].some(o => o.value === prevVal)) {
+              pqFileSel.value = prevVal;
+            }
+            pqFileSel.dataset.sig = sig;
+          }
+          pqFileSel.disabled = !lc.ready || studying;
+        }
+        pqBtn.disabled = !lc.ready || studying;
+        pqBtn.textContent = pq.exists ? `Trenuj z Parquet (${pq.total_size_mb} MB)` : "Pobierz i trenuj z Parquet";
+      }
       document.getElementById("stopStudyBtn").style.display = studying ? "inline-block" : "none";
 
       // Study live progress
       const sp = document.getElementById("studyProgress");
       if (studying) {
         sp.className = "study-progress visible";
-        document.getElementById("studyTitle").textContent = `🌐 Uczę się z sieci: „${s.study.topic}”`;
-        document.getElementById("studyStats").textContent =
-          `Runda ${s.study.round}/${s.study.max_rounds} · Stron: ${s.study.pages_read} · Faktów: ${s.study.facts_learned} · Opanowanie: ${s.study.mastery.toFixed(0)}%`;
-        document.getElementById("studyBar").style.width = Math.min(100, Math.max(8, s.study.mastery)) + "%";
-        document.getElementById("studyAction").textContent = s.study.current_action || "Analizuję...";
+        const isParquet = (s.study.topic || "").includes(".parquet") || (s.study.topic || "").includes("Polski");
+        const isTeacher = (s.study.topic || "").includes("Bielik") || (s.study.topic || "").includes("Dostrajanie dialogów");
+        document.getElementById("studyTitle").textContent = s.study.topic || "Trening GPU";
+        document.getElementById("studyStats").textContent = isTeacher
+          ? `${s.study.round}/${s.study.max_rounds} · ${s.study.mastery.toFixed(0)}%`
+          : isParquet
+            ? `Krok ${s.study.round}/${s.study.max_rounds} · ${Number(s.study.facts_learned || 0).toLocaleString("pl-PL")} zdań · ${s.study.mastery.toFixed(1)}%`
+            : `Runda ${s.study.round}/${s.study.max_rounds} · ${s.study.facts_learned} engramów · ${s.study.mastery.toFixed(0)}%`;
+        document.getElementById("studyBar").style.width = Math.min(100, Math.max(4, s.study.mastery)) + "%";
+        document.getElementById("studyAction").textContent = s.study.current_action || "Przetwarzam...";
       } else {
         sp.className = "study-progress";
       }
+
+      const tPrevBtn = document.getElementById("teacherPreviewBtn");
+      if (tPrevBtn) tPrevBtn.disabled = savedDial === 0;
+      renderTrainingFeed(s, studying);
 
       const creativityPct = Math.max(0, Math.min(100, Number(s.creativity_score ?? 44)));
       const pendingInfo = Number(s.pending_info_to_link ?? s.memory.short_term_memory_count ?? 0);
@@ -896,10 +1193,67 @@
       bar.style.background = s.state_mode.includes("REM") || s.state_mode.includes("NREM")
         ? "var(--indigo)" : (studying ? "var(--cyan)" : "var(--purple)");
 
+      const creSlider = document.getElementById("creativitySlider");
+      const creSliderVal = document.getElementById("creativitySliderVal");
+      const creLevelPct = Math.round(Math.max(0, Math.min(1, Number(s.creativity_level ?? 0.7))) * 100);
+      if (creSlider && document.activeElement !== creSlider) {
+        creSlider.value = String(creLevelPct);
+        if (creSliderVal) creSliderVal.textContent = `${creLevelPct}%`;
+      }
+
+      // Living Brain (M1/M2/M4) & Dynamic Memory Budget telemetry
+      const lb = s.living_brain;
+      if (lb) {
+        const fmtMb = (mb) => mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${Number(mb).toFixed(1)} MB`;
+        const lbBadge = document.getElementById("lbStatusBadge");
+        if (lbBadge) {
+          lbBadge.textContent = lb.budget_status || "ROŚNIE";
+          lbBadge.className = "badge " + (lb.budget_status === "ROŚNIE" ? "state-AWAKE" : (lb.budget_status === "HOMEOSTAZA" ? "state-DROWSY" : "state-STUDYING"));
+        }
+        const hwNote = lb.target_device === "gpu"
+          ? `GPU: ${lb.gpu_allocated_mb}/${lb.gpu_total_mb} MB`
+          : `RAM: ${lb.ram_rss_mb}/${lb.ram_total_mb} MB`;
+        const sumEl = document.getElementById("lbMemSummary");
+        if (sumEl) {
+          sumEl.textContent = `${fmtMb(lb.living_mb)} / ${fmtMb(lb.effective_budget_mb)} (${lb.utilization_pct}%) · Zapas: ${fmtMb(lb.headroom_mb)} · ${hwNote}`;
+        }
+        const lbBar = document.getElementById("lbMemBar");
+        if (lbBar) {
+          lbBar.style.width = Math.min(100, Math.max(1, Number(lb.utilization_pct || 0))) + "%";
+          lbBar.style.background = lb.utilization_pct >= 90 ? "var(--amber)" : "var(--cyan)";
+        }
+        const devSel = document.getElementById("lbDeviceSel");
+        if (devSel && document.activeElement !== devSel) {
+          devSel.value = lb.target_device || "gpu";
+        }
+        const bSlider = document.getElementById("lbBudgetSlider");
+        const bVal = document.getElementById("lbBudgetVal");
+        if (bSlider && document.activeElement !== bSlider) {
+          bSlider.value = String(Math.round(Number(lb.memory_budget_mb || 4096)));
+          if (bVal) bVal.textContent = fmtMb(lb.memory_budget_mb || 4096);
+        }
+        const n = lb.neurons || {};
+        document.getElementById("lbNeuronsVal").textContent = Number(n.total || 0).toLocaleString("pl-PL");
+        document.getElementById("lbLayersVal").textContent = `L1:${n.l1} L2:${n.l2} L3:${n.l3} A:${n.assoc} M4:${n.m4}`;
+        document.getElementById("lbSynVal").textContent = Number(lb.active_synapses || 0).toLocaleString("pl-PL");
+        document.getElementById("lbM2Val").textContent = String(lb.m2_episodes || 0);
+        const ls = lb.last_step || {};
+        const nm = lb.neuromodulators || {};
+        document.getElementById("lbPeVal").textContent = Number(ls.surprise || 0).toFixed(3);
+        document.getElementById("lbCurVal").textContent = Number(ls.intrinsic_curiosity || 0).toFixed(2);
+        document.getElementById("lbNmVal").textContent = `${Number(nm.noradrenaline || 0).toFixed(2)} / ${Number(nm.dopamine || 0).toFixed(2)} / ${Number(nm.acetylcholine || 0).toFixed(2)}`;
+        document.getElementById("lbTickVal").textContent = String(lb.tick_count || 0);
+        document.getElementById("lbFatVal").textContent = Number(ls.mean_fatigue || 0).toFixed(3);
+      }
+
       document.getElementById("dayVal").textContent = s.day;
       document.getElementById("sleepsVal").textContent = s.total_sleeps;
       document.getElementById("loraUpdatesVal").textContent = lc.lora_updates;
       document.getElementById("winLimVal").textContent = s.limits.working_chat_window;
+      const wmSdrEl = document.getElementById("wmSdrVal");
+      if (wmSdrEl) wmSdrEl.textContent = s.memory.working_sdr_count ?? 0;
+      const wmSdrLimEl = document.getElementById("wmSdrLimVal");
+      if (wmSdrLimEl) wmSdrLimEl.textContent = s.limits.working_sdr_capacity ?? 32;
       document.getElementById("stMemVal").textContent = s.memory.short_term_memory_count;
       document.getElementById("stLimVal").textContent = s.limits.short_term_memories;
       document.getElementById("stFactVal").textContent = s.memory.short_term_fact_count;
@@ -926,28 +1280,36 @@
       renderChat(s);
       renderMemoryTab(s);
 
-      // Sleep table (EWC Graph Loss + Language Cortex Transformer Loss on GPU)
+      // Sleep table (Pred Error + SHY Pruned Synapses + Broca Loss + REM)
       const tbody = document.getElementById("sleepTableBody");
       if (s.sleep_history.length > 0) {
         tbody.innerHTML = s.sleep_history.slice().reverse().slice(0, 6).map(r => {
-          const ewcText = (r.concept_loss_start || r.concept_loss_end)
-            ? `${Number(r.concept_loss_start).toFixed(2)}→<strong>${Number(r.concept_loss_end).toFixed(2)}</strong>`
+          const peStart = r.prediction_error_start ?? r.concept_loss_start ?? 0;
+          const peEnd = r.prediction_error_end ?? r.concept_loss_end ?? 0;
+          const peText = (peStart || peEnd)
+            ? `${Number(peStart).toFixed(4)}→<strong>${Number(peEnd).toFixed(4)}</strong>`
             : "—";
-          const lmText = r.lora_trained
-            ? `${Number(r.lora_loss_start).toFixed(2)}→<strong>${Number(r.lora_loss_end).toFixed(2)}</strong>`
+          const shyText = (r.pruned_synapses !== undefined)
+            ? `<strong>-${r.pruned_synapses}</strong> <span class="sub">(${r.active_synapses})</span>`
+            : "—";
+          const bStart = r.broca_loss_start ?? r.lora_loss_start ?? 0;
+          const bEnd = r.broca_loss_end ?? r.lora_loss_end ?? 0;
+          const lmText = (r.lora_trained || bStart || bEnd)
+            ? `${Number(bStart).toFixed(2)}→<strong>${Number(bEnd).toFixed(2)}</strong>`
             : "—";
           return `
           <tr>
             <td>#${r.night_number}</td>
             <td>${(r.duration_ms / 1000).toFixed(1)}s</td>
             <td>+${r.new_memories}</td>
-            <td>${ewcText}</td>
+            <td>${peText}</td>
+            <td>${shyText}</td>
             <td>${lmText}</td>
-            <td style="color:var(--purple)">+${(r.rem_reflections || []).length} / +${(r.rem_new_links || []).length}</td>
+            <td style="color:var(--purple)">+${(r.rem_reflections || []).length}</td>
           </tr>`;
         }).join("");
       } else {
-        tbody.innerHTML = `<tr><td colspan="6" class="sub">Brak przespanych nocy.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="7" class="sub">Brak przespanych nocy.</td></tr>`;
       }
 
       // Event log
@@ -1027,18 +1389,18 @@
         let strokeCol = "rgba(56,189,248,0.55)";
         let midX = (p1.x + p2.x) / 2;
         let midY = (p1.y + p2.y) / 2;
-        if (e.source === "REM_DREAM") {
+        if (e.source === "ACTIVE_SYNAPSE") {
+          strokeCol = "rgba(34,211,238,0.88)";
+          ctx.strokeStyle = strokeCol; ctx.lineWidth = isFocusEdge ? 2.5 : 1.9;
+          ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
+        } else if (e.source === "REM_DREAM") {
           strokeCol = "rgba(192,132,252,0.88)";
           ctx.strokeStyle = strokeCol; ctx.lineWidth = isFocusEdge ? 2.5 : 1.9;
           midX = (p1.x + p2.x) / 2 + (p1.y - p2.y) * 0.14;
           midY = (p1.y + p2.y) / 2 + (p2.x - p1.x) * 0.14;
           ctx.moveTo(p1.x, p1.y); ctx.quadraticCurveTo(midX, midY, p2.x, p2.y);
-        } else if (e.source === "HIPPOCAMPUS") {
-          strokeCol = "rgba(251,191,36,0.75)";
-          ctx.strokeStyle = strokeCol; ctx.setLineDash([4, 4]); ctx.lineWidth = isFocusEdge ? 2.1 : 1.4;
-          ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
         } else {
-          ctx.strokeStyle = strokeCol; ctx.lineWidth = isFocusEdge ? 2.2 : 1.4;
+          ctx.strokeStyle = strokeCol; ctx.lineWidth = isFocusEdge ? 2.2 : 1.3;
           ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
         }
         ctx.stroke();
@@ -1057,21 +1419,28 @@
         const p = posMap[n.id];
         const isSelected = n.id === selectedNodeId;
         const isHovered = n.id === hoveredNodeId;
+        const isActive = Boolean(n.active);
         const dim = focusId && !neighborSet.has(n.id);
-        const baseR = Math.min(9, (n.consolidated ? 6.0 : 5.0) + Math.min(3, (n.degree || 0) * 0.4));
+        const baseR = Math.min(9.5, (isActive ? 6.5 : 4.8) + Math.min(3, (n.degree || 0) * 0.35));
         ctx.save();
         ctx.globalAlpha = dim ? 0.22 : 1.0;
+        if (isActive) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, baseR + 4, 0, Math.PI * 2);
+          ctx.fillStyle = "rgba(16,185,129,0.28)";
+          ctx.fill();
+        }
         ctx.beginPath();
         ctx.arc(p.x, p.y, isSelected || isHovered ? baseR + 2 : baseR, 0, Math.PI * 2);
-        ctx.fillStyle = isSelected ? "#f43f5e" : (n.consolidated ? "#0ea5e9" : "#f59e0b");
+        ctx.fillStyle = isSelected ? "#f43f5e" : (isActive ? "#10b981" : (n.consolidated ? "#0ea5e9" : "#64748b"));
         ctx.fill();
-        if (isSelected || isHovered) {
-          ctx.lineWidth = 2;
-          ctx.strokeStyle = "#ffffff";
+        if (isSelected || isHovered || isActive) {
+          ctx.lineWidth = isActive ? 1.8 : 2;
+          ctx.strokeStyle = isActive && !isSelected ? "#6ee7b7" : "#ffffff";
           ctx.stroke();
         }
-        ctx.fillStyle = "#f1f5f9";
-        ctx.font = (isSelected || isHovered) ? "bold 11px Segoe UI" : "10.5px Segoe UI";
+        ctx.fillStyle = isActive ? "#a7f3d0" : "#cbd5e1";
+        ctx.font = (isSelected || isHovered || isActive) ? "bold 10.5px Segoe UI" : "10px Segoe UI";
         ctx.textAlign = "center";
         ctx.fillText(n.id, p.x, p.y + baseR + 11);
         ctx.restore();
@@ -1106,8 +1475,9 @@
         if (hit) {
           const edges = (latestState.graph && latestState.graph.edges) || [];
           const rels = edges.filter(e => e.src === hit.id || e.dst === hit.id).slice(0, 6)
-            .map(e => `<div>• ${escapeHtml(e.src)} —[<strong>${escapeHtml(e.rel)}</strong>]→ ${escapeHtml(e.dst)}</div>`).join("");
-          tip.innerHTML = `<strong>${escapeHtml(hit.id)}</strong> <span class="sub">(${hit.node.consolidated ? "kora" : "hipokamp"} · stopień ${hit.node.degree || 0})</span>${rels ? `<div style="margin-top:4px">${rels}</div>` : ""}`;
+            .map(e => `<div>• ${escapeHtml(e.src)} —[<strong>w=${escapeHtml(e.rel)}</strong>]→ ${escapeHtml(e.dst)}</div>`).join("");
+          const stLabel = hit.node.active ? `k-WTA AKTYWNY (${hit.node.activity})` : "spoczynkowy";
+          tip.innerHTML = `<strong>${escapeHtml(hit.id)}</strong> <span class="sub">(${stLabel} · próg ${hit.node.threshold ?? 0} · st. ${hit.node.degree || 0})</span>${rels ? `<div style="margin-top:4px">${rels}</div>` : ""}`;
           tip.style.display = "block";
           tip.style.left = Math.min(canvas.clientWidth - 240, Math.max(8, mx + 12)) + "px";
           tip.style.top = Math.max(8, my - 10) + "px";
@@ -1187,14 +1557,29 @@
       await poll();
     }
 
+    async function trainPolishParquet() {
+      savedDialoguesPreview = null;
+      trainingFeedCollapsed = false;
+      const stepsSel = document.getElementById("parquetSteps");
+      const fileSel = document.getElementById("parquetFile");
+      const maxSteps = Number(stepsSel ? stepsSel.value : 5000);
+      const pq = (latestState && latestState.parquet_corpus) || {};
+      const filename = (fileSel && fileSel.value) || pq.filename || "__ALL__";
+      const res = await api("/api/train_parquet", { filename, max_steps: maxSteps });
+      if (!res.ok) alert(res.error || "Nie udało się uruchomić nauki z pliku Parquet.");
+      await poll();
+    }
+
     async function trainLanguageNow() {
+      savedDialoguesPreview = null;
+      trainingFeedCollapsed = false;
       const btn = document.getElementById("trainLangBtn");
       if (!btn) return;
       btn.disabled = true;
       const old = btn.textContent;
       btn.textContent = "⏳ Trenuję model językowy na GPU...";
       try {
-        const res = await api("/api/train_language", { epochs: 22 });
+        const res = await api("/api/train_language", { epochs: 180 });
         if (!res.ok) alert(res.error || "Nie udało się wytrenować języka.");
       } finally {
         btn.textContent = old;
@@ -1205,6 +1590,153 @@
     async function startContinuousLearning(minutes = 60) {
       const res = await api("/api/study/continuous", { duration_minutes: minutes });
       if (!res.ok) alert(res.error || "Nie udało się uruchomić auto-nauki.");
+      await poll();
+    }
+
+    function setTrainTab(tab) {
+      for (const name of ["teacher", "parquet", "web"]) {
+        const btn = document.getElementById("trTab-" + name);
+        const pane = document.getElementById("trPane-" + name);
+        if (btn) btn.classList.toggle("active", name === tab);
+        if (pane) pane.style.display = name === tab ? "flex" : "none";
+      }
+    }
+
+    function setAuxTab(tab) {
+      for (const name of ["sleep", "log"]) {
+        const btn = document.getElementById("auxTab-" + name);
+        const pane = document.getElementById("auxPane-" + name);
+        if (btn) btn.classList.toggle("active", name === tab);
+        if (pane) pane.style.display = name === tab ? "block" : "none";
+      }
+    }
+
+    function renderTrainingFeed(s, studying) {
+      const wrap = document.getElementById("trainingFeedWrap");
+      const box = document.getElementById("trainingFeedBox");
+      const liveBadge = document.getElementById("trainingFeedLiveBadge");
+      const cntEl = document.getElementById("trainingFeedCount");
+      const toggleBtn = document.getElementById("trainingFeedToggleBtn");
+      if (!wrap || !box) return;
+
+      const liveItems = Array.isArray(s.training_dialogue_feed) ? s.training_dialogue_feed : [];
+      const maxLiveId = liveItems.length > 0 ? Number(liveItems[liveItems.length - 1].id || 0) : 0;
+      if (maxLiveId > lastLiveFeedSeq) {
+        lastLiveFeedSeq = maxLiveId;
+        savedDialoguesPreview = null;
+      }
+      const usingSaved = Boolean(savedDialoguesPreview && savedDialoguesPreview.length > 0);
+      const items = usingSaved ? savedDialoguesPreview : liveItems;
+      const isLangTraining = studying && (
+        (s.study.topic || "").includes("Bielik") ||
+        (s.study.topic || "").includes("Polski") ||
+        (s.study.topic || "").includes(".parquet") ||
+        (s.study.topic || "").includes("dialog")
+      );
+
+      if (!items.length && !isLangTraining) {
+        wrap.className = "train-feed-wrap";
+        return;
+      }
+      wrap.className = "train-feed-wrap visible";
+      if (liveBadge) liveBadge.style.display = (isLangTraining && !usingSaved) ? "inline-block" : "none";
+      if (cntEl) {
+        cntEl.textContent = items.length > 0
+          ? `(${items.length} ${usingSaved ? "zapisanych" : "wymian"})`
+          : "(czekam na pierwszą wymianę...)";
+      }
+      if (toggleBtn) toggleBtn.textContent = trainingFeedCollapsed ? "Rozwiń" : "Zwiń";
+      box.className = trainingFeedCollapsed ? "train-feed-box collapsed" : "train-feed-box";
+
+      const hash = JSON.stringify(items.map(it => [it.id, it.tag, it.prompt, it.teacher_reply, it.brain_reply])) + (isLangTraining ? "|live" : "|idle");
+      if (hash === lastTrainingFeedHash) return;
+      const wasNearBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 48;
+      lastTrainingFeedHash = hash;
+
+      if (!items.length) {
+        box.innerHTML = `<div class="sub" style="padding:6px 4px">Ładowanie modelu i generowanie pierwszych dialogów...</div>`;
+        return;
+      }
+
+      box.innerHTML = items.map(it => {
+        const promptHtml = it.prompt
+          ? `<div class="tf-bubble tf-prompt"><span class="tf-role">${escapeHtml(it.prompt_role || "Pytanie")}:</span>${escapeHtml(it.prompt)}</div>`
+          : "";
+        const teacherHtml = it.teacher_reply
+          ? `<div class="tf-bubble tf-teacher"><span class="tf-role">${escapeHtml(it.teacher_role || "Nauczyciel")}:</span>${escapeHtml(it.teacher_reply)}</div>`
+          : "";
+        const brainHtml = it.brain_reply
+          ? `<div class="tf-bubble tf-brain"><span class="tf-role">${escapeHtml(it.brain_role || "Twój mózg")}:</span>${escapeHtml(it.brain_reply)}</div>`
+          : "";
+        return `
+          <div class="tf-card">
+            <div class="tf-meta">
+              <span class="tf-tag">${escapeHtml(it.tag || "Nauka")}</span>
+              <span>${escapeHtml(it.t || "")}</span>
+            </div>
+            ${promptHtml}${teacherHtml}${brainHtml}
+          </div>`;
+      }).join("");
+
+      if (wasNearBottom) {
+        box.scrollTop = box.scrollHeight;
+      }
+    }
+
+    function toggleTrainingFeed() {
+      trainingFeedCollapsed = !trainingFeedCollapsed;
+      if (latestState) renderTrainingFeed(latestState, Boolean(latestState.study && latestState.study.active));
+    }
+
+    async function clearTrainingFeed() {
+      savedDialoguesPreview = null;
+      lastTrainingFeedHash = "";
+      await api("/api/training_feed/clear", {});
+      poll();
+    }
+
+    async function loadSavedTeacherDialogues() {
+      const res = await api("/api/teacher_dialogues?limit=80");
+      if (!res.ok) {
+        alert(res.error || "Nie udało się wczytać zapisanych dialogów.");
+        return;
+      }
+      const list = Array.isArray(res.dialogues) ? res.dialogues : [];
+      if (!list.length) {
+        alert("Brak zapisanych dialogów od Bielika.");
+        return;
+      }
+      const total = Number(res.total || list.length);
+      const offset = Math.max(0, total - list.length);
+      savedDialoguesPreview = list.map((d, i) => ({
+        id: -(i + 1),
+        t: "zapisany",
+        tag: `Zapisany dialog Bielika #${offset + i + 1}/${total}`,
+        prompt_role: "Pytanie",
+        prompt: d.q || "",
+        teacher_role: "Bielik (Nauczyciel)",
+        teacher_reply: d.a || "",
+        brain_role: "",
+        brain_reply: "",
+      }));
+      trainingFeedCollapsed = false;
+      lastTrainingFeedHash = "";
+      if (latestState) renderTrainingFeed(latestState, Boolean(latestState.study && latestState.study.active));
+      const box = document.getElementById("trainingFeedBox");
+      if (box) box.scrollTop = box.scrollHeight;
+    }
+
+    async function startBielikTeacher(skipGen = false) {
+      savedDialoguesPreview = null;
+      trainingFeedCollapsed = false;
+      const sel = document.getElementById("teacherDialoguesCount");
+      const numDialogues = Number(sel ? sel.value : 100);
+      const res = await api("/api/train_teacher", {
+        num_dialogues: numDialogues,
+        train_epochs: 160,
+        skip_generation: Boolean(skipGen),
+      });
+      if (!res.ok) alert(res.error || "Nie udało się uruchomić nauki z Bielikiem.");
       await poll();
     }
 
@@ -1296,6 +1828,41 @@
     async function toggleAutoWeb() {
       if (!latestState) return;
       await api("/api/control", { auto_web: !latestState.auto_web });
+      poll();
+    }
+    function onCreativityInput(val) {
+      const el = document.getElementById("creativitySliderVal");
+      if (el) el.textContent = `${Number(val)}%`;
+    }
+    async function applyCreativity(val) {
+      const lvl = Math.max(0, Math.min(1, Number(val) / 100));
+      await api("/api/control", { creativity_level: lvl });
+      poll();
+    }
+    function onLivingBudgetInput(val) {
+      const mb = Number(val);
+      const el = document.getElementById("lbBudgetVal");
+      if (el) el.textContent = mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(0)} MB`;
+    }
+    async function setLivingBudgetPreset(mb) {
+      const s = document.getElementById("lbBudgetSlider");
+      if (s) s.value = String(mb);
+      onLivingBudgetInput(mb);
+      await applyLivingBudget();
+    }
+    async function applyLivingBudget() {
+      const s = document.getElementById("lbBudgetSlider");
+      const d = document.getElementById("lbDeviceSel");
+      const res = await api("/api/living/budget", {
+        memory_budget_mb: Number(s ? s.value : 4096),
+        target_device: d ? d.value : "gpu",
+      });
+      if (!res.ok) alert(res.error || "Nie udało się zmienić limitu pamięci.");
+      poll();
+    }
+    async function stimulateLivingBrain(forceGrow = false) {
+      const res = await api("/api/living/stimulate", { steps: 5, force_grow: forceGrow });
+      if (!res.ok) alert(res.error || "Błąd stymulacji Living Brain.");
       poll();
     }
     async function saveBrain() { await api("/api/save", {}); poll(); }

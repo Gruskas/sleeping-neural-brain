@@ -12,6 +12,8 @@ brain_state/
 *.pt
 *.pth
 *.safetensors
+*.parquet
+*.parquet.part
 
 # IDE / OS
 .vscode/

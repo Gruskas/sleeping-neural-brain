@@ -1,854 +1,676 @@
 from __future__ import annotations
 
-import math
 import time
 import uuid
-from collections import deque
-from dataclasses import dataclass, field, asdict
-from typing import Any, Callable
+from dataclasses import dataclass, field
+from typing import Any
 
-_PL_TRANS = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZZ")
+import torch
+import torch.nn.functional as F
 
-_STOPWORDS_PL = {
-    "jest", "sa", "to", "oraz", "lub", "albo", "czy", "jak", "jaki", "jaka",
-    "jakie", "kto", "co", "czym", "gdzie", "kiedy", "dlaczego", "czemu", "dla",
-    "przez", "przy", "nad", "pod", "przed", "bez", "jako", "jego", "jej", "ich",
-    "tego", "tym", "tej", "ten", "ta", "te", "tak", "nie", "ale", "lecz", "wiec",
-    "ze", "sie", "czyli", "jednak", "rowniez", "takze", "poniewaz", "mozna",
-    "ktory", "ktora", "ktore", "ktorych", "czesto", "bardzo", "miedzy", "zwiazek",
-    "roznica", "porownaj", "laczy", "wplyw", "zalezy", "powiedz", "opowiedz",
-    "wyjasnij", "opisz", "podaj", "zdefiniuj", "napisz", "krotko", "temat",
-    "slowo", "oznacza", "wtedy", "natomiast", "ponadto", "tylko", "jeszcze",
-}
-
-_POLISH_ROOT_GROUPS: tuple[tuple[str, ...], ...] = (
-    ("slonc", "slonecz"),
-    ("oddychan", "oddech"),
-    ("czlowiek", "ludz"),
-    ("swiatl", "swietl"),
-    ("roslin", "roslinn"),
-    ("ziemi", "ziemsk"),
-    ("komork", "komor"),
-    ("energi", "energet"),
-    ("pamiec", "pamiet"),
-    ("dzien", "dni"),
-    ("procesor", "cpu"),
-    ("graficzn", "gpu"),
-    ("dysk", "ssd", "hdd"),
-    ("ram", "operacyjn"),
-    ("tlen", "tlenu", "tlenow"),
-    ("dwutlen", "co2"),
-    ("wod", "h2o"),
-)
-
-
-def _strip_pl(s: str) -> str:
-    return s.translate(_PL_TRANS)
-
-
-def _cosine(a: list[float], b: list[float]) -> float:
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    return float(sum(x * y for x, y in zip(a, b)))
-
-
-def _words_match(a: str, b: str) -> bool:
-    if a == b:
-        return True
-    if len(a) >= 4 and len(b) >= 4 and abs(len(a) - len(b)) <= 5:
-        a_stem = a[: max(4, min(len(a) - 2, 6))]
-        b_stem = b[: max(4, min(len(b) - 2, 6))]
-        if b.startswith(a_stem) or a.startswith(b_stem):
-            return True
-    for grp in _POLISH_ROOT_GROUPS:
-        a_hit = any((a == g or (len(g) >= 4 and a.startswith(g))) for g in grp)
-        if a_hit:
-            b_hit = any((b == g or (len(g) >= 4 and b.startswith(g))) for g in grp)
-            if b_hit:
-                return True
-    return False
-
-
-def _tokenize_words_norm(s: str, drop_stopwords: bool = True) -> list[str]:
-    cleaned = _strip_pl(s.lower())
-    for ch in ",.!?;:\"'()[]{}—-/\n\t":
-        cleaned = cleaned.replace(ch, " ")
-    raw = [w for w in cleaned.split() if len(w) >= 2]
-    if not drop_stopwords:
-        return [w for w in raw if len(w) >= 3 or w in ("pi", "o2", "ip", "si", "ai")]
-    filtered = [w for w in raw if w not in _STOPWORDS_PL and (len(w) >= 3 or w in ("pi", "o2", "ip", "si", "ai"))]
-    return filtered if filtered else [w for w in raw if len(w) >= 3]
-
-
-def _keyword_overlap(q: str, text: str) -> float:
-    q_words = set(_tokenize_words_norm(q, drop_stopwords=True))
-    t_words = set(_tokenize_words_norm(text, drop_stopwords=False))
-    if not q_words or not t_words:
-        return 0.0
-    inter = sum(1 for qw in q_words if any(_words_match(qw, tw) for tw in t_words))
-    return inter / max(1, len(q_words))
+from .sensory_wernicke import k_wta
 
 
 @dataclass
-class ConceptFact:
-    src: str
-    rel: str
-    dst: str
-    strength: float = 1.0
-    day: int = 1
-    source: str = "WAKE_EXPERIENCE"  # WAKE_EXPERIENCE | WEB_STUDY | CONSOLIDATED | REM_DREAM
-    bridge: str | None = None
-    consolidated: bool = False
-    timestamp: float = field(default_factory=time.time)
-
-    def key(self) -> tuple[str, str, str]:
-        return (self.src, self.rel, self.dst)
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ConceptFact":
-        return cls(**data)
-
-
-@dataclass
-class MemoryTrace:
-    """A human-like declarative memory trace with strength, recall reinforcement, topic & GPU embedding."""
-
-    text: str
-    category: str = "wiedza"  # użytkownik | wiedza | nauka_z_sieci | zasada | wydarzenie | refleksja_rem
-    importance: int = 3  # 1..5
-    strength: float = 1.2
-    recall_count: int = 0
-    day_created: int = 1
-    last_recalled_day: int = 1
-    consolidated: bool = False
-    superseded: bool = False
-    source_url: str | None = None
-    topic: str | None = None
-    embedding: list[float] = field(default_factory=list)
-    id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
-    timestamp: float = field(default_factory=time.time)
-
-    def to_public_dict(self) -> dict[str, Any]:
-        d = asdict(self)
-        d.pop("embedding", None)
-        d["strength"] = round(self.strength, 2)
-        return d
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "MemoryTrace":
-        # Backwards compatible with older checkpoints missing source_url/topic
-        valid = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
-        return cls(**valid)
-
-
-class Hippocampus:
+class EngramMeta:
     """
-    High-capacity human-like dual-memory organ:
-      - Short-term buffers (WAKE / active study): up to 5,000 declarative memories + 5,000 graph triples
-      - Long-term archives (Post-SLEEP): up to 50,000 semantic memories + 500 REM reflections + concept graph
+    Lightweight UI diagnostic metadata attached to a tensor engram.
+    STRICT ISOLATION RULE:
+      `preview_label` may ONLY be read by `/api/state` and `/api/export` for UI tabs.
+      `chat`, `chat_stream`, `BiologicalAssociativeCortex`, and `BrocaByteTransformer`
+      MUST NEVER read `preview_label`.
+    """
+
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    category: str = "wiedza"
+    preview_label: str = ""
+    sparsity_pct: float = 4.0
+    topic: str | None = None
+    source_url: str | None = None
+    timestamp: float = field(default_factory=time.time)
+    pinned: bool = False
+
+    def to_meta_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "category": self.category,
+            "preview_label": self.preview_label,
+            "sparsity_pct": round(float(self.sparsity_pct), 2),
+            "topic": self.topic,
+            "source_url": self.source_url,
+            "timestamp": self.timestamp,
+            "pinned": bool(self.pinned),
+        }
+
+    @classmethod
+    def from_meta_dict(cls, data: dict[str, Any]) -> "EngramMeta":
+        return cls(
+            id=str(data.get("id") or uuid.uuid4().hex[:8]),
+            category=str(data.get("category", "wiedza")),
+            preview_label=str(data.get("preview_label", "")),
+            sparsity_pct=float(data.get("sparsity_pct", 4.0)),
+            topic=data.get("topic"),
+            source_url=data.get("source_url"),
+            timestamp=float(data.get("timestamp", time.time())),
+            pinned=bool(data.get("pinned", False)),
+        )
+
+
+class TensorEngramBank:
+    """
+    Contiguous GPU/CPU bfloat16 engram bank:
+      - `engrams`: [M, N] bfloat16 L2-normalized sparse SDR vectors
+      - `strengths`, `importances`, `days_created`, `last_recalled_days`, `recall_counts`: 1D tensors
+      - Retrieval runs via a single matrix multiply `engrams @ q` (zero Python loops, zero string matching).
+      - Disk checkpoints serialize SDRs sparsely as `(indices int16, values bfloat16)`.
     """
 
     def __init__(
         self,
+        num_neurons: int,
+        sdr_k: int,
+        max_capacity: int,
+        device: torch.device,
+    ) -> None:
+        self.num_neurons = num_neurons
+        self.sdr_k = sdr_k
+        self.max_capacity = max_capacity
+        self.device = device
+        self.clear()
+
+    def clear(self) -> None:
+        self.engrams = torch.empty((0, self.num_neurons), dtype=torch.bfloat16, device=self.device)
+        self.strengths = torch.empty((0,), dtype=torch.float32, device=self.device)
+        self.importances = torch.empty((0,), dtype=torch.float32, device=self.device)
+        self.days_created = torch.empty((0,), dtype=torch.int32, device=self.device)
+        self.last_recalled_days = torch.empty((0,), dtype=torch.int32, device=self.device)
+        self.recall_counts = torch.empty((0,), dtype=torch.int32, device=self.device)
+        self.pinned = torch.empty((0,), dtype=torch.bool, device=self.device)
+        self.meta: list[EngramMeta] = []
+
+    def __len__(self) -> int:
+        return int(self.engrams.shape[0])
+
+    @torch.no_grad()
+    def add_batch(
+        self,
+        sdrs: torch.Tensor,
+        metas: list[EngramMeta],
+        strengths: list[float] | torch.Tensor,
+        importances: list[float] | torch.Tensor,
+        day: int,
+    ) -> list[str]:
+        if sdrs.ndim == 1:
+            sdrs = sdrs.unsqueeze(0)
+        m = int(sdrs.shape[0])
+        if m == 0:
+            return []
+
+        norm_sdrs = F.normalize(sdrs.to(device=self.device, dtype=torch.float32), dim=-1, eps=1e-6).to(torch.bfloat16)
+        st_t = (
+            strengths.to(device=self.device, dtype=torch.float32)
+            if isinstance(strengths, torch.Tensor)
+            else torch.tensor(strengths, dtype=torch.float32, device=self.device)
+        )
+        imp_t = (
+            importances.to(device=self.device, dtype=torch.float32)
+            if isinstance(importances, torch.Tensor)
+            else torch.tensor(importances, dtype=torch.float32, device=self.device)
+        )
+        day_t = torch.full((m,), int(day), dtype=torch.int32, device=self.device)
+        rec_t = torch.zeros((m,), dtype=torch.int32, device=self.device)
+        pin_t = torch.tensor([bool(item.pinned) for item in metas], dtype=torch.bool, device=self.device)
+
+        self.engrams = torch.cat([self.engrams, norm_sdrs], dim=0)
+        self.strengths = torch.cat([self.strengths, st_t], dim=0)
+        self.importances = torch.cat([self.importances, imp_t], dim=0)
+        self.days_created = torch.cat([self.days_created, day_t], dim=0)
+        self.last_recalled_days = torch.cat([self.last_recalled_days, day_t.clone()], dim=0)
+        self.recall_counts = torch.cat([self.recall_counts, rec_t], dim=0)
+        self.pinned = torch.cat([self.pinned, pin_t], dim=0)
+        self.meta.extend(metas)
+
+        self._enforce_capacity()
+        return [item.id for item in metas]
+
+    @torch.no_grad()
+    def _enforce_capacity(self) -> None:
+        n = len(self)
+        if n <= self.max_capacity:
+            return
+        pinned_idx = torch.nonzero(self.pinned, as_tuple=False).squeeze(-1)
+        unpinned_idx = torch.nonzero(~self.pinned, as_tuple=False).squeeze(-1)
+        if pinned_idx.numel() >= self.max_capacity:
+            # Core identity & pinned memories are NEVER evicted
+            keep_idx, _ = torch.sort(pinned_idx)
+            self._slice_in_place(keep_idx)
+            return
+        rem_slots = self.max_capacity - int(pinned_idx.numel())
+        if int(unpinned_idx.numel()) <= rem_slots:
+            return
+        # Retain all pinned engrams + highest-priority unpinned engrams (importance, strength, recency)
+        priority = self.importances * 2.0 + self.strengths + self.last_recalled_days.float() * 0.05
+        unpinned_prio = priority.index_select(0, unpinned_idx)
+        top_rel = torch.topk(unpinned_prio, k=rem_slots, largest=True, sorted=False).indices
+        keep_unpinned = unpinned_idx.index_select(0, top_rel)
+        keep_idx = torch.cat([pinned_idx, keep_unpinned], dim=0)
+        keep_idx, _ = torch.sort(keep_idx)
+        self._slice_in_place(keep_idx)
+
+    @torch.no_grad()
+    def _slice_in_place(self, keep_idx: torch.Tensor) -> None:
+        self.engrams = self.engrams.index_select(0, keep_idx).contiguous()
+        self.strengths = self.strengths.index_select(0, keep_idx).contiguous()
+        self.importances = self.importances.index_select(0, keep_idx).contiguous()
+        self.days_created = self.days_created.index_select(0, keep_idx).contiguous()
+        self.last_recalled_days = self.last_recalled_days.index_select(0, keep_idx).contiguous()
+        self.recall_counts = self.recall_counts.index_select(0, keep_idx).contiguous()
+        self.pinned = self.pinned.index_select(0, keep_idx).contiguous()
+        keep_list = keep_idx.cpu().tolist()
+        self.meta = [self.meta[i] for i in keep_list]
+
+    @torch.no_grad()
+    def recall_tensor(
+        self,
+        query_sdr: torch.Tensor,
+        top_k: int,
+        current_day: int,
+        min_sim: float = 0.05,
+    ) -> dict[str, Any]:
+        """
+        Pure GPU matrix-multiply recall `engrams @ q`.
+        NEVER accesses or returns `preview_label`.
+        """
+        n = len(self)
+        if n == 0 or top_k <= 0:
+            return {
+                "ids": [],
+                "scores": [],
+                "indices": [],
+                "engrams": torch.empty((0, self.num_neurons), dtype=torch.bfloat16, device=self.device),
+            }
+
+        q = F.normalize(query_sdr.to(device=self.device, dtype=torch.float32).reshape(-1), dim=-1, eps=1e-6)
+        q_bf16 = q.to(torch.bfloat16)
+        # Single matmul on GPU: [M, N] @ [N] -> [M]
+        sims = torch.mv(self.engrams, q_bf16).float()
+        weighted = sims * (0.85 + 0.15 * torch.clamp(self.strengths / 3.0, min=0.2, max=1.5))
+
+        k = min(int(top_k), n)
+        vals, idxs = torch.topk(weighted, k=k, largest=True, sorted=True)
+        raw_sims = sims.index_select(0, idxs)
+        valid_mask = raw_sims >= min_sim
+        if not valid_mask.any():
+            return {
+                "ids": [],
+                "scores": [],
+                "indices": [],
+                "engrams": torch.empty((0, self.num_neurons), dtype=torch.bfloat16, device=self.device),
+            }
+
+        sel_idx = idxs[valid_mask]
+        sel_scores = raw_sims[valid_mask]
+
+        # Biological testing effect: recalling an engram strengthens it slightly
+        self.recall_counts.index_add_(0, sel_idx, torch.ones_like(sel_idx, dtype=torch.int32))
+        self.last_recalled_days[sel_idx] = int(current_day)
+        self.strengths[sel_idx] = torch.clamp(self.strengths[sel_idx] + 0.05, max=6.0)
+
+        idx_list = sel_idx.cpu().tolist()
+        score_list = [round(float(s), 4) for s in sel_scores.cpu().tolist()]
+        ids = [self.meta[i].id for i in idx_list]
+        return {
+            "ids": ids,
+            "scores": score_list,
+            "indices": idx_list,
+            "engrams": self.engrams.index_select(0, sel_idx),
+        }
+
+    @torch.no_grad()
+    def delete_by_id(self, engram_id: str) -> bool:
+        target = engram_id.strip()
+        if not target or len(self) == 0:
+            return False
+        keep = [i for i, m in enumerate(self.meta) if m.id != target]
+        if len(keep) == len(self.meta):
+            return False
+        if not keep:
+            self.clear()
+            return True
+        keep_idx = torch.tensor(keep, dtype=torch.long, device=self.device)
+        self._slice_in_place(keep_idx)
+        return True
+
+    def clear_preview_labels(self, replacement: str = "") -> None:
+        """Erase/overwrite diagnostic preview labels (proves chat never depends on them)."""
+        for m in self.meta:
+            m.preview_label = replacement
+
+    @torch.no_grad()
+    def export_sparse_tensors(self) -> dict[str, Any]:
+        """Serialize SDR engrams compactly as sparse (indices int16, values bfloat16)."""
+        n = len(self)
+        k = min(self.sdr_k, self.num_neurons)
+        if n == 0:
+            return {
+                "indices": torch.empty((0, k), dtype=torch.int16),
+                "values": torch.empty((0, k), dtype=torch.bfloat16),
+                "strengths": torch.empty((0,), dtype=torch.float32),
+                "importances": torch.empty((0,), dtype=torch.float32),
+                "days_created": torch.empty((0,), dtype=torch.int32),
+                "last_recalled_days": torch.empty((0,), dtype=torch.int32),
+                "recall_counts": torch.empty((0,), dtype=torch.int32),
+                "pinned": torch.empty((0,), dtype=torch.bool),
+            }
+        vals, idxs = torch.topk(self.engrams.float(), k=k, dim=-1, largest=True, sorted=True)
+        return {
+            "indices": idxs.to(dtype=torch.int16).cpu(),
+            "values": vals.to(dtype=torch.bfloat16).cpu(),
+            "strengths": self.strengths.detach().cpu(),
+            "importances": self.importances.detach().cpu(),
+            "days_created": self.days_created.detach().cpu(),
+            "last_recalled_days": self.last_recalled_days.detach().cpu(),
+            "recall_counts": self.recall_counts.detach().cpu(),
+            "pinned": self.pinned.detach().cpu(),
+        }
+
+    @torch.no_grad()
+    def import_sparse_tensors(self, tensor_state: dict[str, Any], meta_list: list[dict[str, Any]]) -> None:
+        self.clear()
+        idxs: torch.Tensor = tensor_state["indices"]
+        vals: torch.Tensor = tensor_state["values"]
+        n = int(idxs.shape[0])
+        if n == 0:
+            return
+        dense = torch.zeros((n, self.num_neurons), dtype=torch.bfloat16, device=self.device)
+        dense.scatter_(-1, idxs.to(device=self.device, dtype=torch.long), vals.to(device=self.device, dtype=torch.bfloat16))
+        self.engrams = dense
+        self.strengths = tensor_state["strengths"].to(device=self.device, dtype=torch.float32)
+        self.importances = tensor_state["importances"].to(device=self.device, dtype=torch.float32)
+        self.days_created = tensor_state["days_created"].to(device=self.device, dtype=torch.int32)
+        self.last_recalled_days = tensor_state["last_recalled_days"].to(device=self.device, dtype=torch.int32)
+        self.recall_counts = tensor_state["recall_counts"].to(device=self.device, dtype=torch.int32)
+        self.meta = [EngramMeta.from_meta_dict(d) for d in meta_list[:n]]
+        while len(self.meta) < n:
+            self.meta.append(EngramMeta())
+        meta_pinned = torch.tensor([bool(m.pinned) for m in self.meta], dtype=torch.bool, device=self.device)
+        if "pinned" in tensor_state and isinstance(tensor_state["pinned"], torch.Tensor) and int(tensor_state["pinned"].shape[0]) == n:
+            self.pinned = tensor_state["pinned"].to(device=self.device, dtype=torch.bool) | meta_pinned
+        else:
+            self.pinned = meta_pinned
+        for i, p_flag in enumerate(self.pinned.cpu().tolist()):
+            self.meta[i].pinned = bool(p_flag)
+
+    def to_meta_list(self) -> list[dict[str, Any]]:
+        return [m.to_meta_dict() for m in self.meta]
+
+    @torch.no_grad()
+    def to_public_list(self, limit: int = 120, sort_by_strength: bool = False) -> list[dict[str, Any]]:
+        """
+        Diagnostic view STRICTLY for `/api/state` and `/api/export` UI tabs.
+        Includes `strength`, `sparsity_pct`, and diagnostic `preview_label`.
+        """
+        n = len(self)
+        if n == 0:
+            return []
+        strengths_cpu = self.strengths.detach().cpu().tolist()
+        imps_cpu = self.importances.detach().cpu().tolist()
+        days_cpu = self.days_created.detach().cpu().tolist()
+        rec_days_cpu = self.last_recalled_days.detach().cpu().tolist()
+        rec_cnt_cpu = self.recall_counts.detach().cpu().tolist()
+
+        indices = list(range(n))
+        if sort_by_strength:
+            indices.sort(key=lambda i: (rec_days_cpu[i], strengths_cpu[i], imps_cpu[i]), reverse=True)
+            indices = indices[:limit]
+        else:
+            indices = indices[-limit:]
+
+        out: list[dict[str, Any]] = []
+        for i in indices:
+            m = self.meta[i]
+            out.append(
+                {
+                    "id": m.id,
+                    "category": m.category,
+                    "preview_label": m.preview_label,
+                    "text": m.preview_label,  # UI tab display alias (never used by chat/Broca)
+                    "importance": int(round(imps_cpu[i])),
+                    "strength": round(float(strengths_cpu[i]), 2),
+                    "sparsity_pct": round(float(m.sparsity_pct), 2),
+                    "recall_count": int(rec_cnt_cpu[i]),
+                    "day_created": int(days_cpu[i]),
+                    "last_recalled_day": int(rec_days_cpu[i]),
+                    "topic": m.topic,
+                    "source_url": m.source_url,
+                    "timestamp": m.timestamp,
+                    "pinned": bool(m.pinned),
+                }
+            )
+        return out
+
+
+class Hippocampus:
+    """
+    GPU-resident Tensor Hippocampus (bfloat16 engram banks + sparse SDR persistence):
+      - `short_term` (Hipokamp): fresh wake SDR engrams before sleep consolidation
+      - `semantic` (Pamięć trwała): consolidated generalized SDR prototypes
+      - `rem` (REM): hybrid engrams synthesized during vectorized GPU REM dreaming
+    """
+
+    def __init__(
+        self,
+        num_neurons: int = 2048,
+        sdr_k: int = 82,
         max_short_term_memories: int = 5000,
-        max_short_term_facts: int = 5000,
         max_semantic_memories: int = 50000,
         max_rem_reflections: int = 500,
+        device: torch.device | None = None,
     ) -> None:
-        self.max_short_term_memories = max_short_term_memories
-        self.max_short_term_facts = max_short_term_facts
-        self.max_semantic_memories = max_semantic_memories
-        self.max_rem_reflections = max_rem_reflections
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.num_neurons = num_neurons
+        self.sdr_k = sdr_k
 
-        # Short-term (WAKE & Web Study)
-        self.short_term_facts: list[ConceptFact] = []
-        self.short_term_memories: list[MemoryTrace] = []
-
-        # Long-term (Post-SLEEP)
-        self.consolidated_facts: dict[tuple[str, str, str], ConceptFact] = {}
-        self.rem_dream_links: dict[tuple[str, str, str], ConceptFact] = {}
-        self.semantic_memories: list[MemoryTrace] = []
-        self.rem_reflections: list[MemoryTrace] = []
-        self.episodic_memories: list[MemoryTrace] = []
+        self.short_term = TensorEngramBank(num_neurons, sdr_k, max_short_term_memories, self.device)
+        self.semantic = TensorEngramBank(num_neurons, sdr_k, max_semantic_memories, self.device)
+        self.rem = TensorEngramBank(num_neurons, sdr_k, max_rem_reflections, self.device)
         self.studied_topics: dict[str, dict[str, Any]] = {}
 
-    def record_fact(
+    @torch.no_grad()
+    def record_engram(
         self,
-        src: str,
-        rel: str,
-        dst: str,
-        day: int,
-        strength: float = 1.0,
-        source: str = "WAKE_EXPERIENCE",
-    ) -> ConceptFact:
-        fact = ConceptFact(
-            src=src.strip().lower()[:60],
-            rel=rel.strip().lower()[:40],
-            dst=dst.strip().lower()[:60],
-            strength=strength,
-            day=day,
-            source=source,
-            consolidated=False,
-        )
-        for existing in self.short_term_facts:
-            if existing.key() == fact.key():
-                existing.strength = min(4.0, existing.strength + 0.5)
-                existing.timestamp = time.time()
-                return existing
-        self.short_term_facts.append(fact)
-        if len(self.short_term_facts) > self.max_short_term_facts:
-            self.short_term_facts = self.short_term_facts[-self.max_short_term_facts :]
-        return fact
-
-    def record_memory(
-        self,
-        text: str,
-        category: str,
-        importance: int,
-        day: int,
-        embedding: list[float] | None = None,
+        sdr: torch.Tensor,
+        preview_label: str = "",
+        category: str = "wiedza",
+        importance: int = 3,
+        day: int = 1,
+        strength: float = 1.2,
+        sparsity_pct: float = 4.0,
+        topic: str | None = None,
         source_url: str | None = None,
-        topic: str | None = None,
-    ) -> MemoryTrace:
-        clean = text.strip()
-        emb = embedding or []
-
-        for existing in self.short_term_memories:
-            sim_thresh = 0.86 if category == "rozmowa" else 0.92
-            if existing.text.lower() == clean.lower() or (emb and _cosine(existing.embedding, emb) > sim_thresh):
-                if category == "rozmowa":
-                    existing.text = clean
-                existing.strength = min(4.0, existing.strength + 0.4)
-                existing.importance = max(existing.importance, importance)
-                existing.timestamp = time.time()
-                return existing
-
-        trace = MemoryTrace(
-            text=clean,
-            category=category,
-            importance=max(1, min(5, importance)),
-            strength=0.8 + importance * 0.28,
-            day_created=day,
-            last_recalled_day=day,
-            consolidated=False,
-            source_url=source_url,
-            topic=topic,
-            embedding=emb,
-        )
-        self.short_term_memories.append(trace)
-        if len(self.short_term_memories) > self.max_short_term_memories:
-            # Drop lowest-importance oldest short-term memory only if 5,000+ exceeded
-            self.short_term_memories.sort(key=lambda m: (m.importance, m.timestamp), reverse=True)
-            self.short_term_memories = self.short_term_memories[: self.max_short_term_memories]
-        return trace
-
-    def record_episodic(
-        self,
-        text: str,
-        day: int,
-        embedding: list[float] | None = None,
-    ) -> MemoryTrace:
-        clean = text.strip()
-        emb = embedding or []
-        for existing in self.episodic_memories[-12:]:
-            if existing.text.lower() == clean.lower() or (emb and _cosine(existing.embedding, emb) > 0.90):
-                existing.text = clean
-                existing.timestamp = time.time()
-                return existing
-        trace = MemoryTrace(
-            text=clean,
-            category="rozmowa",
-            importance=3,
-            strength=1.4,
-            day_created=day,
-            last_recalled_day=day,
-            consolidated=True,
-            embedding=emb,
-        )
-        self.episodic_memories.append(trace)
-        if len(self.episodic_memories) > 1000:
-            self.episodic_memories = self.episodic_memories[-1000:]
-        return trace
-
-    def add_rem_reflection(
-        self,
-        text: str,
-        day: int,
-        embedding: list[float] | None = None,
-        topic: str | None = None,
-    ) -> MemoryTrace:
-        clean = text.strip()
-        for existing in self.rem_reflections:
-            if existing.text.lower() == clean.lower():
-                existing.strength = min(5.0, existing.strength + 0.3)
-                return existing
-        trace = MemoryTrace(
-            text=clean,
-            category="refleksja_rem",
-            importance=4,
-            strength=1.6,
-            day_created=day,
-            last_recalled_day=day,
-            consolidated=True,
-            topic=topic,
-            embedding=embedding or [],
-        )
-        self.rem_reflections.append(trace)
-        if len(self.rem_reflections) > self.max_rem_reflections:
-            self.rem_reflections = self.rem_reflections[-self.max_rem_reflections :]
-        return trace
-
-    def search_memories(
-        self,
-        query_vec: list[float],
-        query_text: str,
-        current_day: int,
-        top_hippo: int = 14,
-        top_semantic: int = 16,
-        top_rem: int = 8,
-    ) -> dict[str, list[MemoryTrace]]:
-        def score_trace(m: MemoryTrace) -> float:
-            if m.superseded:
-                return -999.0
-            cos = _cosine(query_vec, m.embedding) if (query_vec and m.embedding) else 0.0
-            kw_text = _keyword_overlap(query_text, m.text)
-            kw_topic = _keyword_overlap(query_text, m.topic or "")
-            # Reject completely unrelated memories before adding strength/importance bonuses
-            if cos < 0.18 and kw_text == 0.0 and kw_topic == 0.0:
-                return 0.0
-            # Strong lexical/topic boost so directly learned definitions ALWAYS rank #1!
-            exact_boost = 0.48 * kw_text + 0.35 * kw_topic
-            strength_bonus = min(0.25, math.log1p(max(0.0, m.strength)) * 0.10)
-            core_bonus = 0.08 if m.category == "użytkownik" and m.importance >= 4 else 0.0
-            imp_bonus = 0.12 if m.importance >= 5 else 0.0
-            return 0.42 * cos + exact_boost + strength_bonus + core_bonus + imp_bonus
-
-        # 1) Short-term Hippocampus (today's chats + recent web study)
-        scored_hippo = sorted(self.short_term_memories, key=score_trace, reverse=True)
-        hippo_hits = [m for m in scored_hippo if score_trace(m) >= 0.22][:top_hippo]
-
-        # 2) Long-term consolidated Semantic Cortex
-        active_sem = [m for m in self.semantic_memories if not m.superseded]
-        scored_sem = sorted(active_sem, key=score_trace, reverse=True)
-        sem_hits: list[MemoryTrace] = []
-        seen_ids: set[str] = set()
-
-        for m in scored_sem:
-            if m.id in seen_ids:
-                continue
-            sc = score_trace(m)
-            if sc < 0.22:
-                break
-            sem_hits.append(m)
-            seen_ids.add(m.id)
-            m.recall_count += 1
-            m.last_recalled_day = current_day
-            m.strength = min(6.0, m.strength + 0.15)
-            if len(sem_hits) >= top_semantic:
-                break
-
-        # 3) REM Reflections
-        scored_rem = sorted(self.rem_reflections, key=score_trace, reverse=True)
-        rem_hits = [m for m in scored_rem[:top_rem] if score_trace(m) >= 0.22]
-
-        # Separate user profile facts so greetings know user's name without polluting unrelated search pills
-        user_profile = [
-            m for m in (self.short_term_memories + active_sem)
-            if not m.superseded and m.category == "użytkownik"
-        ][:8]
-
-        # Episodic conversation & event memories (preserved across sleeps)
-        episodic_pool = [
-            m for m in (self.episodic_memories + self.short_term_memories + active_sem)
-            if not m.superseded and m.category in ("rozmowa", "wydarzenie")
-        ]
-        episodic_pool.sort(key=lambda m: (score_trace(m) >= 0.18, m.timestamp), reverse=True)
-        episodic_hits = episodic_pool[:8]
-
-        return {
-            "hippocampus": hippo_hits,
-            "semantic": sem_hits,
-            "rem": rem_hits,
-            "user_profile": user_profile,
-            "episodic": episodic_hits,
-        }
-
-    def find_concept_paths(
-        self,
-        query_terms: list[str],
-        max_hops: int = 3,
-        max_paths: int = 6,
-    ) -> list[dict[str, Any]]:
-        """Find multi-hop connecting paths across consolidated, REM, and short-term facts."""
-        all_facts = (
-            list(self.consolidated_facts.values())
-            + list(self.short_term_facts)
-            + list(self.rem_dream_links.values())
-        )
-        if not all_facts or not query_terms:
-            return []
-
-        adj: dict[str, list[tuple[str, str, str, str, float, str | None]]] = {}
-        nodes_set: set[str] = set()
-        for f in all_facts:
-            u, rel, v = f.src.strip().lower(), f.rel.strip().lower(), f.dst.strip().lower()
-            if not u or not v or u == v:
-                continue
-            nodes_set.add(u)
-            nodes_set.add(v)
-            adj.setdefault(u, []).append((v, rel, "out", f.source, float(f.strength), f.bridge))
-            adj.setdefault(v, []).append((u, rel, "in", f.source, float(f.strength), f.bridge))
-
-        if not nodes_set:
-            return []
-
-        nodes_list = sorted(nodes_set)
-        node_norm_map = {n: _strip_pl(n) for n in nodes_list}
-        node_words_map = {n: set(_tokenize_words_norm(n, drop_stopwords=False)) for n in nodes_list}
-
-        def resolve_term(term: str) -> list[str]:
-            t_clean = term.strip().lower()
-            if not t_clean:
-                return []
-            t_norm = _strip_pl(t_clean)
-            t_words = [w for w in _tokenize_words_norm(t_clean, drop_stopwords=True)]
-            if not t_words:
-                return []
-            scored: list[tuple[float, str]] = []
-            for n in nodes_list:
-                n_norm = node_norm_map[n]
-                if n == t_clean or n_norm == t_norm:
-                    scored.append((10.0, n))
-                    continue
-                n_words = node_words_map[n]
-                if not n_words:
-                    continue
-                hits = sum(1 for tw in t_words if any(_words_match(tw, nw) for nw in n_words))
-                if hits == 0:
-                    continue
-                cov_q = hits / len(t_words)
-                cov_n = hits / len(n_words)
-                substr_bonus = 0.4 if (len(t_norm) >= 4 and (t_norm in n_norm or n_norm in t_norm)) else 0.0
-                score = 2.0 * cov_q + 1.2 * cov_n + substr_bonus
-                if score >= 1.1:
-                    scored.append((score, n))
-            scored.sort(key=lambda x: (-x[0], len(x[1])))
-            return [n for _, n in scored[:2]]
-
-        resolved_groups: list[list[str]] = []
-        seen_resolved: set[str] = set()
-        for term in query_terms:
-            matches = resolve_term(term)
-            fresh = [m for m in matches if m not in seen_resolved]
-            if fresh:
-                resolved_groups.append(fresh)
-                seen_resolved.update(fresh)
-
-        all_resolved = [n for grp in resolved_groups for n in grp]
-        if not all_resolved:
-            return []
-
-        def format_summary(steps: list[dict[str, Any]]) -> str:
-            if not steps:
-                return ""
-            parts: list[str] = []
-            first = steps[0]
-            if first["direction"] == "out":
-                parts.append(f"{first['src']} —({first['rel']})→ {first['dst']}")
-            else:
-                parts.append(f"{first['dst']} ←({first['rel']})— {first['src']}")
-            for st in steps[1:]:
-                if st["direction"] == "out":
-                    parts.append(f"—({st['rel']})→ {st['dst']}")
-                else:
-                    parts.append(f"←({st['rel']})— {st['src']}")
-            return " ".join(parts)
-
-        results: list[dict[str, Any]] = []
-        seen_summaries: set[str] = set()
-
-        if len(resolved_groups) >= 2:
-            # Find shortest connecting paths across distinct resolved concept groups
-            candidate_paths: list[tuple[float, dict[str, Any]]] = []
-            for i in range(len(resolved_groups)):
-                for j in range(i + 1, len(resolved_groups)):
-                    for start in resolved_groups[i]:
-                        for end in resolved_groups[j]:
-                            if start == end:
-                                continue
-                            # BFS up to max_hops
-                            queue: deque[tuple[str, list[dict[str, Any]]]] = deque([(start, [])])
-                            visited_depth: dict[str, int] = {start: 0}
-                            found_for_pair: list[tuple[float, dict[str, Any]]] = []
-                            while queue:
-                                cur, path_steps = queue.popleft()
-                                if len(path_steps) >= max_hops:
-                                    continue
-                                edges = sorted(
-                                    adj.get(cur, []),
-                                    key=lambda e: (e[3] == "REM_DREAM", -e[4]),
-                                )
-                                for nxt, rel, direction, source, strength, _bridge in edges:
-                                    if any(
-                                        (s["src"] == nxt or s["dst"] == nxt)
-                                        for s in path_steps
-                                    ):
-                                        continue
-                                    step_dict = {
-                                        "src": cur if direction == "out" else nxt,
-                                        "rel": rel,
-                                        "dst": nxt if direction == "out" else cur,
-                                        "direction": direction,
-                                        "source": source,
-                                    }
-                                    new_steps = path_steps + [step_dict]
-                                    if nxt == end:
-                                        bridges = []
-                                        cur_node = start
-                                        for st in new_steps[:-1]:
-                                            cur_node = st["dst"] if st["direction"] == "out" else st["src"]
-                                            if cur_node not in (start, end) and cur_node not in bridges:
-                                                bridges.append(cur_node)
-                                        rem_penalty = sum(0.6 for st in new_steps if st["source"] == "REM_DREAM")
-                                        hub_penalty = sum(
-                                            0.35 for b in bridges if len(adj.get(b, [])) > 12
-                                        )
-                                        rank_cost = len(new_steps) + rem_penalty + hub_penalty
-                                        candidate_paths.append(
-                                            (
-                                                rank_cost,
-                                                {
-                                                    "start": start,
-                                                    "end": end,
-                                                    "hops": len(new_steps),
-                                                    "steps": new_steps,
-                                                    "bridges": bridges,
-                                                    "summary": format_summary(new_steps),
-                                                },
-                                            )
-                                        )
-                                        found_for_pair.append(candidate_paths[-1])
-                                        if len(found_for_pair) >= 2:
-                                            break
-                                    elif len(new_steps) < max_hops:
-                                        prev_d = visited_depth.get(nxt)
-                                        if prev_d is None or len(new_steps) <= prev_d:
-                                            visited_depth[nxt] = len(new_steps)
-                                            queue.append((nxt, new_steps))
-                                if len(found_for_pair) >= 2:
-                                    break
-
-            candidate_paths.sort(key=lambda x: (x[0], x[1]["hops"], x[1]["summary"]))
-            for _, p in candidate_paths:
-                if p["summary"] in seen_summaries:
-                    continue
-                seen_summaries.add(p["summary"])
-                results.append(p)
-                if len(results) >= max_paths:
-                    break
-
-        if not results and all_resolved:
-            # Single-concept fallback: return top 1-hop and 2-hop chains
-            anchor = all_resolved[0]
-            seen_pairs: set[tuple[str, str]] = set()
-            one_hop = sorted(
-                adj.get(anchor, []),
-                key=lambda e: (e[3] == "REM_DREAM", -e[4]),
-            )
-            for nxt, rel, direction, source, strength, _ in one_hop[:4]:
-                if (anchor, nxt) in seen_pairs:
-                    continue
-                seen_pairs.add((anchor, nxt))
-                st1 = {
-                    "src": anchor if direction == "out" else nxt,
-                    "rel": rel,
-                    "dst": nxt if direction == "out" else anchor,
-                    "direction": direction,
-                    "source": source,
-                }
-                # Try extending 1 more hop if informative
-                ext_edges = [
-                    e for e in sorted(adj.get(nxt, []), key=lambda e: (e[3] == "REM_DREAM", -e[4]))
-                    if e[0] != anchor and (anchor, e[0]) not in seen_pairs
-                ]
-                if ext_edges and len(results) < 2:
-                    nxt2, rel2, dir2, src2, _, _ = ext_edges[0]
-                    st2 = {
-                        "src": nxt if dir2 == "out" else nxt2,
-                        "rel": rel2,
-                        "dst": nxt2 if dir2 == "out" else nxt,
-                        "direction": dir2,
-                        "source": src2,
-                    }
-                    steps = [st1, st2]
-                    summ = format_summary(steps)
-                    if summ not in seen_summaries:
-                        seen_summaries.add(summ)
-                        results.append(
-                            {
-                                "start": anchor,
-                                "end": nxt2,
-                                "hops": 2,
-                                "steps": steps,
-                                "bridges": [nxt],
-                                "summary": summ,
-                            }
-                        )
-                        continue
-                steps = [st1]
-                summ = format_summary(steps)
-                if summ not in seen_summaries:
-                    seen_summaries.add(summ)
-                    results.append(
-                        {
-                            "start": anchor,
-                            "end": nxt,
-                            "hops": 1,
-                            "steps": steps,
-                            "bridges": [],
-                            "summary": summ,
-                        }
-                    )
-                if len(results) >= min(4, max_paths):
-                    break
-
-        return results[:max_paths]
-
-    def search_memories_multihop(
-        self,
-        query_vec: list[float],
-        query_text: str,
-        sub_queries: list[str],
-        sub_vecs: list[list[float]],
-        bridge_terms: list[str],
-        current_day: int,
-        top_hippo: int = 14,
-        top_semantic: int = 18,
-        top_rem: int = 8,
-    ) -> dict[str, list[MemoryTrace]]:
-        base = self.search_memories(
-            query_vec=query_vec,
-            query_text=query_text,
-            current_day=current_day,
-            top_hippo=top_hippo,
-            top_semantic=top_semantic,
-            top_rem=top_rem,
-        )
-        if not sub_queries or (len(sub_queries) < 2 and not bridge_terms):
-            return base
-
-        hippo_hits = list(base["hippocampus"])
-        sem_hits = list(base["semantic"])
-        rem_hits = list(base["rem"])
-        seen_hippo = {m.id for m in hippo_hits}
-        seen_sem = {m.id for m in sem_hits}
-        seen_rem = {m.id for m in rem_hits}
-        active_sem = [m for m in self.semantic_memories if not m.superseded]
-
-        def score_sub(m: MemoryTrace, sq: str, sv: list[float]) -> float:
-            if m.superseded:
-                return -999.0
-            cos = _cosine(sv, m.embedding) if (sv and m.embedding) else 0.0
-            kw_text = _keyword_overlap(sq, m.text)
-            kw_topic = _keyword_overlap(sq, m.topic or "")
-            if kw_text == 0.0 and kw_topic == 0.0 and cos < 0.45:
-                return 0.0
-            return 0.42 * cos + 0.52 * kw_text + 0.35 * kw_topic + (0.08 if m.importance >= 5 else 0.0)
-
-        for sq, sv in zip(sub_queries[:5], sub_vecs[:5]):
-            for pool, seen_set, out_list, is_sem in (
-                (self.short_term_memories, seen_hippo, hippo_hits, False),
-                (active_sem, seen_sem, sem_hits, True),
-                (self.rem_reflections, seen_rem, rem_hits, False),
-            ):
-                scored = sorted(pool, key=lambda m: score_sub(m, sq, sv), reverse=True)
-                added = 0
-                for m in scored:
-                    if m.id in seen_set:
-                        continue
-                    if score_sub(m, sq, sv) < 0.25:
-                        break
-                    out_list.append(m)
-                    seen_set.add(m.id)
-                    if is_sem:
-                        m.recall_count += 1
-                        m.last_recalled_day = current_day
-                        m.strength = min(6.0, m.strength + 0.12)
-                    added += 1
-                    if added >= 4:
-                        break
-
-        for bt in bridge_terms[:4]:
-            if not bt or len(bt.strip()) < 3:
-                continue
-            for pool, seen_set, out_list, is_sem in (
-                (self.short_term_memories, seen_hippo, hippo_hits, False),
-                (active_sem, seen_sem, sem_hits, True),
-            ):
-                matches = [
-                    m for m in pool
-                    if m.id not in seen_set
-                    and (_keyword_overlap(bt, m.text) > 0.0 or _keyword_overlap(bt, m.topic or "") > 0.0)
-                ]
-                matches.sort(key=lambda m: (_keyword_overlap(bt, m.text), m.importance, m.strength), reverse=True)
-                for m in matches[:2]:
-                    out_list.append(m)
-                    seen_set.add(m.id)
-                    if is_sem:
-                        m.recall_count += 1
-                        m.last_recalled_day = current_day
-
-        return {
-            "hippocampus": hippo_hits[: top_hippo + 6],
-            "semantic": sem_hits[: top_semantic + 8],
-            "rem": rem_hits[: top_rem + 4],
-            "user_profile": base["user_profile"],
-            "episodic": base["episodic"],
-        }
-
-    def consolidate_declarative_memories(
-        self,
-        language_cortex: Any | None,
-        decay: float,
-        prune_threshold: float,
-        current_day: int,
-        contradiction_checker: Callable[[str, list[str]], int | None] | None = None,
+        pinned: bool = False,
     ) -> dict[str, Any]:
-        new_count = 0
-        updated_count = 0
-        reinforced_count = 0
-        new_texts: list[str] = []
-        seen_new_texts: set[str] = set()
-
-        def add_new_text(txt: str) -> None:
-            if txt not in seen_new_texts:
-                seen_new_texts.add(txt)
-                new_texts.append(txt)
-
-        checker = contradiction_checker
-        if checker is None and language_cortex is not None and language_cortex.ready:
-            checker = language_cortex.check_memory_update
-
-        active_sem = [m for m in self.semantic_memories if not m.superseded]
-
-        # Only run LLM contradiction check on user/rule memories (skip bulk web encyclopedia facts for speed)
-        for m in self.short_term_memories:
-            dup = None
-            for old in active_sem:
-                if old.text.lower() == m.text.lower() or (
-                    m.embedding and old.embedding and _cosine(m.embedding, old.embedding) > 0.91
-                ):
-                    dup = old
-                    break
-
-            if dup is not None:
-                dup.strength = min(6.0, dup.strength + 0.5)
-                dup.importance = max(dup.importance, m.importance)
-                dup.last_recalled_day = current_day
-                reinforced_count += 1
-                add_new_text(dup.text)
-                continue
-
-            if (
-                checker is not None
-                and active_sem
-                and m.category in ("użytkownik", "zasada", "wydarzenie")
-            ):
-                candidates = sorted(
-                    active_sem,
-                    key=lambda o: 0.65 * _cosine(m.embedding, o.embedding) + 0.35 * _keyword_overlap(m.text, o.text),
-                    reverse=True,
-                )[:3]
-                close_cands = [
-                    c
-                    for c in candidates
-                    if (0.65 * _cosine(m.embedding, c.embedding) + 0.35 * _keyword_overlap(m.text, c.text)) >= 0.36
-                ]
-                if close_cands:
-                    rep_idx = checker(m.text, [c.text for c in close_cands])
-                    if rep_idx is not None:
-                        close_cands[rep_idx].superseded = True
-                        updated_count += 1
-
-            m.consolidated = True
-            self.semantic_memories.append(m)
-            active_sem.append(m)
-            new_count += 1
-            add_new_text(m.text)
-
-        # Gentle biological forgetting curve for weak, unreferenced trivial memories
-        forgotten_count = 0
-        kept_sem: list[MemoryTrace] = []
-        for old in self.semantic_memories:
-            if old.superseded:
-                continue
-            if old.importance < 4 and old.last_recalled_day < current_day:
-                old.strength *= decay
-            if old.strength < prune_threshold and old.importance <= 2:
-                forgotten_count += 1
-                continue
-            kept_sem.append(old)
-        if len(kept_sem) > self.max_semantic_memories:
-            kept_sem.sort(key=lambda x: (x.importance, x.strength, x.last_recalled_day), reverse=True)
-            kept_sem = kept_sem[: self.max_semantic_memories]
-        self.semantic_memories = kept_sem
-
-        # Select diverse high-value older memories for Experience Replay during LoRA sleep training
-        new_set = set(new_texts)
-        replay_pool = sorted(
-            [m for m in self.semantic_memories if m.text not in new_set],
-            key=lambda x: (x.importance, x.strength, x.recall_count),
-            reverse=True,
+        meta = EngramMeta(
+            category=category,
+            preview_label=(preview_label or "")[:200],
+            sparsity_pct=sparsity_pct,
+            topic=topic,
+            source_url=source_url,
+            pinned=bool(pinned),
         )
-        replay_texts = [m.text for m in replay_pool[:28]]
+        self.short_term.add_batch(
+            sdrs=sdr.unsqueeze(0) if sdr.ndim == 1 else sdr[:1],
+            metas=[meta],
+            strengths=[float(strength)],
+            importances=[float(max(1, min(5, importance)))],
+            day=day,
+        )
+        return {
+            "id": meta.id,
+            "category": meta.category,
+            "preview_label": meta.preview_label,
+            "text": meta.preview_label,
+            "importance": int(max(1, min(5, importance))),
+            "strength": round(float(strength), 2),
+            "sparsity_pct": round(float(sparsity_pct), 2),
+            "day_created": day,
+            "topic": topic,
+            "source_url": source_url,
+            "pinned": bool(pinned),
+        }
+
+    @torch.no_grad()
+    def record_engrams_batch(
+        self,
+        sdrs: torch.Tensor,
+        preview_labels: list[str],
+        category: str = "wiedza",
+        importances: list[int] | None = None,
+        day: int = 1,
+        sparsity_pct: float = 4.0,
+        topic: str | None = None,
+        source_url: str | None = None,
+        pinned: bool = False,
+        pinned_flags: list[bool] | None = None,
+    ) -> list[str]:
+        m = int(sdrs.shape[0])
+        if m == 0:
+            return []
+        imps = [float(max(1, min(5, x))) for x in (importances or [4] * m)]
+        strengths = [1.0 + 0.12 * x for x in imps]
+        p_flags = [bool(x) for x in pinned_flags[:m]] if pinned_flags is not None else [bool(pinned)] * m
+        while len(p_flags) < m:
+            p_flags.append(bool(pinned))
+        metas = [
+            EngramMeta(
+                category=category,
+                preview_label=(lbl or "")[:200],
+                sparsity_pct=sparsity_pct,
+                topic=topic,
+                source_url=source_url,
+                pinned=p_flags[idx],
+            )
+            for idx, lbl in enumerate(preview_labels[:m])
+        ]
+        return self.short_term.add_batch(sdrs, metas, strengths, imps, day=day)
+
+    @torch.no_grad()
+    def record_rem_engrams(
+        self,
+        sdrs: torch.Tensor,
+        decoded_labels: list[str],
+        day: int = 1,
+        sparsity_pct: float = 4.0,
+    ) -> list[str]:
+        m = int(sdrs.shape[0])
+        if m == 0:
+            return []
+        metas = [
+            EngramMeta(
+                category="refleksja_rem",
+                preview_label=(lbl or "")[:200],
+                sparsity_pct=sparsity_pct,
+            )
+            for lbl in decoded_labels[:m]
+        ]
+        return self.rem.add_batch(
+            sdrs=sdrs,
+            metas=metas,
+            strengths=[1.8] * m,
+            importances=[4.0] * m,
+            day=day,
+        )
+
+    @torch.no_grad()
+    def get_hopfield_bank(self, max_engrams: int = 8192) -> torch.Tensor:
+        """
+        Return a single contiguous bfloat16 tensor [M_total, N] on GPU for Modern Hopfield dynamics.
+        NEVER exposes any string or preview_label.
+        """
+        parts = [b.engrams for b in (self.short_term, self.semantic, self.rem) if len(b) > 0]
+        if not parts:
+            return torch.empty((0, self.num_neurons), dtype=torch.bfloat16, device=self.device)
+        combined = torch.cat(parts, dim=0)
+        if combined.shape[0] > max_engrams:
+            combined = combined[-max_engrams:]
+        return combined
+
+    @torch.no_grad()
+    def recall_all_banks(
+        self,
+        query_sdr: torch.Tensor,
+        current_day: int,
+        top_hippo: int = 12,
+        top_semantic: int = 16,
+        top_rem: int = 6,
+        min_sim: float = 0.35,
+    ) -> dict[str, dict[str, Any]]:
+        """Pure tensor recall across all three banks via single GPU matmuls."""
+        return {
+            "hippocampus": self.short_term.recall_tensor(query_sdr, top_k=top_hippo, current_day=current_day, min_sim=min_sim),
+            "semantic": self.semantic.recall_tensor(query_sdr, top_k=top_semantic, current_day=current_day, min_sim=min_sim),
+            "rem": self.rem.recall_tensor(query_sdr, top_k=top_rem, current_day=current_day, min_sim=min_sim),
+        }
+
+    @torch.no_grad()
+    def consolidate_nrem_light_gpu(
+        self,
+        merge_threshold: float = 0.86,
+        decay: float = 0.96,
+        prune_threshold: float = 0.18,
+        current_day: int = 1,
+    ) -> dict[str, Any]:
+        """
+        Fully vectorized GPU NREM Light stage:
+          1. Compares short-term engrams against long-term semantic bank in one matmul.
+          2. Merges close SDRs (>= merge_threshold) into generalized k-WTA prototypes.
+          3. Promotes novel engrams to long-term semantic memory.
+          4. Applies biological forgetting curve and prunes weak low-importance traces.
+        """
+        st_n = len(self.short_term)
+        merged_count = 0
+        new_count = 0
+        fresh_engrams = (
+            self.short_term.engrams.clone()
+            if st_n > 0
+            else torch.empty((0, self.num_neurons), dtype=torch.bfloat16, device=self.device)
+        )
+
+        if st_n > 0:
+            # 1) Deduplicate within short_term first via GPU matmul
+            st_f = self.short_term.engrams.float()
+            keep_st_mask = torch.ones(st_n, dtype=torch.bool, device=self.device)
+            if st_n > 1:
+                self_sim = st_f @ st_f.T
+                # Upper-triangular mask: if an earlier short-term trace is near-duplicate, merge into it
+                # (never drop pinned short-term engrams during deduplication)
+                tril_sim = torch.tril(self_sim, diagonal=-1)
+                dup_vals, _ = tril_sim.max(dim=1)
+                keep_st_mask = (dup_vals < merge_threshold) | self.short_term.pinned
+                merged_count += int((~keep_st_mask).sum().item())
+
+            keep_st_idx = torch.nonzero(keep_st_mask, as_tuple=False).squeeze(-1)
+            cand_engrams = self.short_term.engrams.index_select(0, keep_st_idx)
+            cand_strengths = self.short_term.strengths.index_select(0, keep_st_idx)
+            cand_imps = self.short_term.importances.index_select(0, keep_st_idx)
+            cand_pinned = self.short_term.pinned.index_select(0, keep_st_idx)
+            cand_metas = [self.short_term.meta[i] for i in keep_st_idx.cpu().tolist()]
+
+            # 2) Match candidates against long-term semantic bank in a single GPU matmul
+            if len(self.semantic) > 0 and cand_engrams.shape[0] > 0:
+                sim_mat = torch.matmul(cand_engrams.float(), self.semantic.engrams.float().T)  # [C, S]
+                best_sim, best_sem_idx = sim_mat.max(dim=1)
+                merge_mask = best_sim >= merge_threshold
+                novel_mask = ~merge_mask
+
+                if merge_mask.any():
+                    m_cand = cand_engrams[merge_mask].float()
+                    m_targets = best_sem_idx[merge_mask]
+                    old_vecs = self.semantic.engrams.index_select(0, m_targets).float()
+                    # Generalized prototype update via k-WTA
+                    blended = 0.70 * old_vecs + 0.30 * m_cand
+                    proto, _, _ = k_wta(blended, k=self.sdr_k, normalize=True)
+                    self.semantic.engrams[m_targets] = proto.to(torch.bfloat16)
+                    self.semantic.strengths[m_targets] = torch.clamp(self.semantic.strengths[m_targets] + 0.45, max=6.0)
+                    self.semantic.importances[m_targets] = torch.maximum(
+                        self.semantic.importances[m_targets], cand_imps[merge_mask]
+                    )
+                    self.semantic.last_recalled_days[m_targets] = int(current_day)
+                    # Propagate pinned status onto merged long-term semantic prototypes
+                    m_pin_flags = cand_pinned[merge_mask]
+                    if bool(m_pin_flags.any().item()):
+                        for t_i, p_f in zip(m_targets.cpu().tolist(), m_pin_flags.cpu().tolist()):
+                            if p_f:
+                                self.semantic.pinned[t_i] = True
+                                self.semantic.meta[t_i].pinned = True
+                    merged_count += int(merge_mask.sum().item())
+
+                if novel_mask.any():
+                    novel_idx = torch.nonzero(novel_mask, as_tuple=False).squeeze(-1)
+                    novel_metas = [cand_metas[i] for i in novel_idx.cpu().tolist()]
+                    self.semantic.add_batch(
+                        sdrs=cand_engrams.index_select(0, novel_idx),
+                        metas=novel_metas,
+                        strengths=cand_strengths.index_select(0, novel_idx),
+                        importances=cand_imps.index_select(0, novel_idx),
+                        day=current_day,
+                    )
+                    new_count = int(novel_idx.numel())
+            elif cand_engrams.shape[0] > 0:
+                self.semantic.add_batch(
+                    sdrs=cand_engrams,
+                    metas=cand_metas,
+                    strengths=cand_strengths,
+                    importances=cand_imps,
+                    day=current_day,
+                )
+                new_count = int(cand_engrams.shape[0])
+
+        # 3) Biological forgetting curve on long-term semantic bank (vectorized GPU)
+        #    Core pinned memories (pinned=True) are strictly immune to decay and forgetting!
+        forgotten_count = 0
+        if len(self.semantic) > 0:
+            not_pinned = ~self.semantic.pinned
+            decay_mask = not_pinned & (self.semantic.importances < 4.0) & (self.semantic.last_recalled_days < int(current_day))
+            self.semantic.strengths = torch.where(
+                decay_mask,
+                self.semantic.strengths * float(decay),
+                self.semantic.strengths,
+            )
+            forget_mask = not_pinned & (self.semantic.strengths < float(prune_threshold)) & (self.semantic.importances <= 2.0)
+            forgotten_count = int(forget_mask.sum().item())
+            if forgotten_count > 0:
+                keep_idx = torch.nonzero(~forget_mask, as_tuple=False).squeeze(-1)
+                if keep_idx.numel() == 0:
+                    self.semantic.clear()
+                else:
+                    self.semantic._slice_in_place(keep_idx)
 
         return {
             "new_memories": new_count,
-            "updated_memories": updated_count,
-            "reinforced_memories": reinforced_count,
+            "merged_memories": merged_count,
             "forgotten_memories": forgotten_count,
-            "new_texts": new_texts,
-            "replay_texts": replay_texts,
+            "fresh_engrams": fresh_engrams,
+            "semantic_count": len(self.semantic),
         }
 
-    def nrem_stage_facts(self) -> dict[str, int]:
-        raw_fact_count = len(self.short_term_facts)
-        new_facts = 0
-        reinforced_facts = 0
-        for f in self.short_term_facts:
-            k = f.key()
-            if k in self.consolidated_facts:
-                old = self.consolidated_facts[k]
-                old.strength = min(5.0, old.strength + f.strength * 0.5)
-                old.consolidated = True
-                reinforced_facts += 1
-            else:
-                f.consolidated = True
-                f.source = "CONSOLIDATED"
-                self.consolidated_facts[k] = f
-                new_facts += 1
-        return {
-            "raw_facts": raw_fact_count,
-            "new_facts": new_facts,
-            "reinforced_facts": reinforced_facts,
-        }
+    @torch.no_grad()
+    def sample_nrem_replay_batch(
+        self,
+        fresh_engrams: torch.Tensor,
+        batch_size: int = 48,
+        fresh_ratio: float = 0.30,
+    ) -> torch.Tensor:
+        """
+        Build a GPU Experience Replay batch mixing ~30% fresh Hipokamp engrams
+        and ~70% consolidated Pamięć trwała engrams.
+        """
+        n_fresh = int(fresh_engrams.shape[0])
+        n_sem = len(self.semantic)
+        if n_fresh == 0 and n_sem == 0:
+            return torch.empty((0, self.num_neurons), dtype=torch.float32, device=self.device)
+
+        parts: list[torch.Tensor] = []
+        target_fresh = min(n_fresh, max(1, int(round(batch_size * fresh_ratio)))) if n_fresh > 0 else 0
+        target_sem = min(n_sem, max(0, batch_size - target_fresh)) if n_sem > 0 else 0
+        if target_sem == 0 and n_fresh > target_fresh:
+            target_fresh = min(n_fresh, batch_size)
+
+        if target_fresh > 0:
+            idx_f = torch.randint(0, n_fresh, (target_fresh,), device=self.device)
+            parts.append(fresh_engrams.index_select(0, idx_f).float())
+
+        if target_sem > 0:
+            weights = torch.clamp(self.semantic.strengths * self.semantic.importances, min=0.1)
+            probs = weights / weights.sum()
+            idx_s = torch.multinomial(probs, num_samples=target_sem, replacement=(target_sem > n_sem))
+            parts.append(self.semantic.engrams.index_select(0, idx_s).float())
+
+        return torch.cat(parts, dim=0)
 
     def delete_memory(self, memory_id: str) -> bool:
-        target = memory_id.strip()
-        if not target:
-            return False
-        for attr in ("short_term_memories", "semantic_memories", "rem_reflections", "episodic_memories"):
-            lst: list[MemoryTrace] = getattr(self, attr)
-            before = len(lst)
-            filtered = [m for m in lst if m.id != target]
-            if len(filtered) != before:
-                setattr(self, attr, filtered)
+        for bank in (self.short_term, self.semantic, self.rem):
+            if bank.delete_by_id(memory_id):
                 return True
         return False
 
@@ -866,31 +688,42 @@ class Hippocampus:
         return False
 
     def clear_short_term(self) -> None:
-        self.short_term_facts.clear()
-        self.short_term_memories.clear()
+        self.short_term.clear()
 
-    def to_dict(self) -> dict[str, Any]:
+    def reset_all_banks(self) -> None:
+        """Clear all engram banks (used when re-encoding after Wernicke space changes)."""
+        self.short_term.clear()
+        self.semantic.clear()
+        self.rem.clear()
+
+    def clear_all_preview_labels(self, replacement: str = "") -> None:
+        self.short_term.clear_preview_labels(replacement)
+        self.semantic.clear_preview_labels(replacement)
+        self.rem.clear_preview_labels(replacement)
+
+    def export_sparse_tensors(self) -> dict[str, Any]:
         return {
-            "short_term_facts": [f.to_dict() for f in self.short_term_facts],
-            "consolidated_facts": [f.to_dict() for f in self.consolidated_facts.values()],
-            "rem_dream_links": [f.to_dict() for f in self.rem_dream_links.values()],
-            "short_term_memories": [m.to_dict() for m in self.short_term_memories],
-            "semantic_memories": [m.to_dict() for m in self.semantic_memories],
-            "rem_reflections": [m.to_dict() for m in self.rem_reflections],
-            "episodic_memories": [m.to_dict() for m in self.episodic_memories],
+            "short_term": self.short_term.export_sparse_tensors(),
+            "semantic": self.semantic.export_sparse_tensors(),
+            "rem": self.rem.export_sparse_tensors(),
+        }
+
+    def export_metadata(self) -> dict[str, Any]:
+        return {
+            "short_term_meta": self.short_term.to_meta_list(),
+            "semantic_meta": self.semantic.to_meta_list(),
+            "rem_meta": self.rem.to_meta_list(),
             "studied_topics": self.studied_topics,
         }
 
-    def load_dict(self, data: dict[str, Any]) -> None:
-        self.short_term_facts = [ConceptFact.from_dict(d) for d in data.get("short_term_facts", [])]
-        self.consolidated_facts = {
-            f.key(): f for f in (ConceptFact.from_dict(d) for d in data.get("consolidated_facts", []))
-        }
-        self.rem_dream_links = {
-            f.key(): f for f in (ConceptFact.from_dict(d) for d in data.get("rem_dream_links", []))
-        }
-        self.short_term_memories = [MemoryTrace.from_dict(d) for d in data.get("short_term_memories", [])]
-        self.semantic_memories = [MemoryTrace.from_dict(d) for d in data.get("semantic_memories", [])]
-        self.rem_reflections = [MemoryTrace.from_dict(d) for d in data.get("rem_reflections", [])]
-        self.episodic_memories = [MemoryTrace.from_dict(d) for d in data.get("episodic_memories", [])]
-        self.studied_topics = dict(data.get("studied_topics", {}))
+    def import_state(self, tensor_state: dict[str, Any], meta_state: dict[str, Any]) -> None:
+        self.short_term.import_sparse_tensors(
+            tensor_state["short_term"], meta_state.get("short_term_meta", [])
+        )
+        self.semantic.import_sparse_tensors(
+            tensor_state["semantic"], meta_state.get("semantic_meta", [])
+        )
+        self.rem.import_sparse_tensors(
+            tensor_state["rem"], meta_state.get("rem_meta", [])
+        )
+        self.studied_topics = dict(meta_state.get("studied_topics", {}))
