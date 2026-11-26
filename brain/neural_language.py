@@ -257,9 +257,12 @@ class BrocaByteTransformer(nn.Module):
         return z
 
     def _pool_z_summary(self, z_mem: torch.Tensor) -> torch.Tensor:
-        # Flatten compressed 16 cortical columns [B, 16, 32] -> [B, 512] -> [B, col_dim]
+        # Flatten primary 16 cortical columns [B, 16, 32] -> [B, 512] -> [B, col_dim];
+        # any extra columns (e.g. recalled Hippocampus memory columns [16..32]) remain
+        # directly accessible to all Cross-Attention layers without breaking checkpoint shapes!
         b = z_mem.shape[0]
-        comp = torch.tanh(self.z_col_compress(z_mem)).reshape(b, -1)
+        z_primary = z_mem[:, : self.cfg.num_columns, :]
+        comp = torch.tanh(self.z_col_compress(z_primary)).reshape(b, -1)
         return self.z_summary_norm(self.z_summary_proj(comp))
 
     def forward(

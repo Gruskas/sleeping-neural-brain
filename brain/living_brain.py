@@ -732,11 +732,16 @@ class LivingBrainEngine:
     @torch.no_grad()
     def _project_sensory(self, sensory_vec: torch.Tensor | None) -> torch.Tensor:
         if sensory_vec is None:
-            # Spontaneous background sensory drive modulated by theta/gamma oscillations
+            # Spontaneous resting-state drive (Default Mode Network): top-down prediction
+            # gently drifts via unit-norm theta/gamma spontaneous fluctuations (never 5x noise!)
             osc = 0.55 + 0.30 * math.sin(self.theta_phase) + 0.15 * math.sin(self.gamma_phase)
-            raw = torch.randn(self.sensory_dim, device=self.device, dtype=torch.float32) * (0.20 * osc)
+            noise_unit = F.normalize(
+                torch.randn(self.sensory_dim, device=self.device, dtype=torch.float32), dim=-1, eps=1e-6
+            )
+            raw = noise_unit * (0.35 * osc)
             if self.state_l1.abs().max().item() > 1e-6:
-                raw = raw + 0.65 * (self.G_10.float() @ self.state_l1)
+                pred_unit = F.normalize(self.G_10.float() @ self.state_l1, dim=-1, eps=1e-6)
+                raw = raw + 0.78 * pred_unit
             return F.normalize(raw, dim=-1, eps=1e-6)
 
         v = sensory_vec.to(device=self.device, dtype=torch.float32).reshape(-1)
@@ -889,7 +894,9 @@ class LivingBrainEngine:
             m4_sims = self.m4_prototypes.float() @ z_assoc  # [n_m4]
             best_m4_idx = int(torch.argmax(m4_sims).item())
             best_m4_sim = float(m4_sims[best_m4_idx].item())
-            uncertainty = max(0.0, min(1.0, 1.0 - max(0.0, best_m4_sim)))
+            # Calibrate sparse k-WTA prototype similarity + hierarchical PE into [0, 1] uncertainty
+            m4_novelty = max(0.0, min(1.0, 1.0 - min(1.0, max(0.0, best_m4_sim) * 2.2)))
+            uncertainty = max(0.0, min(1.0, 0.45 * m4_novelty + 0.55 * total_surprise))
 
             prev_unit_err = float(self.m4_err_ema[best_m4_idx].item())
             unit_lp = max(0.0, prev_unit_err - total_surprise)
@@ -899,8 +906,11 @@ class LivingBrainEngine:
             # Goldilocks / inverted-U curiosity curve:
             # Peak reward at moderate uncertainty (~0.45) + high learning progress;
             # penalizes boring repetitive loops (uncertainty < 0.15) AND pure unlearnable noise (> 0.85, LP ~ 0)
-            goldilocks = math.exp(-(((uncertainty - 0.45) / 0.26) ** 2))
-            intrinsic_curiosity = float(goldilocks * (0.45 + 2.5 * (learning_progress + unit_lp)))
+            goldilocks = math.exp(-(((uncertainty - 0.45) / 0.28) ** 2))
+            cur_raw = float(goldilocks * (0.48 + 2.4 * (learning_progress + unit_lp)))
+            if spontaneous:
+                cur_raw *= 0.65
+            intrinsic_curiosity = max(0.0, min(1.0, cur_raw))
 
             boredom_exploration = False
             if total_surprise < 0.16:
@@ -925,9 +935,16 @@ class LivingBrainEngine:
             surprise_delta = total_surprise - self.surprise_ema
             self.surprise_ema = 0.90 * self.surprise_ema + 0.10 * total_surprise
 
-            # Noradrenaline: sharp spike on context shift / surprise -> boosts plasticity & resets fatigue!
-            na = 0.25 + 2.15 * (1.0 / (1.0 + math.exp(-5.0 * (surprise_delta + 0.05))))
-            self.neuromod.noradrenaline = max(0.10, min(2.50, na))
+            # Noradrenaline (Locus Coeruleus): calm tonic baseline (~0.40-0.55) at rest,
+            # sharp phasic spike (1.2-2.2) ONLY on real context shift / high external surprise!
+            if spontaneous:
+                na_target = 0.32 + 0.75 * (1.0 / (1.0 + math.exp(-6.0 * (surprise_delta - 0.10))))
+            else:
+                novelty_drive = max(0.0, total_surprise - 0.35) * 1.15
+                na_target = 0.42 + 1.85 * (1.0 / (1.0 + math.exp(-6.5 * (surprise_delta - 0.08)))) + novelty_drive
+            self.neuromod.noradrenaline = max(
+                0.15, min(2.50, 0.55 * self.neuromod.noradrenaline + 0.45 * na_target)
+            )
             if self.neuromod.noradrenaline > 1.55:
                 # Sudden context switch resets attention fatigue immediately
                 self.fatigue_l1.mul_(0.35)
@@ -1003,8 +1020,8 @@ class LivingBrainEngine:
                 avg = getattr(self, avg_name)
                 avg.mul_(0.95).add_(0.05 * fired)
                 thr = getattr(self, thr_name)
-                thr.add_(0.015 * (avg - 0.04))
-                thr.clamp_(-0.35, 0.35)
+                thr.add_(0.010 * (avg - 0.04))
+                thr.clamp_(-0.15, 0.15)
 
             mean_fatigue = float(
                 (self.fatigue_l1.mean() + self.fatigue_l2.mean() + self.fatigue_l3.mean() + self.fatigue_assoc.mean()).item()
@@ -1130,6 +1147,55 @@ class LivingBrainEngine:
         self.m2_pinned = torch.cat([self.m2_pinned, torch.tensor([bool(pinned)], device=self.device, dtype=torch.bool)], dim=0)
 
     # ── Sleep Offline Replay (M2 -> M1) + SHY Homeostasis (Pillar 1 & 4) ─────
+    @torch.no_grad()
+    def encode_external_engrams(
+        self,
+        sensory_vecs: torch.Tensor,
+        importances: list[float] | None = None,
+        pinned_flags: list[bool] | None = None,
+    ) -> int:
+        """
+        Hippocampus -> LivingBrain (M2) NREM synchronization:
+        Absorb consolidated/pinned Hippocampus engrams into M1/M2 so LivingBrainEngine
+        shares the same semantic knowledge base instead of living as a separate silo.
+        """
+        n = int(sensory_vecs.shape[0]) if sensory_vecs.ndim >= 2 else (1 if sensory_vecs.numel() > 0 else 0)
+        if n == 0:
+            return 0
+        vecs = sensory_vecs.unsqueeze(0) if sensory_vecs.ndim == 1 else sensory_vecs
+        encoded = 0
+        for i in range(n):
+            imp = float(importances[i]) if (importances and i < len(importances)) else 3.5
+            is_pin = bool(pinned_flags[i]) if (pinned_flags and i < len(pinned_flags)) else (imp >= 4.0)
+            val = max(0.15, min(0.85, 0.15 * imp))
+            tel = self.cognitive_step(
+                sensory_vec=vecs[i],
+                external_valence=val,
+                allow_growth=False,
+                spontaneous=False,
+                pinned=is_pin,
+            )
+            if tel.m2_encoded:
+                encoded += 1
+        return encoded
+
+    @torch.no_grad()
+    def export_top_m2_assoc_vectors(self, top_k: int = 8) -> tuple[torch.Tensor, list[bool]]:
+        """
+        LivingBrain (M2) -> Cortex/Hippocampus NREM synchronization:
+        Export top-k strongest / pinned M2 associative traces for cortical consolidation.
+        """
+        with self.lock:
+            m = int(self.m2_assoc_traces.shape[0])
+            if m == 0 or top_k <= 0:
+                return torch.empty((0, self.n_assoc), device=self.device, dtype=torch.float32), []
+            k = min(int(top_k), m)
+            priority = self.m2_strengths + 0.6 * self.m2_surprises + 0.3 * self.m2_valences + self.m2_pinned.float() * 3.0
+            top_idx = torch.topk(priority, k=k, largest=True, sorted=True).indices
+            vecs = self.m2_assoc_traces.index_select(0, top_idx).detach().float().clone()
+            pins = [bool(x) for x in self.m2_pinned.index_select(0, top_idx).detach().cpu().tolist()]
+            return vecs, pins
+
     @torch.no_grad()
     def sleep_consolidate_replay(self, replay_steps: int = 12) -> dict[str, Any]:
         """

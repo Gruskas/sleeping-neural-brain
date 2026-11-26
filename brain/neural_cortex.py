@@ -21,6 +21,7 @@ class CortexThought:
     attractor_steps: int
     sparsity_pct: float
     max_hopfield_sim: float = 0.0
+    recalled_columns: torch.Tensor | None = None  # [B, 16, D] recalled Hippocampus columns for Broca Cross-Attention
 
 
 class BiologicalAssociativeCortex(nn.Module):
@@ -243,6 +244,7 @@ class BiologicalAssociativeCortex(nn.Module):
         attn_weights: torch.Tensor | None = None
         energy_t: torch.Tensor | None = None
         best_sim_t: torch.Tensor | None = None
+        last_h_hop: torch.Tensor | None = None
 
         for step_i in range(n_steps):
             # Native bfloat16 Tensor Core matmul + zero CPU-GPU .item() sync inside loop!
@@ -253,6 +255,7 @@ class BiologicalAssociativeCortex(nn.Module):
                 logits = beta * raw_sims
                 attn_weights = F.softmax(logits, dim=-1)  # [B, M]
                 h_hop = F.normalize((attn_weights.to(dtype=w_dt) @ e_mat).float(), dim=-1, eps=1e-6)
+                last_h_hop = h_hop
                 lse_t = torch.logsumexp(logits, dim=-1).mean()
                 energy_t = -(lse_t / max(1e-6, beta)) + 0.5
 
@@ -318,6 +321,24 @@ class BiologicalAssociativeCortex(nn.Module):
         else:
             columns_star = raw_cols * torch.rsqrt(raw_cols.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
 
+        # Project strongly recalled Hippocampus engram into 16 cortical columns for Broca Cross-Attention
+        recalled_columns: torch.Tensor | None = None
+        if last_h_hop is not None and (force_hopfield or best_sim_val >= hopfield_min_sim):
+            if sdr_to_columns_fn is not None:
+                rec_raw = sdr_to_columns_fn(
+                    last_h_hop.to(dtype=next_param_dtype(sdr_to_columns_fn, torch.float32))
+                ).float()
+            else:
+                rec_raw = F.normalize(
+                    (last_h_hop.to(dtype=w_dt) @ self.W_in).float().view(b, self.num_columns, self.column_dim),
+                    dim=-1,
+                    eps=1e-6,
+                )
+            if hasattr(F, "rms_norm"):
+                recalled_columns = F.rms_norm(rec_raw, (self.column_dim,), eps=1e-6)
+            else:
+                recalled_columns = rec_raw * torch.rsqrt(rec_raw.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+
         return CortexThought(
             z_star=z,
             columns_star=columns_star,
@@ -326,6 +347,7 @@ class BiologicalAssociativeCortex(nn.Module):
             attractor_steps=n_steps,
             sparsity_pct=sparsity_pct,
             max_hopfield_sim=round(best_sim_val, 4),
+            recalled_columns=recalled_columns,
         )
 
     @torch.no_grad()

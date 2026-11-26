@@ -620,6 +620,7 @@ class LanguageCortex:
         thoughts: list[CortexThought] = []
         temps: list[float] = []
         labels: list[str] = []
+        two_hop_note = ""
         for label, cand_t, use_bank, hop_min, cand_wm_w, cand_steps, cand_noise, use_snap in path_specs:
             thought = cortex.perceive_and_think(
                 sensory_columns=w_out.columns,
@@ -637,12 +638,63 @@ class LanguageCortex:
                 neuromod=neuromod,
                 living_telemetry=living_telemetry,
             )
+            # Multi-step associative chain (Hippocampus <-> Z*): on the contextual path,
+            # when Hop 1 recalls a strong memory, feed Z*_1 back into Hippocampus for a 2nd associative hop!
+            if (
+                label == "Kontekstowa"
+                and use_bank
+                and engram_bank is not None
+                and engram_bank.shape[0] >= 2
+                and thought.max_hopfield_sim >= 0.65
+            ):
+                hop2 = cortex.perceive_and_think(
+                    sensory_columns=thought.columns_star,
+                    sensory_sdr=thought.z_star,
+                    engram_bank=engram_bank,
+                    sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
+                    steps=3,
+                    noise_std=0.0,
+                    update_last_active=False,
+                    hopfield_min_sim=0.72,
+                    working_memory_sdr=working_memory_sdr if cand_wm_w > 0.0 else None,
+                    working_memory_weight=cand_wm_w * 0.5,
+                    living_assoc_vec=living_assoc_vec,
+                    living_blend=living_blend,
+                    neuromod=neuromod,
+                    living_telemetry=living_telemetry,
+                )
+                # Preserve Hop 1 recalled columns if Hop 2 didn't attach stronger ones
+                if hop2.recalled_columns is None and thought.recalled_columns is not None:
+                    hop2.recalled_columns = thought.recalled_columns
+                two_hop_note = (
+                    f"Pętla skojarzeń 2-hop (Hipokamp ↔ Z*): hop1_sim={thought.max_hopfield_sim:.2f} → "
+                    f"hop2_sim={hop2.max_hopfield_sim:.2f}"
+                )
+                thought = hop2
             thoughts.append(thought)
             temps.append(round(cand_t, 3))
             labels.append(label)
 
         # Parallel batched generation + single-pass batched neural confidence scoring on GPU!
-        mem_batch = torch.cat([th.columns_star[:1] for th in thoughts], dim=0)  # [K, 16, D]
+        # When any candidate strongly recalled Hippocampus columns, concatenate them as extra
+        # Cross-Attention memory columns [K, 32, D] so Broca directly reads recalled memory!
+        has_recalled_mem = any(th.recalled_columns is not None for th in thoughts)
+        if has_recalled_mem:
+            mem_batch = torch.cat(
+                [
+                    torch.cat(
+                        [
+                            th.columns_star[:1],
+                            th.recalled_columns[:1] if th.recalled_columns is not None else th.columns_star[:1],
+                        ],
+                        dim=1,
+                    )
+                    for th in thoughts
+                ],
+                dim=0,
+            )  # [K, 32, D]
+        else:
+            mem_batch = torch.cat([th.columns_star[:1] for th in thoughts], dim=0)  # [K, 16, D]
         with self._op_lock:
             gen_batch = self._broca_raw.generate_batch(
                 memory_columns_batch=mem_batch,
@@ -671,6 +723,8 @@ class LanguageCortex:
                 f"Neuromodulacja inferencji: NA={na_val:.2f} (kroki={eff_steps}, T_baz={eff_base_t:.2f}) · "
                 f"Ciekawość M4={cur_val:.2f}{'+eksploracja' if boredom_exp else ''} (T_kreat={cre_temp:.2f})"
             )
+        if two_hop_note:
+            critique_notes.append(two_hop_note + (" · Cross-Attention Broki z kolumnami Hipokampu" if has_recalled_mem else ""))
         p1_conf = float(conf_list[0]["confidence"])
 
         for idx in range(len(thoughts)):

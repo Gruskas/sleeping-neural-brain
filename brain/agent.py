@@ -262,16 +262,36 @@ class SleepingBrain:
         if len(self._working_sdr_ring) > cap:
             self._working_sdr_ring = self._working_sdr_ring[-cap:]
 
-    def _get_working_memory_sdr(self) -> torch.Tensor | None:
+    def _get_working_memory_sdr(
+        self,
+        query_sdr: torch.Tensor | None = None,
+        max_slots: int = 6,
+        focus_recent: bool = False,
+    ) -> torch.Tensor | None:
+        """
+        Prefrontal Cortex (PFC) discrete slot working memory with query-gated attention:
+        maintains the last `max_slots` (default 6) turn SDR slots and attends to the most
+        relevant & recent slots instead of flattening 64 turns into one blurred average.
+        """
         if not self._working_sdr_ring:
             return None
-        # Exponentially decayed weighted sum of recent turn SDRs (newest turn = weight 1.0, older decay by 0.86^age)
-        n = len(self._working_sdr_ring)
-        acc = torch.zeros(self.cfg.num_neurons, device=self.device, dtype=torch.float32)
-        for idx, vec in enumerate(self._working_sdr_ring):
-            age = (n - 1) - idx
-            weight = 0.86 ** age
-            acc.add_(vec.float(), alpha=weight)
+        slot_cap = 3 if focus_recent else max(2, int(max_slots))
+        slots_list = self._working_sdr_ring[-slot_cap:]
+        k = len(slots_list)
+        slots = torch.stack([v.float() for v in slots_list], dim=0)  # [K, N]
+        ages = torch.arange(k - 1, -1, -1, device=self.device, dtype=torch.float32)
+
+        if query_sdr is not None and query_sdr.numel() == self.cfg.num_neurons and not focus_recent:
+            q = F.normalize(query_sdr.to(device=self.device, dtype=torch.float32).reshape(-1), dim=-1, eps=1e-6)
+            sims = slots @ q  # [K]
+            logits = 6.0 * sims - 0.18 * ages
+            weights = F.softmax(logits, dim=0)
+        else:
+            # Explicit follow-up ("dlaczego?", "rozwiń to") focuses sharply on the immediate last turns
+            logits = -0.55 * ages
+            weights = F.softmax(logits, dim=0)
+
+        acc = (weights.unsqueeze(1) * slots).sum(dim=0)
         norm = float(acc.norm().item())
         if norm <= 1e-6:
             return None
@@ -2218,16 +2238,22 @@ class SleepingBrain:
 
         with self.lock:
             engram_bank = self.hippocampus.get_hopfield_bank()
-            wm_sdr = self._get_working_memory_sdr()
             wm_count = len(self._working_sdr_ring)
 
         temp = temperature if temperature is not None else self._sampling_temperature()
         w_out, q_fam, _ = self.language_cortex.perceive_for_chat(msg)
+        is_followup = self._is_followup_query(msg)
+        with self.lock:
+            wm_sdr = self._get_working_memory_sdr(
+                query_sdr=w_out.sdr[0],
+                max_slots=6,
+                focus_recent=is_followup,
+            )
 
-        # Apply Working Memory SDR on contextual follow-ups and novel short replies so the brain
+        # Apply PFC Working Memory SDR on contextual follow-ups and novel short replies so the brain
         # genuinely carries conversation context without contaminating standalone factual questions.
-        if wm_sdr is not None and q_fam < 0.78 and (self._is_followup_query(msg) or len(msg) <= 24):
-            wm_weight = 0.24
+        if wm_sdr is not None and q_fam < 0.78 and (is_followup or len(msg) <= 24):
+            wm_weight = 0.28 if is_followup else 0.22
         else:
             wm_weight = 0.0
 
@@ -2466,11 +2492,16 @@ class SleepingBrain:
 
         with self.lock:
             engram_bank = self.hippocampus.get_hopfield_bank()
-            wm_sdr = self._get_working_memory_sdr()
             wm_count = len(self._working_sdr_ring)
             history_snapshot = list(self.working_chat[-64:])
 
         w_out = self.language_cortex.perceive_one(msg)
+        with self.lock:
+            wm_sdr = self._get_working_memory_sdr(
+                query_sdr=w_out.sdr[0],
+                max_slots=6,
+                focus_recent=self._is_followup_query(msg),
+            )
         wm_weight = 0.22 if wm_sdr is not None else 0.0
         thought = self.cortex.perceive_and_think(
             sensory_columns=w_out.columns,
@@ -2863,8 +2894,69 @@ class SleepingBrain:
                     report.broca_loss_end = float(lora_res["loss_end"])
                     report.lora_duration_ms = float(lora_res["duration_ms"])
 
+            # Bidirectional NREM Memory Unification: Hippocampus <-> LivingBrainEngine (M2) <-> Cortex
+            hippo_to_m2 = 0
+            m2_to_cortex = 0
+            try:
+                with self.lock:
+                    sem_n = len(self.hippocampus.semantic)
+                    if sem_n > 0:
+                        k_sync = min(16, sem_n)
+                        prio = (
+                            self.hippocampus.semantic.importances * 2.0
+                            + self.hippocampus.semantic.strengths
+                            + self.hippocampus.semantic.pinned.float() * 4.0
+                        )
+                        top_idx = torch.topk(prio, k=k_sync, largest=True, sorted=False).indices
+                        sync_sdrs = self.hippocampus.semantic.engrams.index_select(0, top_idx).float()
+                        sync_imps = self.hippocampus.semantic.importances.index_select(0, top_idx).cpu().tolist()
+                        sync_pins = self.hippocampus.semantic.pinned.index_select(0, top_idx).cpu().tolist()
+                        sync_cols = self.language_cortex.wernicke_module.sdr_to_columns(sync_sdrs).detach()
+                    else:
+                        sync_cols = None
+                        sync_imps = []
+                        sync_pins = []
+                if sync_cols is not None and sync_cols.shape[0] > 0:
+                    hippo_to_m2 = self.living_brain.encode_external_engrams(
+                        sensory_vecs=sync_cols,
+                        importances=sync_imps,
+                        pinned_flags=sync_pins,
+                    )
+
+                m2_vecs, _ = self.living_brain.export_top_m2_assoc_vectors(top_k=6)
+                if m2_vecs.shape[0] > 0:
+                    from .sensory_wernicke import k_wta
+
+                    with self.lock:
+                        m2_cols_list = [
+                            self.cortex.project_living_to_columns(m2_vecs[i], batch_size=1)
+                            for i in range(int(m2_vecs.shape[0]))
+                        ]
+                        m2_cols = torch.cat(m2_cols_list, dim=0)  # [K, 16, D]
+                        s_flat = F.normalize(
+                            m2_cols.to(device=self.device, dtype=torch.float32).reshape(m2_cols.shape[0], -1),
+                            dim=-1,
+                            eps=1e-6,
+                        )
+                        m2_sdrs, _, _ = k_wta(
+                            (s_flat.to(dtype=self.cortex.W_in.dtype) @ self.cortex.W_in.T).float(),
+                            k=self.cfg.sdr_k,
+                            normalize=True,
+                        )
+                        self.cortex.learn_local(m2_cols, m2_sdrs, steps=3, noise_std=0.01)
+                        m2_to_cortex = int(m2_vecs.shape[0])
+            except Exception:
+                pass
+
             # Offline M2 -> M1 Replay + SHY Homeostasis + Fatigue Reset in Living Brain
             lb_sleep = self.living_brain.sleep_consolidate_replay(replay_steps=16)
+            if hippo_to_m2 > 0 or m2_to_cortex > 0:
+                with self.lock:
+                    self._log(
+                        "SLEEP",
+                        f"🔗 Unifikacja NREM Hipokamp ↔ LivingBrain M2: +{hippo_to_m2} engramów do M2, "
+                        f"{m2_to_cortex} śladów M2 skonsolidowanych w korze.",
+                    )
 
             with self.lock:
                 self._wake_broca_buffer.clear()

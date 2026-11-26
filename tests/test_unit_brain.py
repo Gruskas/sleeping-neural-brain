@@ -1210,6 +1210,71 @@ class TestHTTPServerSSEAndPretrainScript(unittest.TestCase):
         cos_u_z = float(F.cosine_similarity(novel_u[0], th.z_star[0], dim=0).item())
         self.assertGreater(cos_u_z, 0.80, f"Threshold must not crush sensory SDR u (got cos={cos_u_z:.3f})!")
 
+    def test_living_brain_biological_resting_state_and_curiosity(self) -> None:
+        from brain.living_brain import LivingBrainEngine
+
+        lb = LivingBrainEngine(sensory_dim=256, target_device="ram", memory_budget_mb=2048.0, start_background_clock=False)
+        # Run 25 calm spontaneous resting-state ticks
+        tel = None
+        for _ in range(25):
+            tel = lb.cognitive_step(sensory_vec=None, allow_growth=False, spontaneous=True)
+        assert tel is not None
+        # Resting Noradrenaline must settle to calm tonic baseline (< 0.85, NOT stuck at 1.45!)
+        self.assertLess(lb.neuromod.noradrenaline, 0.85)
+        # Curiosity M4 must be alive (> 0.10, NOT frozen at 0.02-0.03!)
+        self.assertGreater(tel.intrinsic_curiosity, 0.10)
+
+        # Novel external stimulus must raise NA and encode an M2 episode
+        na_rest = lb.neuromod.noradrenaline
+        tel_ext = lb.cognitive_step(sensory_vec=torch.randn(256), external_valence=0.35, allow_growth=False, spontaneous=False)
+        self.assertGreater(lb.neuromod.noradrenaline, na_rest)
+        self.assertGreater(tel_ext.intrinsic_curiosity, 0.20)
+        self.assertTrue(tel_ext.m2_encoded)
+
+    def test_pfc_slots_broca_recalled_columns_and_nrem_m2_sync(self) -> None:
+        import torch.nn.functional as F
+        from brain.config import BrainConfig
+        from brain.living_brain import LivingBrainEngine
+        from brain.neural_cortex import BiologicalAssociativeCortex
+        from brain.neural_language import BrocaByteTransformer
+        from brain.sensory_wernicke import k_wta
+
+        # 1) BrocaByteTransformer accepts 32 columns ([Z* ; recalled_hippo_columns]) without changing weights
+        cfg = BrainConfig(
+            num_neurons=512,
+            sdr_k=24,
+            num_columns=16,
+            column_dim=64,
+            broca_dim=64,
+            broca_layers=2,
+            broca_heads=4,
+            broca_ff_dim=128,
+            broca_max_seq_len=64,
+            broca_max_new_bytes=20,
+        )
+        broca = BrocaByteTransformer(cfg)
+        mem32 = torch.randn(2, 32, 64)
+        out = broca.generate_batch(mem32, temperatures=[0.5, 0.6], max_new_bytes=12)
+        self.assertEqual(len(out), 2)
+
+        # 2) CortexThought attaches recalled_columns when Hippocampus bank matches strongly
+        cortex = BiologicalAssociativeCortex(cfg, device=torch.device("cpu"))
+        u, _, _ = k_wta(torch.randn(1, 512), k=24, normalize=True)
+        cols = torch.randn(1, 16, 64)
+        bank = u.clone().to(torch.bfloat16)
+        th = cortex.perceive_and_think(cols, u, engram_bank=bank, steps=3, hopfield_min_sim=0.70)
+        self.assertIsNotNone(th.recalled_columns)
+        assert th.recalled_columns is not None
+        self.assertEqual(tuple(th.recalled_columns.shape), (1, 16, 64))
+
+        # 3) LivingBrainEngine NREM bidirectional sync helpers (encode_external_engrams + export_top_m2_assoc_vectors)
+        lb = LivingBrainEngine(sensory_dim=256, target_device="ram", memory_budget_mb=2048.0, start_background_clock=False)
+        enc_n = lb.encode_external_engrams(torch.randn(4, 256), importances=[4.0, 5.0, 3.0, 4.0], pinned_flags=[True, True, False, True])
+        self.assertGreaterEqual(enc_n, 3)
+        m2_vecs, m2_pins = lb.export_top_m2_assoc_vectors(top_k=3)
+        self.assertEqual(int(m2_vecs.shape[0]), 3)
+        self.assertTrue(any(m2_pins))
+
 
 if __name__ == "__main__":
     unittest.main()
