@@ -1576,6 +1576,11 @@ class SleepingBrain:
             #    so the brain never stays stuck in Wikipedia-continuation mode!
             # 2) Reset stale W_in / W_rec / threshold and re-encode curriculum entries in the updated Wernicke space.
             if res["trained"]:
+                with self.lock:
+                    had_curriculum = "szkoła podstawowa — fundamenty" in self.hippocampus.studied_topics
+                    self.cortex.reset_synaptic_weights()
+                    self.hippocampus.reset_all_banks()
+
                 if res["steps"] >= 50:
                     with self.lock:
                         self.study_state["current_action"] = "Dostrajam dialogi i Q&A po nauce z Parquet (GPU)..."
@@ -1594,7 +1599,9 @@ class SleepingBrain:
                                     brain_reply=str(st.get("sample_brain", "")) or "(odpowiada...)",
                                 )
 
+                    saved_teacher_pairs = load_teacher_dialogues(self.state_dir)
                     self.language_cortex.train_language_cortex(
+                        extra_qa_pairs=saved_teacher_pairs or None,
                         epochs=90,
                         include_curriculum=True,
                         cortex=self.cortex,
@@ -1602,10 +1609,6 @@ class SleepingBrain:
                         progress_callback=_on_post_pq_dialogue,
                         stop_event=self._study_stop_event,
                     )
-                with self.lock:
-                    had_curriculum = "szkoła podstawowa — fundamenty" in self.hippocampus.studied_topics
-                    self.cortex.reset_synaptic_weights()
-                    self.hippocampus.reset_all_banks()
 
                 reencode_texts: list[str] = []
                 reencode_imps: list[int] = []
@@ -1625,8 +1628,9 @@ class SleepingBrain:
                                     preview_label=txt[:200],
                                     sparsity_pct=w_re.sparsity_pct,
                                     topic="Szkoła podstawowa — fundamenty",
+                                    pinned=(imp >= 4),
                                 )
-                                for txt in reencode_texts
+                                for txt, imp in zip(reencode_texts, reencode_imps)
                             ],
                             strengths=[1.5] * len(reencode_texts),
                             importances=[float(x) for x in reencode_imps],
@@ -1636,7 +1640,7 @@ class SleepingBrain:
                         self.cortex.apply_synaptic_homeostasis()
                     self._log(
                         "STUDY",
-                        f"🔄 Zresetowano W_in/W_rec i przekodowano {len(reencode_texts)} engramów z curriculum do nowej przestrzeni Wernickego.",
+                        f"🔄 Zresetowano W_in/W_rec przed dostrajaniem dialogów i przekodowano {len(reencode_texts)} engramów do nowej przestrzeni Wernickego.",
                     )
                 else:
                     self._log(

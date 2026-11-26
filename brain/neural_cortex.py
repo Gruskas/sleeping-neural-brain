@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -392,11 +393,14 @@ class BiologicalAssociativeCortex(nn.Module):
             w_rec_f.fill_diagonal_(0.0)
             w_rec_f.clamp_(-1.0, 1.0)
 
-            # 3) Homeostatic threshold plasticity
+            # 3) Homeostatic threshold plasticity — strictly bounded to a small fraction (~15%) of
+            #    an active k-WTA neuron's amplitude (1/sqrt(sdr_k) ~= 0.039) so homeostasis gently
+            #    breaks ties without EVER overpowering the user's sensory SDR `u`!
             fired = (z > 0).float().mean(dim=0)
             self.avg_activity.mul_(0.90).add_(0.10 * fired)
-            self.threshold.add_(float(self.cfg.homeostasis_lr) * (self.avg_activity - self.target_sparsity))
-            self.threshold.clamp_(-0.4, 0.4)
+            thr_cap = min(0.006, 0.15 / math.sqrt(float(max(1, self.sdr_k))))
+            self.threshold.add_(float(self.cfg.homeostasis_lr) * 0.1 * (self.avg_activity - self.target_sparsity))
+            self.threshold.clamp_(-thr_cap, thr_cap)
             self.total_local_updates += 1
 
         self.W_in.copy_(w_in_f.to(dtype=self.W_in.dtype))
@@ -597,7 +601,10 @@ class BiologicalAssociativeCortex(nn.Module):
         self.W_in.copy_(state["W_in"].to(device=self.device, dtype=self.W_in.dtype))
         self.W_rec.copy_(state["W_rec"].to(device=self.device, dtype=self.W_rec.dtype))
         self.W_rec.fill_diagonal_(0.0)
-        self.threshold.copy_(state["threshold"].to(device=self.device, dtype=torch.float32))
+        thr_cap = min(0.006, 0.15 / math.sqrt(float(max(1, self.sdr_k))))
+        self.threshold.copy_(
+            state["threshold"].to(device=self.device, dtype=torch.float32).clamp(-thr_cap, thr_cap)
+        )
         self.avg_activity.copy_(state["avg_activity"].to(device=self.device, dtype=torch.float32))
         if "last_active_sdr" in state:
             self.last_active_sdr.copy_(state["last_active_sdr"].to(device=self.device, dtype=torch.float32))

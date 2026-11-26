@@ -17,6 +17,13 @@ class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        import sys
+        _, exc, _ = sys.exc_info()
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
 
 class BrainServer:
     """Pure conversational & autonomous web-study HTTP server (no 2D world loop)."""
@@ -50,7 +57,10 @@ class BrainServer:
                     for k, v in extra_headers.items():
                         self.send_header(k, v)
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    return
 
             def _read_json(self) -> dict[str, Any]:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -101,7 +111,10 @@ class BrainServer:
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
-                    self.wfile.write(data)
+                    try:
+                        self.wfile.write(data)
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        return
                     return
 
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")

@@ -312,9 +312,9 @@ class LanguageCortex:
         sim_f = round(float(best_val.item()), 4)
         if self._canonical_q_sdrs.shape[0] != self._known_q_sdrs.shape[0]:
             return sim_f, None
-        if sim_f >= 0.78:
+        if sim_f >= 0.84:
             return sim_f, self._canonical_q_sdrs[int(best_idx.item())]
-        if sim_f >= 0.45:
+        if sim_f >= 0.72:
             k_top = min(3, int(sims.shape[0]))
             top_vals, top_idxs = torch.topk(sims, k=k_top)
             weights = F.softmax(16.0 * top_vals, dim=-1).to(dtype=torch.float32)
@@ -606,15 +606,15 @@ class LanguageCortex:
 
         w_out, q_sim, canon_sdr = self.perceive_for_chat(user_message)
 
-        if canon_sdr is not None and q_sim >= 0.45:
+        if canon_sdr is not None and q_sim >= 0.72:
             snap_sdr = canon_sdr.to(device=self.device, dtype=w_out.sdr.dtype).unsqueeze(0)
         else:
             snap_sdr = w_out.sdr
 
         path_specs: list[tuple[str, float, bool, float, float, int, float, bool]] = [
-            ("Precyzyjna", max(0.36, eff_base_t - 0.08), False, 0.92, 0.0, eff_steps, 0.0, True),
-            ("Kontekstowa", eff_base_t, True, 0.85, working_memory_weight, min(6, eff_steps + 1), 0.0, q_sim >= 0.72),
-            ("Kreatywna", cre_temp, False, 0.90, working_memory_weight * 0.5, eff_steps, cre_noise, q_sim >= 0.78),
+            ("Precyzyjna", max(0.36, eff_base_t - 0.08), False, 0.92, 0.0, eff_steps, 0.0, q_sim >= 0.84),
+            ("Kontekstowa", eff_base_t, True, 0.85, working_memory_weight, min(6, eff_steps + 1), 0.0, q_sim >= 0.84),
+            ("Kreatywna", cre_temp, False, 0.90, working_memory_weight * 0.5, eff_steps, cre_noise, q_sim >= 0.88),
         ][:k_cand]
 
         thoughts: list[CortexThought] = []

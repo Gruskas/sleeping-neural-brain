@@ -1188,6 +1188,28 @@ class TestHTTPServerSSEAndPretrainScript(unittest.TestCase):
         sims = torch.mv(lb.m2_assoc_traces.float(), marker_vec.float())
         self.assertGreater(float(sims.max().item()), 0.99, "Old strong M2 episode must survive _prune_weak_episodes!")
 
+    def test_cortex_threshold_bounded_preserves_sensory_sdr(self) -> None:
+        import torch.nn.functional as F
+        from brain.config import BrainConfig
+        from brain.neural_cortex import BiologicalAssociativeCortex
+        from brain.sensory_wernicke import k_wta
+
+        cfg = BrainConfig(num_neurons=1024, sdr_k=40, num_columns=4, column_dim=32)
+        cortex = BiologicalAssociativeCortex(cfg, device=torch.device("cpu"))
+        # Drive many local updates with skewed patterns to try to push homeostatic threshold
+        cols = torch.randn(8, 4, 32)
+        z_batch, _, _ = k_wta(torch.randn(8, 1024), k=40, normalize=True)
+        for _ in range(40):
+            cortex.learn_local(cols, z_batch, steps=5, noise_std=0.01)
+
+        self.assertLessEqual(float(cortex.threshold.abs().max().item()), 0.0061)
+        # Verify a novel sensory SDR `u` is NOT overwritten by homeostatic thresholds!
+        novel_u, _, _ = k_wta(torch.randn(1, 1024), k=40, normalize=True)
+        novel_cols = torch.randn(1, 4, 32)
+        th = cortex.perceive_and_think(novel_cols, novel_u, engram_bank=None, steps=3, noise_std=0.0, update_last_active=False)
+        cos_u_z = float(F.cosine_similarity(novel_u[0], th.z_star[0], dim=0).item())
+        self.assertGreater(cos_u_z, 0.80, f"Threshold must not crush sensory SDR u (got cos={cos_u_z:.3f})!")
+
 
 if __name__ == "__main__":
     unittest.main()
