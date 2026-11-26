@@ -865,7 +865,9 @@
         const s = await api("/api/state");
         latestState = s;
         renderUI(s);
-      } catch (e) {}
+      } catch (e) {
+        console.error("poll/renderUI error:", e);
+      }
     }
 
     function setMemTab(tab) {
@@ -1129,6 +1131,7 @@
       const pqFileSel = document.getElementById("parquetFile");
       if (pqBtn) {
         const pq = s.parquet_corpus || {};
+        const files = Array.isArray(pq.files) ? pq.files : [];
         if (pqFileSel) {
           const sig = files.length > 0
             ? files.map(f => `${f.filename}:${f.size_mb}:${f.num_rows}`).join("|")
