@@ -120,6 +120,13 @@ class BiologicalAssociativeCortex(nn.Module):
         self.last_prediction_error: float = 0.0
         self.total_local_updates: int = 0
 
+    def to(self, *args: Any, **kwargs: Any) -> "BiologicalAssociativeCortex":
+        res = super().to(*args, **kwargs)
+        target_dev = self.W_in.device
+        if hasattr(self, "W_rec") and self.W_rec is not None and self.W_rec.device != target_dev:
+            self.W_rec = self.W_rec.to(device=target_dev)
+        return res
+
     def total_parameters(self) -> int:
         return int(self.W_in.numel() + self.W_rec.numel() + self.threshold.numel())
 
@@ -642,7 +649,8 @@ class BiologicalAssociativeCortex(nn.Module):
         sel_t = torch.tensor(selected, dtype=torch.long, device=cur_dev)
         sub_w = self.W_rec.select_submatrix(sel_t, sel_t)  # [K, K]
         # Build feature matrix from synaptic profiles + engram affinity if available
-        feats = self.W_in.index_select(0, sel_t).float()  # [K, sensory_dim]
+        w_in_idx = sel_t if self.W_in.device == cur_dev else sel_t.to(self.W_in.device)
+        feats = self.W_in.index_select(0, w_in_idx).to(device=cur_dev, dtype=torch.float32)  # [K, sensory_dim]
         if engram_bank is not None and engram_bank.numel() > 0:
             if isinstance(engram_bank, QuantizedSynapseMatrix):
                 m_eb = engram_bank.shape[0]

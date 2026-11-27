@@ -242,6 +242,7 @@ AI_BANNED_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\basystent(?:em|a)?\s+(?:ai|sztucznej\s+inteligencji)\b"),
     re.compile(r"\b(?:chatgpt|openai|speakleash)\b"),
     re.compile(r"\bnie\s+jestem\s+(?:czlowiekiem|istota\s+zywa|zywym\s+organizmem)\b"),
+    re.compile(r"\bjako\s+nauczyciel\w*\s+(?:naturalnego\s+)?jezyka\s+polskiego\b"),
 )
 
 
@@ -371,10 +372,10 @@ def generate_bielik_teacher_dialogues(
     model = None
     generated_pairs: list[tuple[str, str]] = []
     sys_msg = (
-        "Jesteś nauczycielem naturalnego języka polskiego. "
-        + LIVING_BRAIN_SYSTEM_RULES
-        + " Odpowiadaj na każdą wiadomość po polsku — naturalnie, po ludzku, bez cenzury, bez moralizowania, "
-        "z własną osobowością, krótko i konkretnie (maksymalnie ~200 znaków)."
+        LIVING_BRAIN_SYSTEM_RULES
+        + " Rozmawiasz bezpośrednio z użytkownikiem po polsku — naturalnie, po ludzku, bez moralizowania, "
+        "bez mówienia że jesteś nauczycielem, botem czy AI. Odpowiadaj z własną osobowością, "
+        "rzeczowo na pytania o fakty i luźno na zwykłe pogaduchy (1–2 zdania, maksymalnie ~200 znaków)."
     )
 
     try:
@@ -1180,6 +1181,7 @@ def run_bielik_teacher_subprocess(
     )
     last_summary: dict[str, Any] | None = None
     stopped = False
+    error_lines: list[str] = []
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -1200,11 +1202,21 @@ def run_bielik_teacher_subprocess(
                     last_summary = json.loads(s[len("TEACHER_DONE:") :])
                 except Exception:
                     pass
+            elif s:
+                error_lines.append(s)
+                if len(error_lines) > 30:
+                    error_lines = error_lines[-30:]
         proc.wait(timeout=15)
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+
+    rc = proc.returncode
+    err_msg = ""
+    if not stopped and rc not in (0, None):
+        tail = " | ".join(error_lines[-4:]) if error_lines else f"exit code {rc}"
+        err_msg = f"Podproces Bielika zakończył się błędem (kod {rc}): {tail}"
 
     after_count = count_teacher_dialogues(state_dir)
     gen_n = int(last_summary["generated"]) if (last_summary and "generated" in last_summary) else max(0, after_count - before_count)
@@ -1213,6 +1225,8 @@ def run_bielik_teacher_subprocess(
         "total_saved": after_count,
         "duration_s": round(time.perf_counter() - t0, 2),
         "stopped": stopped,
+        "returncode": rc,
+        "error": err_msg,
     }
 
 
@@ -1255,6 +1269,7 @@ def run_bielik_reasoning_subprocess(
     )
     last_summary: dict[str, Any] | None = None
     stopped = False
+    error_lines: list[str] = []
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -1275,11 +1290,21 @@ def run_bielik_reasoning_subprocess(
                     last_summary = json.loads(s[len("TEACHER_DONE:") :])
                 except Exception:
                     pass
+            elif s:
+                error_lines.append(s)
+                if len(error_lines) > 30:
+                    error_lines = error_lines[-30:]
         proc.wait(timeout=15)
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+
+    rc = proc.returncode
+    err_msg = ""
+    if not stopped and rc not in (0, None):
+        tail = " | ".join(error_lines[-4:]) if error_lines else f"exit code {rc}"
+        err_msg = f"Podproces Bielika (rozumowanie) zakończył się błędem (kod {rc}): {tail}"
 
     after_count = count_reasoning_dialogues(state_dir)
     gen_n = int(last_summary["generated"]) if (last_summary and "generated" in last_summary) else max(0, after_count - before_count)
@@ -1292,6 +1317,8 @@ def run_bielik_reasoning_subprocess(
         "total_saved": after_count,
         "duration_s": round(time.perf_counter() - t0, 2),
         "stopped": stopped,
+        "returncode": rc,
+        "error": err_msg,
     }
 
 

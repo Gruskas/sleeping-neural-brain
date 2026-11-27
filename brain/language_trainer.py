@@ -641,19 +641,33 @@ def build_dialogue_qa_pairs(
         auto-generated from `ELEMENTARY_FOUNDATION_PACK`.
     """
     pairs: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    seen_exact: set[tuple[str, str]] = set()
+    q_to_idx: dict[str, int] = {}
 
-    def _add(q: str, a: str) -> None:
+    def _add(q: str, a: str, override: bool = False) -> None:
         qs = (q or "").strip()
         ans = (a or "").strip()
         if len(qs) < min_chars or len(ans) < min_chars:
             return
         if is_ai_corporate_reply(ans):
             return
-        key = (qs.lower(), ans.lower())
-        if key not in seen:
-            seen.add(key)
-            pairs.append((qs, ans))
+        q_low = qs.lower()
+        exact_key = (q_low, ans.lower())
+        # Keep multiple diverse uncertainty replies for __nieznane_pytanie__,
+        # but prevent conflicting answers for the exact same normal question!
+        if q_low.startswith("__"):
+            if exact_key not in seen_exact:
+                seen_exact.add(exact_key)
+                pairs.append((qs, ans))
+            return
+        if q_low in q_to_idx:
+            if override:
+                pairs[q_to_idx[q_low]] = (qs, ans)
+                seen_exact.add(exact_key)
+            return
+        q_to_idx[q_low] = len(pairs)
+        seen_exact.add(exact_key)
+        pairs.append((qs, ans))
 
     for q, a in BASE_HUMAN_DIALOGUES:
         _add(q, a)
@@ -721,7 +735,7 @@ def build_dialogue_qa_pairs(
 
     if extra_pairs:
         for q, a in extra_pairs:
-            _add(q, a)
+            _add(q, a, override=True)
 
     return pairs
 
@@ -842,8 +856,30 @@ _BAD_WIKI_LINE_RE = re.compile(
 )
 
 
+_PL_STOPWORDS = frozenset({
+    "w", "i", "z", "na", "do", "się", "nie", "jest", "że", "to", "jak", "od",
+    "po", "za", "oraz", "przez", "dla", "jako", "są", "był", "była", "było",
+    "były", "ale", "lub", "czy", "które", "który", "która", "których", "może",
+    "już", "tylko", "także", "również", "bardzo", "przy", "pod", "nad", "przed",
+    "między", "bez", "ze", "we", "co", "kto", "gdy", "jeśli", "gdyż", "ponieważ",
+    "jednak", "więc", "tym", "tego", "tej", "ten", "ta", "te", "ich", "jego",
+    "jej", "aby", "żeby", "ani", "będzie", "będą", "mają", "ma", "być",
+})
+_EN_STOPWORDS = frozenset({
+    "the", "and", "is", "are", "was", "were", "with", "that", "this", "from",
+    "have", "has", "had", "but", "not", "you", "your", "they", "their", "his",
+    "her", "she", "he", "it", "its", "everything", "nothing", "something",
+    "because", "which", "where", "when", "what", "who", "how", "into", "about",
+    "over", "under", "after", "before", "between", "through", "during",
+    "without", "within", "while", "though", "although", "however", "therefore",
+    "would", "could", "should", "will", "can", "just", "than", "then", "also",
+    "more", "most", "some", "any", "all", "each", "every", "both", "few",
+    "many", "much", "such", "only", "very", "here", "there", "been", "being",
+})
+
+
 def _is_grammatical_polish_sentence(s: str, min_chars: int = 32, max_chars: int = 230) -> bool:
-    """Filter for clean, grammatically complete Polish prose sentences (good punctuation, diacritics/letters)."""
+    """Filter for clean, grammatically complete Polish prose sentences (without requiring Polish diacritics)."""
     n = len(s)
     if n < min_chars or n > max_chars:
         return False
@@ -856,9 +892,19 @@ def _is_grammatical_polish_sentence(s: str, min_chars: int = 32, max_chars: int 
     letters = sum(1 for ch in s if ch.isalpha())
     if letters / float(n) < 0.68:
         return False
-    if len(s.split()) < 5:
+    words = s.split()
+    if len(words) < 5:
         return False
     if s.count("(") != s.count(")") or s.count("[") != s.count("]"):
+        return False
+
+    lower_words = [w.strip(".,!?;:\"'()[]{}").lower() for w in words]
+    pl_hits = sum(1 for w in lower_words if w in _PL_STOPWORDS)
+    en_hits = sum(1 for w in lower_words if w in _EN_STOPWORDS)
+
+    if en_hits >= 2 and en_hits > pl_hits:
+        return False
+    if en_hits >= 3 and pl_hits == 0:
         return False
     return True
 
@@ -890,11 +936,15 @@ def inspect_parquet_corpus(path: str | Path) -> dict[str, object]:
 
 
 def list_parquet_corpora(base_dir: str | Path) -> list[dict[str, object]]:
-    """Discover and inspect every *.parquet file in the workspace root (e.g. train-00000..., 000_00000.parquet)."""
+    """Discover and inspect only the approved Polish Parquet corpora from PARQUET_CORPORA_CATALOG."""
     root = Path(base_dir)
     if not root.exists():
         return []
-    files = sorted(p for p in root.glob("*.parquet") if p.is_file())
+    files = [
+        root / name
+        for name in PARQUET_CORPORA_CATALOG
+        if (root / name).is_file()
+    ]
     return [inspect_parquet_corpus(p) for p in files]
 
 

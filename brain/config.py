@@ -65,8 +65,8 @@ class BrainConfig:
     broca_weight_decay: float = 0.05
     broca_label_smoothing: float = 0.1
     broca_dialogue_lr: float = 9e-4
-    broca_dialogue_label_smoothing: float = 0.05
-    broca_dialogue_early_stop_loss: float = 0.53
+    broca_dialogue_label_smoothing: float = 0.04
+    broca_dialogue_early_stop_loss: float = 0.34
     broca_decoder_byte_dropout: float = 0.15
     broca_early_stop_loss: float = 0.90
     broca_z_noise_std: float = 0.03

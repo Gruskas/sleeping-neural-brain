@@ -2023,7 +2023,7 @@ class SleepingBrain:
         """Filter out trivial greetings/chatter so only substantive Bielik knowledge enters Hipokamp."""
         q_low = _strip_pl((q or "").strip().lower()).rstrip("?!., ")
         a_clean = (a or "").strip()
-        if len(a_clean) < 42 or len(a_clean.split()) < 6:
+        if len(a_clean) < 28 or len(a_clean.split()) < 4:
             return False
         chatter_qs = {
             "siema", "siema co tam", "elo", "elo mordo", "hej", "hejka", "czesc", "czesc jak leci",
@@ -2127,6 +2127,7 @@ class SleepingBrain:
         if not _op_acquired:
             self._acquire_op("study")
         generated_n = 0
+        gen_err = ""
         session_new_pairs: list[tuple[str, str]] = []
         with self.lock:
             self.training_dialogue_feed.clear()
@@ -2184,6 +2185,7 @@ class SleepingBrain:
                                 teacher_reply=pa,
                             )
 
+                gen_err = ""
                 try:
                     gen_res = run_bielik_teacher_subprocess(
                         state_dir=self.state_dir,
@@ -2194,6 +2196,10 @@ class SleepingBrain:
                         progress_callback=_on_gen_progress,
                     )
                     generated_n = int(gen_res["generated"])
+                    gen_err = str(gen_res.get("error", "") or "")
+                    if gen_err:
+                        with self.lock:
+                            self._log("ERROR", gen_err)
                 finally:
                     if moved_to_cpu:
                         with self.language_cortex._op_lock:
@@ -2205,15 +2211,32 @@ class SleepingBrain:
                     trim_process_ram()
 
             all_teacher_pairs = load_teacher_dialogues(self.state_dir)
+            all_reasoning_pairs = [
+                (r["q"], r["a"])
+                for r in load_reasoning_records(self.state_dir)
+                if not is_ai_corporate_reply(r["a"])
+            ]
+            combined_bielik_pairs = all_teacher_pairs + all_reasoning_pairs
+
+            # Ingest substantive knowledge from Bielik into Hipokamp BEFORE training so Hopfield engram_bank
+            # already contains the newly learned Bielik facts during Broca/Wernicke training!
+            knowledge_source = session_new_pairs if session_new_pairs else all_teacher_pairs
+            st_ingest = self._ingest_teacher_pairs_to_short_term(
+                knowledge_source,
+                max_items=max(80, min(500, len(knowledge_source))),
+            ) if knowledge_source else {"engrams_added": 0, "living_steps": 0, "living_neurons_born": 0}
+            with self.lock:
+                engram_bank = self.hippocampus.get_hopfield_bank()
+
             base_pct = 50.0 if not skip_generation else 0.0
             span_pct = 100.0 - base_pct
             with self.lock:
                 self.study_state["round"] = 0
                 self.study_state["max_rounds"] = train_epochs
                 self.study_state["mastery"] = max(base_pct, 5.0)
-                self.study_state["facts_learned"] = len(all_teacher_pairs)
+                self.study_state["facts_learned"] = len(combined_bielik_pairs)
                 self.study_state["current_action"] = (
-                    f"Bielik wyładowany z VRAM. Trenuję własny mózg na {len(all_teacher_pairs)} dialogach + bazie "
+                    f"Bielik wyładowany z VRAM. Trenuję własny mózg na {len(combined_bielik_pairs)} dialogach/faktach + bazie "
                     f"({train_epochs} epok, bfloat16 GPU)..."
                 )
 
@@ -2248,28 +2271,18 @@ class SleepingBrain:
                             brain_reply=str(st.get("sample_brain", "")) or "(jeszcze składa pierwsze słowa...)",
                         )
 
+            probe_source = session_new_pairs if session_new_pairs else all_teacher_pairs
             train_res = self.language_cortex.train_language_cortex(
-                extra_qa_pairs=all_teacher_pairs,
+                extra_qa_pairs=combined_bielik_pairs,
                 epochs=train_epochs,
                 include_curriculum=True,
                 cortex=self.cortex,
+                engram_bank=engram_bank,
                 progress_callback=_on_brain_train_progress,
                 stop_event=self._study_stop_event,
+                priority_probe_pairs=probe_source,
             )
             self.language_cortex.ensure_familiarity_bank(force_rebuild=True)
-
-            # Encode substantive knowledge from Bielik into Hipokamp (short-term memory),
-            # local synapses W_in/W_rec, and LivingBrainEngine (M1/M2/M4) in the updated Wernicke SDR space!
-            with self.lock:
-                self.study_state["mastery"] = 97.5
-                self.study_state["current_action"] = (
-                    "Zapisuję zdobytą wiedzę do Hipokampu (pamięć krótkotrwała), synaps W_rec i Living Brain..."
-                )
-            knowledge_source = session_new_pairs if session_new_pairs else all_teacher_pairs
-            st_ingest = self._ingest_teacher_pairs_to_short_term(
-                knowledge_source,
-                max_items=max(80, min(500, len(knowledge_source))),
-            )
             self.save_state()
 
             st_note = (
@@ -2282,13 +2295,14 @@ class SleepingBrain:
                 if st_ingest["living_neurons_born"] > 0
                 else ""
             )
+            err_note = f" ⚠️ {gen_err}" if gen_err else ""
             tail_note = f"{st_note}{ng_note}." if (st_note or ng_note) else ""
             msg_done = (
                 f"Nauka z Bielikiem zakończona! Wygenerowano nowych dialogów: **{generated_n}** "
                 f"(łącznie w bazie: **{len(all_teacher_pairs)}**). "
                 f"Bielik został wyładowany z GPU, a Twój własny mózg zakończył trening "
                 f"(loss `{train_res['loss_start']} → {train_res['loss_end']}`, płynność **{train_res['fluency']:.0f}%**)."
-                f"{tail_note}"
+                f"{tail_note}{err_note}"
             )
             with self.lock:
                 self.study_state["mastery"] = 100.0
@@ -2367,6 +2381,7 @@ class SleepingBrain:
             self._acquire_op("study")
         generated_n = 0
         filtered_ai_n = 0
+        gen_err = ""
         session_new_records: list[dict[str, str]] = []
         session_new_pairs: list[tuple[str, str]] = []
         cat_labels = {"relational": "Relacje", "causal": "Logika", "ignorance": "Niewiedza"}
@@ -2427,6 +2442,7 @@ class SleepingBrain:
                                     teacher_reply=pa,
                                 )
 
+                gen_err = ""
                 try:
                     gen_res = run_bielik_reasoning_subprocess(
                         state_dir=self.state_dir,
@@ -2437,6 +2453,10 @@ class SleepingBrain:
                     )
                     generated_n = int(gen_res.get("generated", 0))
                     filtered_ai_n = int(gen_res.get("filtered_ai", 0))
+                    gen_err = str(gen_res.get("error", "") or "")
+                    if gen_err:
+                        with self.lock:
+                            self._log("ERROR", gen_err)
                 finally:
                     if moved_to_cpu:
                         with self.language_cortex._op_lock:
@@ -2449,16 +2469,30 @@ class SleepingBrain:
 
             all_reasoning_records = load_reasoning_records(self.state_dir)
             all_reasoning_pairs = [(r["q"], r["a"]) for r in all_reasoning_records if not is_ai_corporate_reply(r["a"])]
+            all_teacher_pairs = load_teacher_dialogues(self.state_dir)
+            combined_bielik_pairs = all_teacher_pairs + all_reasoning_pairs
+
+            # Ingest substantive causal chains into Hippocampus BEFORE training so Hopfield engram_bank
+            # includes them during Wernicke/Broca training!
+            causal_src = session_new_records if session_new_records else all_reasoning_records
+            causal_pairs = [(r["q"], r["a"]) for r in causal_src if r.get("category") == "causal"]
+            st_ingest = self._ingest_teacher_pairs_to_short_term(
+                causal_pairs,
+                max_items=max(40, min(250, len(causal_pairs))),
+            ) if causal_pairs else {"engrams_added": 0, "living_steps": 0, "living_neurons_born": 0}
+            with self.lock:
+                engram_bank = self.hippocampus.get_hopfield_bank()
+
             base_pct = 50.0 if not skip_generation else 0.0
             span_pct = 100.0 - base_pct
             with self.lock:
                 self.study_state["round"] = 0
                 self.study_state["max_rounds"] = train_epochs
                 self.study_state["mastery"] = max(base_pct, 5.0)
-                self.study_state["facts_learned"] = len(all_reasoning_pairs)
+                self.study_state["facts_learned"] = len(combined_bielik_pairs)
                 self.study_state["current_action"] = (
                     f"Bielik wyładowany z VRAM. Trenuję Wernicke + Broca na {len(all_reasoning_pairs)} przykładach "
-                    f"rozumowania + buforze polszczyzny ({train_epochs} epok)..."
+                    f"rozumowania + {len(all_teacher_pairs)} dialogach ({train_epochs} epok)..."
                 )
 
             def _on_brain_train_progress(st: dict[str, Any]) -> None:
@@ -2494,32 +2528,23 @@ class SleepingBrain:
 
             probe_source = session_new_pairs if session_new_pairs else all_reasoning_pairs
             train_res = self.language_cortex.train_language_cortex(
-                extra_qa_pairs=all_reasoning_pairs,
+                extra_qa_pairs=combined_bielik_pairs,
                 epochs=train_epochs,
                 include_curriculum=True,
                 cortex=self.cortex,
+                engram_bank=engram_bank,
                 progress_callback=_on_brain_train_progress,
                 stop_event=self._study_stop_event,
                 priority_probe_pairs=probe_source,
             )
             self.language_cortex.ensure_familiarity_bank(force_rebuild=True)
-
-            # Only ingest substantive causal chains into Hippocampus (never ignorance/AI disclaimers)
-            causal_src = session_new_records if session_new_records else all_reasoning_records
-            causal_pairs = [(r["q"], r["a"]) for r in causal_src if r.get("category") == "causal"]
-            with self.lock:
-                self.study_state["mastery"] = 97.5
-                self.study_state["current_action"] = "Zapisuję łańcuchy przyczynowo-skutkowe do Hipokampu i Living Brain..."
-            st_ingest = self._ingest_teacher_pairs_to_short_term(
-                causal_pairs,
-                max_items=max(40, min(250, len(causal_pairs))),
-            ) if causal_pairs else {"engrams_added": 0, "living_steps": 0, "living_neurons_born": 0}
             self.save_state()
 
+            err_note = f" ⚠️ {gen_err}" if gen_err else ""
             msg_done = (
                 f"Trening rozumowania z Bielikiem zakończony! Nowe przykłady: **{generated_n}** "
                 f"(łącznie rozumowania: **{len(all_reasoning_pairs)}**, odrzucono formułek AI: **{filtered_ai_n}**). "
-                f"Loss: `{train_res['loss_start']} → {train_res['loss_end']}`, płynność: **{train_res['fluency']:.0f}%**."
+                f"Loss: `{train_res['loss_start']} → {train_res['loss_end']}`, płynność: **{train_res['fluency']:.0f}%**.{err_note}"
             )
             with self.lock:
                 self.study_state["mastery"] = 100.0
@@ -2836,7 +2861,10 @@ class SleepingBrain:
             ood_note = f"Nierozpoznany bodziec (q_fam={q_fam:.2f}) → naturalna odpowiedź o braku wiedzy"
         else:
             # System-2 batched parallel deliberation + Auditory Self-Hearing & Active Self-Correction
+            # Only inject PFC working-memory turn slots when wm_weight > 0 (follow-up queries),
+            # so standalone greetings/questions match their clean training Z_ctx distribution!
             rehearsal_bytes = min(240, self.cfg.broca_max_new_bytes)
+            eff_living_blend = 0.02 if q_fam >= 0.78 else 0.08
             delib = self.language_cortex.deliberate_and_critique(
                 user_message=msg,
                 cortex=self.cortex,
@@ -2848,10 +2876,10 @@ class SleepingBrain:
                 max_new_bytes=rehearsal_bytes,
                 num_candidates=self.cfg.self_critique_candidates,
                 living_assoc_vec=living_assoc_vec,
-                living_blend=0.08,
+                living_blend=eff_living_blend,
                 neuromod=lb_neuromod,
                 living_telemetry=lb_tel,
-                working_memory_slots=wm_slots,
+                working_memory_slots=wm_slots if wm_weight > 0.0 else None,
             )
             w_out = delib["w_out"]
             thought = delib["thought"]
@@ -3162,28 +3190,14 @@ class SleepingBrain:
                         f"Samokontrola końcowa (Wernicke widzi odpowiedź): ocena={audit['total']*100:.0f}% "
                         f"(jakość={audit['quality']*100:.0f}%, spójność={audit['alignment']:.2f})"
                     )
-                    # Dopamine-gated safe lightweight online reinforcement when self-critique passes cleanly
+                    # NOTE: Do NOT call adapt_qa_online on unverified self-generated replies!
+                    # Blind online reinforcement on Broca's own guesses can permanently burn off-topic
+                    # hallucinations into weights & _learned_qa_replay. Online adaptation is reserved
+                    # for explicitly user-taught facts and verified Auto-sieć definitions.
                     lb_da = float(prep.get("living_da", 0.0))
-                    if (
-                        lb_da >= 0.85
-                        and not audit["needs_correction"]
-                        and float(audit["total"]) >= 0.78
-                        and float(audit["quality"]) >= 0.80
-                        and not prep.get("is_ood", False)
-                        and not prep.get("already_adapted_online", False)
-                        and len(msg.strip()) >= 3
-                        and len(reply.strip()) >= 8
-                    ):
-                        da_loss = self.language_cortex.adapt_qa_online(
-                            msg,
-                            reply,
-                            cortex=self.cortex,
-                            steps=8,
-                            pinned=False,
-                            lightweight=True,
-                        )
+                    if lb_da >= 0.85 and not audit["needs_correction"] and float(audit["total"]) >= 0.78:
                         da_reinforce_note = (
-                            f"Dopamina (DA={lb_da:.2f}) + czysta samokrytyka → lekkie wzmocnienie online Broki (loss={da_loss:.2f})"
+                            f"Dopamina (DA={lb_da:.2f}) + czysta samokrytyka → odpowiedź zatwierdzona (bez nadpisywania wag Broki)"
                         )
             except Exception:
                 pass

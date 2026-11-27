@@ -326,19 +326,27 @@ class LanguageCortex:
         with self._op_lock:
             w_batch = self._wernicke_raw.encode_texts(variants, device=self.device, batch_size=len(variants))
             best_sim = -1.0
+            best_idx = 0
+            sim_0 = -1.0
             for i in range(len(variants)):
                 sim_i, _ = self.match_known_attractor(w_batch.sdr[i])
+                if i == 0:
+                    sim_0 = sim_i
                 if sim_i > best_sim:
                     best_sim = sim_i
+                    best_idx = i
+            # Use the case/punctuation-normalized variant of the user's OWN message when it
+            # matches Wernicke's trained byte space better (e.g. "Siema" -> "siema").
+            pick = best_idx if (best_idx > 0 and best_sim > sim_0 + 0.02) else 0
             single_out = WernickeOutput(
-                columns=w_batch.columns[:1],
-                sdr=w_batch.sdr[:1],
-                reconstructed_columns=w_batch.reconstructed_columns[:1],
-                active_indices=w_batch.active_indices[:1],
-                active_values=w_batch.active_values[:1],
+                columns=w_batch.columns[pick : pick + 1],
+                sdr=w_batch.sdr[pick : pick + 1],
+                reconstructed_columns=w_batch.reconstructed_columns[pick : pick + 1],
+                active_indices=w_batch.active_indices[pick : pick + 1],
+                active_values=w_batch.active_values[pick : pick + 1],
                 sparsity_pct=w_batch.sparsity_pct,
-                patch_columns=w_batch.patch_columns[:1] if w_batch.patch_columns is not None else None,
-                patch_mask=w_batch.patch_mask[:1] if w_batch.patch_mask is not None else None,
+                patch_columns=w_batch.patch_columns[pick : pick + 1] if w_batch.patch_columns is not None else None,
+                patch_mask=w_batch.patch_mask[pick : pick + 1] if w_batch.patch_mask is not None else None,
             )
             return single_out, best_sim, None
 
@@ -474,17 +482,17 @@ class LanguageCortex:
                 thought.z_star[0].float().unsqueeze(0),
             ).item()
         )
-        align_norm = max(0.0, min(1.0, (align + 0.10) / 0.75))
+        align_norm = max(0.0, min(1.0, (align + 0.05) / 0.70))
         conf = float(conf_info["confidence"])
         nll = float(conf_info["avg_nll"])
-        total = round(0.45 * conf + 0.45 * quality + 0.10 * align_norm, 4)
+        total = round(0.40 * conf + 0.35 * quality + 0.25 * align_norm, 4)
 
         issues: list[str] = []
         if nll > 1.05:
             issues.append(f"niska pewność Broki (NLL={nll:.2f})")
         if quality < 0.75:
             issues.append(f"słaba płynność polska ({quality*100:.0f}%)")
-        if align < 0.16:
+        if align < 0.22:
             issues.append(f"rozbieżność słuchowa z intencją Z* (cos={align:.2f})")
         words = re.findall(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż0-9]+", s.lower())
         if len(words) >= 6 and (len(set(words)) / float(len(words))) < 0.52:
@@ -1647,7 +1655,7 @@ class LanguageCortex:
         eff_lr = float(lr if lr is not None else self.cfg.broca_dialogue_lr)
         eff_ls = float(label_smoothing if label_smoothing is not None else self.cfg.broca_dialogue_label_smoothing)
         eff_stop = float(early_stop_loss if early_stop_loss is not None else self.cfg.broca_dialogue_early_stop_loss)
-        eff_drop = float(0.08 if decoder_byte_dropout is None else decoder_byte_dropout)
+        eff_drop = float(0.18 if decoder_byte_dropout is None else decoder_byte_dropout)
         is_cuda = self.device.type == "cuda"
         # VRAM-aware GPU batch sizing (stay well below WDDM paging cliff while saturating Tensor Cores!)
         if batch_size is not None:
@@ -1741,9 +1749,10 @@ class LanguageCortex:
             return in_b, in_m, tg_b
 
         with self._op_lock:
+            self._broca_raw.maybe_repair_collapsed_conditioning()
             self._wernicke_raw.train()
             self._broca_raw.train()
-            cond_mult = 2.0
+            cond_mult = 3.0
             opt = self._build_optimizer(lr=eff_lr, cond_lr_mult=cond_mult)
             opt_p: torch.optim.Optimizer | None = None
 
@@ -1898,12 +1907,14 @@ class LanguageCortex:
                                 clean_z=True,
                                 memory_mask=z_ctx_mask,
                                 return_components=True,
+                                prefix_weight=3.0,
                             )
                             moe_reg = (
                                 float(getattr(self.cfg, "broca_moe_aux_loss_coef", 0.01)) * aux_loss
                                 + float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001)) * z_loss
                             ) if self._broca_raw.use_moe else 0.0
-                            loss = ce_loss + moe_reg + self._wernicke_bottleneck_loss(w_out, z_star)
+                            cond_dec = self._broca_raw.conditioning_decorr_loss(z_ctx, z_ctx_mask)
+                            loss = ce_loss + moe_reg + cond_dec + self._wernicke_bottleneck_loss(w_out, z_star)
 
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
@@ -1974,7 +1985,7 @@ class LanguageCortex:
                             valid_tok = (tgt_next != PAD_BYTE).float()
                             row_nlls = (per_tok * valid_tok).sum(dim=1) / valid_tok.sum(dim=1).clamp(min=1.0)
                             for j, nll_v in enumerate(row_nlls.tolist()):
-                                if nll_v > 0.50:
+                                if nll_v > 0.38:
                                     hard_indices.append(chunk_idxs[j])
 
                     if hard_indices:
@@ -2027,16 +2038,18 @@ class LanguageCortex:
                                         tgt_bytes,
                                         z_ctx,
                                         label_smoothing=0.04,
-                                        decoder_byte_dropout=0.04,
+                                        decoder_byte_dropout=0.08,
                                         clean_z=True,
                                         memory_mask=z_ctx_mask,
                                         return_components=True,
+                                        prefix_weight=3.0,
                                     )
                                     moe_reg = (
                                         float(getattr(self.cfg, "broca_moe_aux_loss_coef", 0.01)) * aux_loss
                                         + float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001)) * z_loss
                                     ) if self._broca_raw.use_moe else 0.0
-                                    loss = ce_loss + moe_reg + self._wernicke_bottleneck_loss(w_out, z_star)
+                                    cond_dec = self._broca_raw.conditioning_decorr_loss(z_ctx, z_ctx_mask)
+                                    loss = ce_loss + moe_reg + cond_dec + self._wernicke_bottleneck_loss(w_out, z_star)
                                 loss.backward()
                                 torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
                                 opt_p.step()
@@ -2045,7 +2058,7 @@ class LanguageCortex:
                                 self._broca_raw.trained_steps += 1
                             loss_end = float((p_loss_gpu / float(max(1, p_cnt))).item())
                             self._broca_raw._update_fluency(loss_end)
-                            hit_p_stop = loss_end <= 0.36
+                            hit_p_stop = loss_end <= 0.26
                             _emit_dialogue_progress(
                                 "dialogue_polish",
                                 p_ep + 1,

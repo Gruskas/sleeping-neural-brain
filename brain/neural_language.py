@@ -543,6 +543,51 @@ class BrocaByteTransformer(nn.Module):
             return self.z_summary_norm(0.85 * primary_sum + 0.15 * extra_mean)
         return primary_sum
 
+    @torch.no_grad()
+    def maybe_repair_collapsed_conditioning(self) -> bool:
+        """
+        Detect & repair rank-1 conditioning collapse (e.g. after long raw-text Parquet pretraining
+        where `z_summary_proj` develops a huge constant bias direction with sv[0] >> sv[1] and maps
+        every question to the same z_summary / bos_z vector). Keeps all Polish LM weights intact!
+        """
+        w = self.z_summary_proj.weight.detach().float()
+        if w.ndim != 2 or min(w.shape) < 4:
+            return False
+        try:
+            svs = torch.linalg.svdvals(w)
+            sv0 = float(svs[0].item())
+            sv1 = float(svs[1].item()) if svs.numel() > 1 else 1.0
+        except Exception:
+            return False
+        if sv0 > 12.0 and (sv0 / max(sv1, 1e-6)) > 1.65:
+            nn.init.xavier_uniform_(self.z_col_compress.weight)
+            nn.init.xavier_uniform_(self.z_summary_proj.weight)
+            nn.init.xavier_uniform_(self.bos_z_proj.weight)
+            nn.init.xavier_uniform_(self.out_z_proj.weight)
+            return True
+        return False
+
+    def conditioning_decorr_loss(
+        self,
+        memory_columns: torch.Tensor,
+        memory_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Prevent Broca's pooled z_summary and bos_z prefix from collapsing across distinct questions."""
+        b = memory_columns.shape[0]
+        if b < 2:
+            return torch.zeros((), device=memory_columns.device, dtype=torch.float32)
+        z_mem = self.col_norm(memory_columns)
+        z_sum = self._pool_z_summary(z_mem, memory_mask=memory_mask)
+        bos_z = self.bos_z_proj(z_sum)
+        eye = torch.eye(b, device=memory_columns.device, dtype=torch.bool)
+        z_flat = F.normalize(z_sum.float(), dim=-1, eps=1e-6)
+        b_flat = F.normalize(bos_z.float(), dim=-1, eps=1e-6)
+        sim_z = (z_flat @ z_flat.T).masked_fill(eye, 0.0)
+        sim_b = (b_flat @ b_flat.T).masked_fill(eye, 0.0)
+        pen_z = (sim_z - 0.25).clamp(min=0.0).pow(2).mean()
+        pen_b = (sim_b - 0.25).clamp(min=0.0).pow(2).mean()
+        return 0.50 * (pen_z + pen_b)
+
     @staticmethod
     def _block_forward_no_cache(
         blk: _BrocaDecoderBlock,
@@ -656,14 +701,15 @@ class BrocaByteTransformer(nn.Module):
         clean_z: bool = False,
         memory_mask: torch.Tensor | None = None,
         return_components: bool = False,
+        prefix_weight: float = 1.0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute next-byte cross-entropy loss conditioned strictly on Z_ctx, plus Sparse MoE
         load-balancing aux_loss and router z_loss (when broca_use_moe=True).
         Applies decoder input byte dropout (~15%) during teacher-forcing so Broca MUST read Z_ctx
         via Cross-Attention + FiLM + <BOS> prefix + output Z* bridge instead of collapsing.
-        When return_components=True, returns (ce_loss, aux_loss, z_loss) so training loops can
-        combine weighted MoE regularization while tracking pure CE for early stopping / fluency.
+        When `prefix_weight > 1.0`, upweights the first 16 answer bytes so Z_ctx answer-selection
+        gradients are not diluted by 100+ easy continuation bytes.
         """
         inp = target_byte_ids[:, :-1]
         tgt = target_byte_ids[:, 1:]
@@ -687,12 +733,28 @@ class BrocaByteTransformer(nn.Module):
             return_aux=True,
         )
         ls = float(self.cfg.broca_label_smoothing if label_smoothing is None else label_smoothing)
-        ce_loss = F.cross_entropy(
-            logits.reshape(-1, BYTE_VOCAB_SIZE),
-            tgt.reshape(-1),
-            ignore_index=PAD_BYTE,
-            label_smoothing=ls,
-        )
+        pw = float(prefix_weight)
+        if pw > 1.01 and tgt.shape[1] > 1:
+            per_tok = F.cross_entropy(
+                logits.reshape(-1, BYTE_VOCAB_SIZE),
+                tgt.reshape(-1),
+                ignore_index=PAD_BYTE,
+                label_smoothing=ls,
+                reduction="none",
+            ).view(tgt.shape)
+            valid = token_mask.to(dtype=per_tok.dtype)
+            pos_w = torch.ones((1, tgt.shape[1]), device=tgt.device, dtype=per_tok.dtype)
+            k_pref = min(16, tgt.shape[1])
+            pos_w[:, :k_pref] = pw
+            w = valid * pos_w
+            ce_loss = (per_tok * w).sum() / w.sum().clamp(min=1.0)
+        else:
+            ce_loss = F.cross_entropy(
+                logits.reshape(-1, BYTE_VOCAB_SIZE),
+                tgt.reshape(-1),
+                ignore_index=PAD_BYTE,
+                label_smoothing=ls,
+            )
         if return_components:
             return ce_loss, aux_loss, z_loss
         if self.use_moe:
