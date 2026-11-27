@@ -141,8 +141,15 @@ class SleepingBrain:
         self.chat_log: list[dict[str, Any]] = []
         self.sleep_history: list[dict[str, Any]] = []
         self.event_log: list[dict[str, Any]] = []
+        self.dmn_thoughts: list[dict[str, Any]] = []
         self.training_dialogue_feed: list[dict[str, Any]] = []
         self._training_feed_seq: int = 0
+
+        # Autonomous DMN idle-thinking state (preempted immediately on user chat)
+        self._last_user_activity_ts: float = time.monotonic()
+        self._last_dmn_think_ts: float = 0.0
+        self._user_interrupt_event = threading.Event()
+        self._dmn_running = threading.Event()
 
         self.broca_llm: LocalPolishBrocaLLM | None = (
             LocalPolishBrocaLLM(
@@ -162,6 +169,7 @@ class SleepingBrain:
             memory_budget_mb=4096.0,
             start_background_clock=True,
         )
+        self.living_brain.set_idle_callback(self._on_background_clock_tick)
 
         if not self.load_state():
             self._seed_initial_knowledge()
@@ -175,6 +183,10 @@ class SleepingBrain:
             if self.broca_llm is not None:
                 self.broca_llm.load_async()
 
+    @property
+    def brain_log(self) -> list[dict[str, Any]]:
+        return self.event_log
+
     def _log(self, kind: str, message: str) -> None:
         self.event_log.append(
             {
@@ -186,6 +198,190 @@ class SleepingBrain:
         )
         if len(self.event_log) > 120:
             self.event_log = self.event_log[-120:]
+
+    def _is_busy_for_dmn(self) -> bool:
+        return (
+            self._user_interrupt_event.is_set()
+            or self._active_op is not None
+            or bool(self.study_state.get("active", False))
+            or self.state_mode != "AWAKE"
+            or not self.language_cortex.ready
+            or self.living_brain._pause_event.is_set()
+        )
+
+    def synthesize_2hop_thought(
+        self,
+        engram_a: dict[str, Any] | torch.Tensor,
+        engram_b: dict[str, Any] | torch.Tensor,
+        engram_c: dict[str, Any] | torch.Tensor,
+        tag: str = "dmn_2hop",
+        importance: float = 3.0,
+        bridge_meta: dict[str, Any] | None = None,
+        non_blocking: bool = False,
+        abort_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """
+        Synthesize an autonomous 2-hop thought connecting A and C through bridge B:
+          1. Build multi-slot Z_ctx [A, B, C] & generate + run Quality Gate via LanguageCortex.
+          2. If accepted:
+             - Save new unpinned engram into Hippocampus (`importance=3.0`, `parent_ids=[A,B,C]`, `tag`).
+             - Gently strengthen A <-> C in LivingBrainEngine via local Oja-Hebb plasticity.
+             - Log the accepted thought and its A --(B)--> C bridge into `event_log` (`brain_log`) and `dmn_thoughts`.
+        """
+        with self.lock:
+            sem_bank = self.hippocampus.semantic.engrams if len(self.hippocampus.semantic) > 0 else None
+            cur_day = int(self.day)
+            creativity = float(self.creativity_level)
+
+        res = self.language_cortex.synthesize_2hop_thought(
+            engram_a=engram_a,
+            engram_b=engram_b,
+            engram_c=engram_c,
+            cortex=self.cortex,
+            engram_bank=sem_bank,
+            creativity_level=creativity,
+            abort_event=abort_event,
+            non_blocking_lock=non_blocking,
+        )
+        if not res.get("accepted"):
+            return res
+
+        if abort_event is not None and abort_event.is_set():
+            res["accepted"] = False
+            res["aborted"] = True
+            return res
+
+        id_a = str(engram_a["id"]) if isinstance(engram_a, dict) and "id" in engram_a else "A"
+        id_b = str(engram_b["id"]) if isinstance(engram_b, dict) and "id" in engram_b else "B"
+        id_c = str(engram_c["id"]) if isinstance(engram_c, dict) and "id" in engram_c else "C"
+        lbl_a = (str(engram_a.get("preview_label", "")) if isinstance(engram_a, dict) else "").strip() or f"#{id_a}"
+        lbl_b = (str(engram_b.get("preview_label", "")) if isinstance(engram_b, dict) else "").strip() or f"#{id_b}"
+        lbl_c = (str(engram_c.get("preview_label", "")) if isinstance(engram_c, dict) else "").strip() or f"#{id_c}"
+        thought_text = str(res["thought_text"]).strip()
+        thought_sdr = res["thought_sdr"]
+
+        # 1) Record accepted thought engram into Hippocampus (pinned=False, moderate importance=3.0)
+        if non_blocking:
+            if not self.lock.acquire(blocking=False):
+                res["accepted"] = False
+                res["aborted"] = True
+                return res
+        else:
+            self.lock.acquire()
+        try:
+            if abort_event is not None and abort_event.is_set():
+                res["accepted"] = False
+                res["aborted"] = True
+                return res
+            saved_engram = self.hippocampus.record_2hop_engram(
+                sdr=thought_sdr,
+                thought_text=thought_text,
+                parent_ids=[id_a, id_b, id_c],
+                tag=tag,
+                importance=float(importance),
+                day=cur_day,
+                strength=1.5,
+                sparsity_pct=self.cortex.last_sparsity_pct,
+                target_bank="rem" if tag == "rem_2hop" else "short_term",
+            )
+            log_kind = "REM" if tag == "rem_2hop" else "DMN"
+            self._log(
+                log_kind,
+                f"💡 Myśl 2-hop ({tag}): „{thought_text}” | Most: [{id_a}] „{lbl_a[:56]}” "
+                f"—([{id_b}] „{lbl_b[:44]}”)→ [{id_c}] „{lbl_c[:56]}”",
+            )
+            record_entry = {
+                "t": time.strftime("%H:%M:%S"),
+                "day": cur_day,
+                "tag": tag,
+                "engram_id": saved_engram["id"],
+                "bank": saved_engram["bank"],
+                "thought": thought_text,
+                "parent_ids": [id_a, id_b, id_c],
+                "parent_labels": {"a": lbl_a[:80], "b": lbl_b[:80], "c": lbl_c[:80]},
+                "sim_ab": bridge_meta.get("sim_ab") if bridge_meta else None,
+                "sim_bc": bridge_meta.get("sim_bc") if bridge_meta else None,
+                "sim_ac": bridge_meta.get("sim_ac") if bridge_meta else None,
+                "joint_coherence": res.get("joint_coherence"),
+            }
+            self.dmn_thoughts.append(record_entry)
+            if len(self.dmn_thoughts) > 80:
+                self.dmn_thoughts = self.dmn_thoughts[-80:]
+        finally:
+            self.lock.release()
+
+        # 2) Gently strengthen A <-> C in LivingBrainEngine via local Oja-Hebb plasticity
+        sdr_a = engram_a["sdr"] if isinstance(engram_a, dict) else engram_a
+        sdr_c = engram_c["sdr"] if isinstance(engram_c, dict) else engram_c
+        oja_stats = self.living_brain.strengthen_association_oja(
+            vec_a=sdr_a,
+            vec_c=sdr_c,
+            lr=0.015,
+            thought_vec=thought_sdr,
+        )
+
+        res["engram_id"] = saved_engram["id"]
+        res["engram"] = saved_engram
+        res["oja_stats"] = oja_stats
+        return res
+
+    def run_dmn_2hop_step(self, non_blocking: bool = True) -> dict[str, Any] | None:
+        """Execute a single autonomous Default Mode Network 2-hop step (sample_2hop_bridge -> synthesize_2hop_thought)."""
+        if self._dmn_running.is_set() or self._is_busy_for_dmn():
+            return None
+        self._dmn_running.set()
+        try:
+            if non_blocking:
+                if not self.lock.acquire(blocking=False):
+                    return None
+            else:
+                self.lock.acquire()
+            try:
+                if self._is_busy_for_dmn() or len(self.hippocampus.semantic) < 3:
+                    return None
+                bridge = self.hippocampus.sample_2hop_bridge(
+                    min_hop_sim=float(getattr(self.cfg, "dmn_bridge_min_hop_sim", 0.45)),
+                    max_direct_sim=float(getattr(self.cfg, "dmn_bridge_max_direct_sim", 0.25)),
+                    current_day=self.day,
+                )
+            finally:
+                self.lock.release()
+
+            if bridge is None:
+                return None
+
+            return self.synthesize_2hop_thought(
+                engram_a=bridge["a"],
+                engram_b=bridge["b"],
+                engram_c=bridge["c"],
+                tag="dmn_2hop",
+                importance=3.0,
+                bridge_meta=bridge,
+                non_blocking=non_blocking,
+                abort_event=self._user_interrupt_event,
+            )
+        finally:
+            self._dmn_running.clear()
+
+    def _on_background_clock_tick(self) -> None:
+        """
+        Invoked from LivingBrainEngine's existing background clock thread (`start_background_clock=True`).
+        Fires a single non-blocking DMN 2-hop step when user has been idle >= `idle_think_delay_sec`
+        and no training/sleep/chat is active; yields immediately if user sends a message.
+        """
+        if not bool(getattr(self.cfg, "dmn_enabled", True)):
+            return
+        if self._is_busy_for_dmn() or self._dmn_running.is_set():
+            return
+        now = time.monotonic()
+        idle_delay = float(getattr(self.cfg, "idle_think_delay_sec", 50.0))
+        think_interval = float(getattr(self.cfg, "dmn_think_interval_sec", 40.0))
+        if (now - self._last_user_activity_ts) < idle_delay:
+            return
+        if (now - self._last_dmn_think_ts) < think_interval:
+            return
+        self._last_dmn_think_ts = now
+        self.run_dmn_2hop_step(non_blocking=True)
 
     def _push_training_dialogue(
         self,
@@ -2810,104 +3006,116 @@ class SleepingBrain:
         }
 
     def chat(self, user_message: str, temperature: float | None = None) -> dict[str, Any]:
-        msg = user_message.strip()
-        if not msg:
-            raise ValueError("Wiadomość nie może być pusta.")
-        cmd_res = self._handle_system_command(msg)
-        if cmd_res is not None:
-            return cmd_res
-
-        math_ans = try_prefrontal_math(msg)
-        if math_ans is not None:
-            with self.lock:
-                self._append_chat("user", msg)
-                self._append_chat(
-                    "assistant",
-                    math_ans,
-                    meta={"thinking": ["Moduł arytmetyki symbolicznej (kora przedczołowa AST)"]},
-                )
-            self.save_state()
-            return {
-                "reply": math_ans,
-                "slept": False,
-                "sleep_report": None,
-                "learned_memories": [],
-                "learned_triples": [],
-                "recalled_memories": {"hippocampus": [], "semantic": [], "rem": []},
-                "concept_hints": [],
-                "energy": round(self.energy, 1),
-                "state_mode": self.state_mode,
-            }
-
-        self._acquire_op("chat")
+        self._last_user_activity_ts = time.monotonic()
+        self._user_interrupt_event.set()
         try:
-            if self.broca_llm is not None:
-                prep, stream_iter = self._prepare_hybrid_llm_thought(msg, temperature=temperature)
-            else:
-                prep, stream_iter = self._prepare_tensor_thought(msg, temperature=temperature)
-            reply = "".join(stream_iter).strip()
-            return self._finalize_chat_turn(msg, reply, prep)
+            msg = user_message.strip()
+            if not msg:
+                raise ValueError("Wiadomość nie może być pusta.")
+            cmd_res = self._handle_system_command(msg)
+            if cmd_res is not None:
+                return cmd_res
+
+            math_ans = try_prefrontal_math(msg)
+            if math_ans is not None:
+                with self.lock:
+                    self._append_chat("user", msg)
+                    self._append_chat(
+                        "assistant",
+                        math_ans,
+                        meta={"thinking": ["Moduł arytmetyki symbolicznej (kora przedczołowa AST)"]},
+                    )
+                self.save_state()
+                return {
+                    "reply": math_ans,
+                    "slept": False,
+                    "sleep_report": None,
+                    "learned_memories": [],
+                    "learned_triples": [],
+                    "recalled_memories": {"hippocampus": [], "semantic": [], "rem": []},
+                    "concept_hints": [],
+                    "energy": round(self.energy, 1),
+                    "state_mode": self.state_mode,
+                }
+
+            self._acquire_op("chat")
+            try:
+                if self.broca_llm is not None:
+                    prep, stream_iter = self._prepare_hybrid_llm_thought(msg, temperature=temperature)
+                else:
+                    prep, stream_iter = self._prepare_tensor_thought(msg, temperature=temperature)
+                reply = "".join(stream_iter).strip()
+                return self._finalize_chat_turn(msg, reply, prep)
+            finally:
+                self._release_op("chat")
         finally:
-            self._release_op("chat")
+            self._last_user_activity_ts = time.monotonic()
+            self._user_interrupt_event.clear()
 
     def chat_stream(self, user_message: str, temperature: float | None = None) -> Iterator[dict[str, Any]]:
         """
         True real-time UTF-8 streaming directly from Broca (zero time.sleep!).
         """
-        msg = user_message.strip()
-        if not msg:
-            raise ValueError("Wiadomość nie może być pusta.")
-        cmd_res = self._handle_system_command(msg)
-        if cmd_res is not None:
-            yield {"type": "done", **cmd_res}
-            return
-
-        math_ans = try_prefrontal_math(msg)
-        if math_ans is not None:
-            res = self.chat(msg)
-            yield {
-                "type": "meta",
-                "learned_memories": [],
-                "learned_triples": [],
-                "recalled_memories": {"hippocampus": [], "semantic": [], "rem": []},
-                "concept_hints": [],
-                "thinking": ["Moduł arytmetyki symbolicznej (kora przedczołowa AST)"],
-            }
-            yield {"type": "token", "delta": math_ans}
-            yield {"type": "done", **res}
-            return
-
-        self._acquire_op("chat")
+        self._last_user_activity_ts = time.monotonic()
+        self._user_interrupt_event.set()
         try:
-            if self.broca_llm is not None:
-                prep, stream_iter = self._prepare_hybrid_llm_thought(msg, temperature=temperature)
-            else:
-                prep, stream_iter = self._prepare_tensor_thought(msg, temperature=temperature, for_stream=True)
-            yield {
-                "type": "meta",
-                "learned_memories": prep["learned_memories"],
-                "learned_triples": [],
-                "recalled_memories": {
-                    "hippocampus": prep["hippo_refs"],
-                    "semantic": prep["sem_refs"],
-                    "rem": prep["rem_refs"],
-                },
-                "concept_hints": [],
-                "thinking": prep["thinking"],
-                "sdr_sparsity_pct": prep["sdr_sparsity_pct"],
-                "hopfield_energy": prep["hopfield_energy"],
-            }
+            msg = user_message.strip()
+            if not msg:
+                raise ValueError("Wiadomość nie może być pusta.")
+            cmd_res = self._handle_system_command(msg)
+            if cmd_res is not None:
+                yield {"type": "done", **cmd_res}
+                return
 
-            chunks: list[str] = []
-            for piece in stream_iter:
-                chunks.append(piece)
-                yield {"type": "token", "delta": piece}
+            math_ans = try_prefrontal_math(msg)
+            if math_ans is not None:
+                res = self.chat(msg)
+                yield {
+                    "type": "meta",
+                    "learned_memories": [],
+                    "learned_triples": [],
+                    "recalled_memories": {"hippocampus": [], "semantic": [], "rem": []},
+                    "concept_hints": [],
+                    "thinking": ["Moduł arytmetyki symbolicznej (kora przedczołowa AST)"],
+                }
+                yield {"type": "token", "delta": math_ans}
+                yield {"type": "done", **res}
+                return
 
-            reply = "".join(chunks).strip()
-            final_res = self._finalize_chat_turn(msg, reply, prep)
-            yield {"type": "done", **final_res}
+            self._acquire_op("chat")
+            try:
+                if self.broca_llm is not None:
+                    prep, stream_iter = self._prepare_hybrid_llm_thought(msg, temperature=temperature)
+                else:
+                    prep, stream_iter = self._prepare_tensor_thought(msg, temperature=temperature, for_stream=True)
+                yield {
+                    "type": "meta",
+                    "learned_memories": prep["learned_memories"],
+                    "learned_triples": [],
+                    "recalled_memories": {
+                        "hippocampus": prep["hippo_refs"],
+                        "semantic": prep["sem_refs"],
+                        "rem": prep["rem_refs"],
+                    },
+                    "concept_hints": [],
+                    "thinking": prep["thinking"],
+                    "sdr_sparsity_pct": prep["sdr_sparsity_pct"],
+                    "hopfield_energy": prep["hopfield_energy"],
+                }
+
+                chunks: list[str] = []
+                for piece in stream_iter:
+                    chunks.append(piece)
+                    yield {"type": "token", "delta": piece}
+
+                reply = "".join(chunks).strip()
+                final_res = self._finalize_chat_turn(msg, reply, prep)
+                yield {"type": "done", **final_res}
+            finally:
+                self._release_op("chat")
         finally:
-            self._release_op("chat")
+            self._last_user_activity_ts = time.monotonic()
+            self._user_interrupt_event.clear()
 
     # ── Vectorized GPU Sleep ─────────────────────────────────────────────────
     def sleep_now(self, visual_pacing: bool = False, _from_nested: bool = False) -> SleepReport:
@@ -3012,14 +3220,54 @@ class SleepingBrain:
             except Exception:
                 pass
 
+            # REM Phase 2-hop Concept Graph synthesis: connect today's consolidated facts with earlier knowledge
+            rem_2hop_steps = max(0, int(getattr(self.cfg, "rem_2hop_steps", 5)))
+            rem_2hop_accepted = 0
+            if rem_2hop_steps > 0 and self.language_cortex.ready:
+                for _ in range(rem_2hop_steps):
+                    with self.lock:
+                        if len(self.hippocampus.semantic) < 3:
+                            break
+                        bridge = self.hippocampus.sample_2hop_bridge(
+                            min_hop_sim=float(getattr(self.cfg, "dmn_bridge_min_hop_sim", 0.45)),
+                            max_direct_sim=float(getattr(self.cfg, "dmn_bridge_max_direct_sim", 0.25)),
+                            current_day=self.day,
+                        )
+                    if bridge is None:
+                        break
+                    syn = self.synthesize_2hop_thought(
+                        engram_a=bridge["a"],
+                        engram_b=bridge["b"],
+                        engram_c=bridge["c"],
+                        tag="rem_2hop",
+                        importance=3.0,
+                        bridge_meta=bridge,
+                        non_blocking=False,
+                    )
+                    if syn.get("accepted"):
+                        rem_2hop_accepted += 1
+                        report.rem_reflections.append(syn["thought_text"])
+                        report.rem_new_links.append(
+                            {
+                                "src_engram": bridge["a"]["id"],
+                                "bridge_engram": bridge["b"]["id"],
+                                "dst_engram": bridge["c"]["id"],
+                                "rem_id": syn.get("engram_id"),
+                                "sim_ab": bridge["sim_ab"],
+                                "sim_bc": bridge["sim_bc"],
+                                "sim_ac": bridge["sim_ac"],
+                                "source": "REM_2HOP",
+                            }
+                        )
+
             # Offline M2 -> M1 Replay + SHY Homeostasis + Fatigue Reset in Living Brain
             lb_sleep = self.living_brain.sleep_consolidate_replay(replay_steps=16)
-            if hippo_to_m2 > 0 or m2_to_cortex > 0:
+            if hippo_to_m2 > 0 or m2_to_cortex > 0 or rem_2hop_accepted > 0:
                 with self.lock:
                     self._log(
                         "SLEEP",
                         f"🔗 Unifikacja NREM Hipokamp ↔ LivingBrain M2: +{hippo_to_m2} engramów do M2, "
-                        f"{m2_to_cortex} śladów M2 skonsolidowanych w korze.",
+                        f"{m2_to_cortex} śladów M2 w korze, REM 2-hop: +{rem_2hop_accepted} nowych myśli.",
                     )
 
             with self.lock:
@@ -3173,6 +3421,7 @@ class SleepingBrain:
                 "chat_log": self.chat_log[-1000:],
                 "working_chat": self.working_chat[-self.cfg.working_chat_buffer :],
                 "sleep_history": self.sleep_history,
+                "dmn_thoughts": self.dmn_thoughts[-80:],
             }
             tmp_meta.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp_meta, meta_path)
@@ -3252,6 +3501,7 @@ class SleepingBrain:
             self.chat_log = list(meta.get("chat_log", []))
             self.working_chat = list(meta.get("working_chat", []))
             self.sleep_history = list(meta.get("sleep_history", []))
+            self.dmn_thoughts = list(meta.get("dmn_thoughts", []))[-80:]
 
             self._log(
                 "INIT",
@@ -3304,6 +3554,7 @@ class SleepingBrain:
             self.working_chat.clear()
             self.sleep_history.clear()
             self.event_log.clear()
+            self.dmn_thoughts.clear()
             self.training_dialogue_feed.clear()
             self._seed_initial_knowledge()
 
@@ -3430,5 +3681,6 @@ class SleepingBrain:
                 "graph": self.build_graph_payload(),
                 "sleep_history": self.sleep_history[-15:],
                 "event_log": self.event_log[-35:],
+                "dmn_thoughts": self.dmn_thoughts[-25:],
                 "training_dialogue_feed": self.training_dialogue_feed[-80:],
             }

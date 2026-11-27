@@ -89,6 +89,14 @@ class BrainConfig:
     auto_sleep_pending_threshold: int = 24
     creativity_level: float = 0.80
 
+    # Autonomous 2-hop Concept Graph (DMN idle thinking & REM bridge synthesis)
+    dmn_enabled: bool = True
+    idle_think_delay_sec: float = 50.0
+    dmn_think_interval_sec: float = 40.0
+    rem_2hop_steps: int = 5
+    dmn_bridge_min_hop_sim: float = 0.45
+    dmn_bridge_max_direct_sim: float = 0.25
+
     # Memory Limits (Expanded Prefrontal Working Memory + Tensor Engram Banks on GPU)
     max_short_term_memories: int = 50000
     max_semantic_memories: int = 200000

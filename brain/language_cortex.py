@@ -527,6 +527,207 @@ class LanguageCortex:
         }
 
     @torch.no_grad()
+    def synthesize_2hop_thought(
+        self,
+        engram_a: dict[str, Any] | torch.Tensor,
+        engram_b: dict[str, Any] | torch.Tensor,
+        engram_c: dict[str, Any] | torch.Tensor,
+        cortex: BiologicalAssociativeCortex,
+        engram_bank: torch.Tensor | None = None,
+        creativity_level: float = 0.70,
+        max_new_bytes: int = 128,
+        num_candidates: int = 2,
+        min_joint_coherence: float = 0.16,
+        max_copy_sim: float = 0.88,
+        abort_event: threading.Event | None = None,
+        non_blocking_lock: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Autonomous 2-hop Concept Graph synthesis (A -> B -> C):
+          1. Build multi-slot Z_ctx with distinct segment-embedded slots for [A, B, C]
+             around their settled cortical bridge attractor Z*.
+          2. Generate candidate short insight(s) connecting A and C through BrocaByteTransformer
+             strictly from tensor Z_ctx (ZERO string/preview_label input to Broca).
+          3. Pass each candidate through the 2-stage Quality Gate:
+             (a) Auditory self-critique (`analyze_self_heard_draft`) must pass with
+                 `needs_correction=False` and zero word repetition loops.
+             (b) Novelty vs A and C (SDR cosine < max_copy_sim and not a copy of A/C)
+                 plus meaningful coherence with their joint context (>= min_joint_coherence).
+        """
+        from .sensory_wernicke import k_wta
+
+        def _extract_sdr(item: dict[str, Any] | torch.Tensor) -> torch.Tensor:
+            t = item["sdr"] if isinstance(item, dict) else item
+            return F.normalize(t.to(device=self.device, dtype=torch.float32).reshape(-1), dim=-1, eps=1e-6)
+
+        def _extract_label(item: dict[str, Any] | torch.Tensor) -> str:
+            return str(item.get("preview_label", "") or "").strip() if isinstance(item, dict) else ""
+
+        if abort_event is not None and abort_event.is_set():
+            return {"accepted": False, "aborted": True, "thought_text": "", "rejection_reasons": ["user_interrupt"]}
+
+        sdr_a = _extract_sdr(engram_a)
+        sdr_b = _extract_sdr(engram_b)
+        sdr_c = _extract_sdr(engram_c)
+
+        # Acquire language_cortex lock (non-blocking in idle DMN so chat/training are NEVER stalled)
+        if non_blocking_lock:
+            if not self._op_lock.acquire(blocking=False):
+                return {"accepted": False, "aborted": True, "thought_text": "", "rejection_reasons": ["lock_busy"]}
+        else:
+            self._op_lock.acquire()
+
+        try:
+            if abort_event is not None and abort_event.is_set():
+                return {"accepted": False, "aborted": True, "thought_text": "", "rejection_reasons": ["user_interrupt"]}
+
+            self._wernicke_raw.eval()
+            self._broca_raw.eval()
+
+            # 1) Project A, B, C SDRs into distinct cortical column slots + settled bridge attractor
+            sdrs_abc = torch.stack([sdr_a, sdr_b, sdr_c], dim=0)  # [3, N]
+            with amp_autocast(self.device):
+                cols_abc = self._wernicke_raw.sdr_to_columns(sdrs_abc)  # [3, 16, D]
+            cols_a = self._normalize_z_columns(cols_abc[0:1])  # [1, 16, D]
+            cols_b = self._normalize_z_columns(cols_abc[1:2])  # [1, 16, D]
+            cols_c = self._normalize_z_columns(cols_abc[2:3])  # [1, 16, D]
+
+            bridge_raw = 0.42 * sdr_a + 0.16 * sdr_b + 0.42 * sdr_c
+            bridge_sdr, _, _ = k_wta(bridge_raw.unsqueeze(0), k=self.cfg.sdr_k, normalize=True)  # [1, N]
+            with amp_autocast(self.device):
+                bridge_cols = self._normalize_z_columns(self._wernicke_raw.sdr_to_columns(bridge_sdr))
+
+            thought = cortex.perceive_and_think(
+                sensory_columns=bridge_cols,
+                sensory_sdr=bridge_sdr,
+                engram_bank=engram_bank,
+                sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
+                steps=self.cfg.attractor_steps,
+                noise_std=0.02 * max(0.2, float(creativity_level)),
+                update_last_active=False,
+            )
+
+            # Distinct multi-slot Z_ctx with segment embeddings:
+            #   primary Z* (seg 1) | A (seg 0) | B (seg 2) | C (seg 3)
+            z_ctx, z_ctx_mask = cortex.build_context_columns(
+                columns_star=self._normalize_z_columns(thought.columns_star),
+                sensory_patch_columns=cols_a,
+                working_memory_slots=cols_b,
+                thought_slots=cols_c,
+            )
+            thought.context_columns = z_ctx
+            thought.context_mask = z_ctx_mask
+
+            if abort_event is not None and abort_event.is_set():
+                return {"accepted": False, "aborted": True, "thought_text": "", "rejection_reasons": ["user_interrupt"]}
+
+            # 2) Generate candidate short thoughts through BrocaByteTransformer
+            k_cand = max(1, min(3, int(num_candidates)))
+            base_temp = max(0.45, min(0.85, float(self.cfg.broca_temperature) + 0.08 * float(creativity_level)))
+            temps = [max(0.40, min(0.92, base_temp + 0.07 * (i - (k_cand - 1) / 2.0))) for i in range(k_cand)]
+            gen_batch = self._broca_raw.generate_batch(
+                memory_columns_batch=z_ctx.expand(k_cand, -1, -1),
+                temperatures=temps,
+                max_new_bytes=max(32, min(220, int(max_new_bytes))),
+                memory_mask=z_ctx_mask.expand(k_cand, -1),
+            )
+        finally:
+            self._op_lock.release()
+
+        if abort_event is not None and abort_event.is_set():
+            return {"accepted": False, "aborted": True, "thought_text": "", "rejection_reasons": ["user_interrupt"]}
+
+        # 3) Quality Gate: Auditory self-critique + zero repetition loops + novelty vs A/C + joint coherence
+        joint_ac = F.normalize(0.5 * sdr_a + 0.5 * sdr_c, dim=-1, eps=1e-6)
+        joint_abc = F.normalize(0.4 * sdr_a + 0.2 * sdr_b + 0.4 * sdr_c, dim=-1, eps=1e-6)
+        lbl_a = _extract_label(engram_a).lower()
+        lbl_c = _extract_label(engram_c).lower()
+        words_a = set(re.findall(r"[a-ząćęłńóśźż0-9]{2,}", lbl_a))
+        words_c = set(re.findall(r"[a-ząćęłńóśźż0-9]{2,}", lbl_c))
+
+        best_accepted: dict[str, Any] | None = None
+        best_rejected: dict[str, Any] | None = None
+
+        for item in gen_batch:
+            if abort_event is not None and abort_event.is_set():
+                return {"accepted": False, "aborted": True, "thought_text": "", "rejection_reasons": ["user_interrupt"]}
+            draft = (item.get("text") or "").strip()
+            diag = self.analyze_self_heard_draft(draft, thought, creativity_level=creativity_level)
+            heard_sdr = diag.get("heard_sdr")
+
+            reasons: list[str] = []
+            if diag["needs_correction"]:
+                reasons.extend(diag["issues"] or [f"audit_score={diag['total']:.2f}"])
+
+            words = re.findall(r"[a-ząćęłńóśźż0-9]+", draft.lower())
+            if len(draft) < 12 or len(words) < 3:
+                reasons.append("zbyt krótka myśl")
+            if re.search(r"\b([a-ząćęłńóśźż0-9]{2,})\s+\1\b", draft.lower()):
+                reasons.append("zapętlenie powtarzających się słów")
+            if len(words) >= 4 and (len(set(words)) / float(len(words))) < 0.55:
+                reasons.append("niska różnorodność leksykalna")
+
+            sim_a = 0.0
+            sim_b = 0.0
+            sim_c = 0.0
+            joint_coh = float(diag.get("alignment", 0.0))
+            if heard_sdr is not None:
+                h_u = F.normalize(heard_sdr.to(device=self.device, dtype=torch.float32).reshape(-1), dim=-1, eps=1e-6)
+                sim_a = float(torch.dot(h_u, sdr_a).item())
+                sim_b = float(torch.dot(h_u, sdr_b).item())
+                sim_c = float(torch.dot(h_u, sdr_c).item())
+                sim_joint_ac = float(torch.dot(h_u, joint_ac).item())
+                sim_joint_abc = float(torch.dot(h_u, joint_abc).item())
+                joint_coh = max(sim_joint_ac, sim_joint_abc, float(diag.get("alignment", 0.0)))
+                if sim_a >= float(max_copy_sim) or sim_c >= float(max_copy_sim):
+                    reasons.append(f"zbyt podobna do rodzica (sim_a={sim_a:.2f}, sim_c={sim_c:.2f})")
+                if joint_coh < float(min_joint_coherence):
+                    reasons.append(f"słaba spójność z kontekstem A+C (coh={joint_coh:.2f})")
+            else:
+                reasons.append("brak heard_sdr")
+
+            # Post-generation text dedup guard against copying A or C verbatim
+            draft_low = draft.lower()
+            if (lbl_a and draft_low == lbl_a) or (lbl_c and draft_low == lbl_c):
+                reasons.append("dokładna kopia A lub C")
+            draft_wset = set(re.findall(r"[a-ząćęłńóśźż0-9]{2,}", draft_low))
+            for ref_set, tag_r in ((words_a, "A"), (words_c, "C")):
+                if len(ref_set) >= 4 and len(draft_wset) >= 4:
+                    jacc = len(draft_wset & ref_set) / float(max(1, len(draft_wset | ref_set)))
+                    if jacc >= 0.85:
+                        reasons.append(f"kopia treści {tag_r} (jaccard={jacc:.2f})")
+
+            cand_res = {
+                "accepted": len(reasons) == 0,
+                "aborted": False,
+                "thought_text": draft,
+                "thought_sdr": heard_sdr.detach().clone() if heard_sdr is not None else thought.z_star[0].detach().clone(),
+                "bridge_columns": thought.columns_star.detach().clone(),
+                "z_ctx_shape": tuple(z_ctx.shape),
+                "audit": {k: v for k, v in diag.items() if k != "heard_sdr"},
+                "sim_to_a": round(sim_a, 4),
+                "sim_to_b": round(sim_b, 4),
+                "sim_to_c": round(sim_c, 4),
+                "joint_coherence": round(joint_coh, 4),
+                "rejection_reasons": reasons,
+            }
+            if cand_res["accepted"]:
+                if best_accepted is None or cand_res["audit"]["total"] > best_accepted["audit"]["total"]:
+                    best_accepted = cand_res
+            else:
+                if best_rejected is None or cand_res["audit"]["total"] > best_rejected["audit"]["total"]:
+                    best_rejected = cand_res
+
+        if best_accepted is not None:
+            return best_accepted
+        return best_rejected or {
+            "accepted": False,
+            "aborted": False,
+            "thought_text": "",
+            "rejection_reasons": ["brak kandydatów"],
+        }
+
+    @torch.no_grad()
     def deliberate_and_critique(
         self,
         user_message: str,

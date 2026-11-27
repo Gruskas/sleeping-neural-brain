@@ -198,6 +198,7 @@ class LivingBrainEngine:
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._bg_thread: threading.Thread | None = None
+        self._idle_callback: Any | None = None
         if start_background_clock:
             self.start_spontaneous_clock()
 
@@ -1095,6 +1096,53 @@ class LivingBrainEngine:
         W[active] = w_new.to(dtype=W.dtype)
 
     @torch.no_grad()
+    def strengthen_association_oja(
+        self,
+        vec_a: torch.Tensor,
+        vec_c: torch.Tensor,
+        lr: float = 0.015,
+        thought_vec: torch.Tensor | None = None,
+    ) -> dict[str, float]:
+        """
+        Gently strengthen bidirectional A <-> C associative links in M1 `W_assoc_rec`
+        using local Oja-Hebb plasticity (zero backprop) when a 2-hop DMN/REM insight is accepted.
+        """
+        with self.lock:
+            def _to_assoc_sdr(v: torch.Tensor) -> torch.Tensor:
+                x0 = self._project_sensory(v)
+                h1 = F.relu(self.W_in_L1.float() @ x0)
+                s1, _, _ = k_wta(h1, k=_safe_k_for_size(self.n_l1, 0.05), normalize=True)
+                h2 = F.relu(self.W_12.float() @ s1)
+                s2, _, _ = k_wta(h2, k=_safe_k_for_size(self.n_l2, 0.05), normalize=True)
+                h3 = F.relu(self.W_23.float() @ s2)
+                s3, _, _ = k_wta(h3, k=_safe_k_for_size(self.n_l3, 0.05), normalize=True)
+                ha = F.relu(self.W_3a.float() @ s3)
+                sa, _, _ = k_wta(ha, k=_safe_k_for_size(self.n_assoc, 0.06), normalize=True)
+                return sa
+
+            assoc_a = _to_assoc_sdr(vec_a)
+            assoc_c = _to_assoc_sdr(vec_c)
+            w_before = self.W_assoc_rec.float().clone()
+            eff_lr = max(1e-4, min(0.08, float(lr)))
+            self._oja_hebb_update(self.W_assoc_rec, assoc_a, assoc_c, lr=eff_lr, decay=0.04)
+            self._oja_hebb_update(self.W_assoc_rec, assoc_c, assoc_a, lr=eff_lr, decay=0.04)
+            self.W_assoc_rec.fill_diagonal_(0.0)
+            delta_norm = float((self.W_assoc_rec.float() - w_before).norm().item())
+
+            if thought_vec is not None:
+                s_th = self._project_sensory(thought_vec)
+                a_th = _to_assoc_sdr(thought_vec)
+                self._encode_m2_episode(a_th, s_th, surprise=0.30, valence=0.35, pinned=False)
+
+            return {
+                "delta_norm": round(delta_norm, 6),
+                "assoc_cos_ac": round(
+                    float(F.cosine_similarity(assoc_a.unsqueeze(0), assoc_c.unsqueeze(0)).item()),
+                    4,
+                ),
+            }
+
+    @torch.no_grad()
     def _local_predictive_update(
         self,
         G: torch.Tensor,
@@ -1243,6 +1291,10 @@ class LivingBrainEngine:
         else:
             self._pause_event.clear()
 
+    def set_idle_callback(self, callback: Any | None) -> None:
+        """Register an optional non-blocking DMN idle callback invoked on the background clock thread."""
+        self._idle_callback = callback
+
     def start_spontaneous_clock(self, interval_sec: float = 0.65) -> None:
         if self._bg_thread is not None and self._bg_thread.is_alive():
             return
@@ -1261,6 +1313,12 @@ class LivingBrainEngine:
                                 self.lock.release()
                     except Exception:
                         pass
+                    cb = self._idle_callback
+                    if cb is not None and not self._pause_event.is_set():
+                        try:
+                            cb()
+                        except Exception:
+                            pass
                 self._stop_event.wait(interval_sec)
 
         self._bg_thread = threading.Thread(target=_loop, daemon=True, name="LivingBrainClock")

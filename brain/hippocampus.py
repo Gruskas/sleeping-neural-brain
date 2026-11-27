@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -29,9 +31,11 @@ class EngramMeta:
     source_url: str | None = None
     timestamp: float = field(default_factory=time.time)
     pinned: bool = False
+    parent_ids: list[str] = field(default_factory=list)
+    tag: str | None = None
 
     def to_meta_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "id": self.id,
             "category": self.category,
             "preview_label": self.preview_label,
@@ -41,9 +45,17 @@ class EngramMeta:
             "timestamp": self.timestamp,
             "pinned": bool(self.pinned),
         }
+        if self.parent_ids:
+            d["parent_ids"] = list(self.parent_ids)
+        if self.tag:
+            d["tag"] = self.tag
+        return d
 
     @classmethod
     def from_meta_dict(cls, data: dict[str, Any]) -> "EngramMeta":
+        raw_parents = data.get("parent_ids")
+        parents = [str(x) for x in raw_parents] if isinstance(raw_parents, (list, tuple)) else []
+        raw_tag = data.get("tag")
         return cls(
             id=str(data.get("id") or uuid.uuid4().hex[:8]),
             category=str(data.get("category", "wiedza")),
@@ -53,6 +65,8 @@ class EngramMeta:
             source_url=data.get("source_url"),
             timestamp=float(data.get("timestamp", time.time())),
             pinned=bool(data.get("pinned", False)),
+            parent_ids=parents,
+            tag=str(raw_tag) if raw_tag else None,
         )
 
 
@@ -76,6 +90,8 @@ class TensorEngramBank:
         self.sdr_k = sdr_k
         self.max_capacity = max_capacity
         self.device = device
+        self.max_explored_pairs = 4096
+        self.explored_pairs: OrderedDict[tuple[str, str], None] = OrderedDict()
         self.clear()
 
     def clear(self) -> None:
@@ -87,6 +103,23 @@ class TensorEngramBank:
         self.recall_counts = torch.empty((0,), dtype=torch.int32, device=self.device)
         self.pinned = torch.empty((0,), dtype=torch.bool, device=self.device)
         self.meta: list[EngramMeta] = []
+        self.explored_pairs.clear()
+
+    @staticmethod
+    def _canonical_pair(id_a: str, id_c: str) -> tuple[str, str]:
+        return (id_a, id_c) if id_a <= id_c else (id_c, id_a)
+
+    def mark_pair_explored(self, id_a: str, id_c: str) -> None:
+        key = self._canonical_pair(id_a, id_c)
+        if key in self.explored_pairs:
+            self.explored_pairs.move_to_end(key)
+        else:
+            self.explored_pairs[key] = None
+            while len(self.explored_pairs) > self.max_explored_pairs:
+                self.explored_pairs.popitem(last=False)
+
+    def is_pair_explored(self, id_a: str, id_c: str) -> bool:
+        return self._canonical_pair(id_a, id_c) in self.explored_pairs
 
     def __len__(self) -> int:
         return int(self.engrams.shape[0])
@@ -227,6 +260,127 @@ class TensorEngramBank:
         }
 
     @torch.no_grad()
+    def sample_2hop_bridge(
+        self,
+        min_hop_sim: float = 0.45,
+        max_direct_sim: float = 0.25,
+        max_attempts: int = 16,
+        recent_days_window: int = 3,
+        current_day: int | None = None,
+        mark_explored: bool = True,
+    ) -> dict[str, Any] | None:
+        """
+        GPU 2-hop Concept Graph discovery (A -> B -> C):
+          - Sample start node A (weighted by importance, with optional boost for recent days).
+          - Find strong 1-hop neighbor B: sim(A, B) >= min_hop_sim (default 0.45), B != A.
+          - Find 2-hop target C: sim(B, C) >= min_hop_sim, C not in {A, B}, AND distant from A:
+            sim(A, C) <= max_direct_sim (default 0.25), preferring different day / context when available.
+          - Deduplicate unordered (id_A, id_C) via LRU `explored_pairs` so the brain explores novel bridges.
+        """
+        n = len(self)
+        if n < 3:
+            return None
+
+        # Importance-weighted start sampling with optional boost for recent-day engrams
+        weights = self.importances.clamp(min=0.5).float().clone()
+        if current_day is not None and recent_days_window > 0:
+            recent_mask = self.days_created >= (int(current_day) - int(recent_days_window))
+            if recent_mask.any() and random.random() < 0.55:
+                weights = torch.where(recent_mask, weights * 2.0, weights)
+        k_starts = min(max(1, int(max_attempts)), n)
+        start_indices = torch.multinomial(weights, num_samples=k_starts, replacement=False).cpu().tolist()
+
+        def _pack_node(idx: int) -> dict[str, Any]:
+            m = self.meta[idx]
+            return {
+                "index": int(idx),
+                "id": m.id,
+                "sdr": self.engrams[idx].detach().clone(),
+                "day": int(self.days_created[idx].item()),
+                "importance": float(self.importances[idx].item()),
+                "topic": m.topic,
+                "category": m.category,
+                "preview_label": m.preview_label,  # ONLY for logging/UI dedup, NEVER input to Broca/Cortex
+            }
+
+        for idx_a in start_indices:
+            sdr_a = self.engrams[idx_a]
+            sim_a = torch.mv(self.engrams, sdr_a).float()
+            sim_a[idx_a] = -1.0
+
+            b_cand_idx = torch.nonzero(sim_a >= float(min_hop_sim), as_tuple=False).squeeze(-1)
+            if b_cand_idx.numel() == 0:
+                continue
+
+            # Inspect up to 8 strongest 1-hop neighbors B (shuffled slightly for diversity)
+            b_sims = sim_a.index_select(0, b_cand_idx)
+            kb = min(8, int(b_cand_idx.numel()))
+            top_b_rel = torch.topk(b_sims, k=kb, largest=True, sorted=True).indices
+            b_indices = b_cand_idx.index_select(0, top_b_rel).cpu().tolist()
+            if len(b_indices) > 2:
+                head, tail = b_indices[:2], b_indices[2:]
+                random.shuffle(tail)
+                b_indices = head + tail
+
+            day_a = int(self.days_created[idx_a].item())
+            meta_a = self.meta[idx_a]
+            ctx_a = (meta_a.topic or meta_a.category or "").strip().lower()
+            diff_day_vec = (self.days_created != day_a).float()
+
+            for idx_b in b_indices:
+                sdr_b = self.engrams[idx_b]
+                sim_b = torch.mv(self.engrams, sdr_b).float()
+                c_mask = (sim_b >= float(min_hop_sim)) & (sim_a <= float(max_direct_sim))
+                c_mask[idx_a] = False
+                c_mask[idx_b] = False
+                c_cand_idx = torch.nonzero(c_mask, as_tuple=False).squeeze(-1)
+                if c_cand_idx.numel() == 0:
+                    continue
+
+                # Rank C candidates: strong B->C bridge + preference for different day & low A-C direct sim
+                c_sim_b = sim_b.index_select(0, c_cand_idx)
+                c_sim_a = sim_a.index_select(0, c_cand_idx)
+                c_diff_d = diff_day_vec.index_select(0, c_cand_idx)
+                c_scores = c_sim_b + 0.35 * c_diff_d + 0.15 * (1.0 - c_sim_a.clamp(min=0.0))
+
+                kc = min(24, int(c_cand_idx.numel()))
+                top_c_rel = torch.topk(c_scores, k=kc, largest=True, sorted=True).indices
+                c_indices = c_cand_idx.index_select(0, top_c_rel).cpu().tolist()
+                c_score_vals = c_scores.index_select(0, top_c_rel).cpu().tolist()
+
+                # Tie-break in favor of different topic/context when available
+                ranked_c: list[tuple[float, int]] = []
+                for idx_c, sc in zip(c_indices, c_score_vals):
+                    meta_c = self.meta[idx_c]
+                    ctx_c = (meta_c.topic or meta_c.category or "").strip().lower()
+                    ctx_bonus = 0.20 if (ctx_a and ctx_c and ctx_a != ctx_c) else 0.0
+                    ranked_c.append((float(sc) + ctx_bonus, int(idx_c)))
+                ranked_c.sort(key=lambda item: item[0], reverse=True)
+
+                for _, idx_c in ranked_c:
+                    id_c = self.meta[idx_c].id
+                    if self.is_pair_explored(meta_a.id, id_c):
+                        continue
+                    if mark_explored:
+                        self.mark_pair_explored(meta_a.id, id_c)
+                    node_a = _pack_node(idx_a)
+                    node_b = _pack_node(idx_b)
+                    node_c = _pack_node(idx_c)
+                    ctx_c = (self.meta[idx_c].topic or self.meta[idx_c].category or "").strip().lower()
+                    return {
+                        "a": node_a,
+                        "b": node_b,
+                        "c": node_c,
+                        "sim_ab": round(float(sim_a[idx_b].item()), 4),
+                        "sim_bc": round(float(sim_b[idx_c].item()), 4),
+                        "sim_ac": round(float(sim_a[idx_c].item()), 4),
+                        "cross_day": bool(node_a["day"] != node_c["day"]),
+                        "cross_context": bool(ctx_a != ctx_c),
+                    }
+
+        return None
+
+    @torch.no_grad()
     def delete_by_id(self, engram_id: str) -> bool:
         target = engram_id.strip()
         if not target or len(self) == 0:
@@ -345,6 +499,8 @@ class TensorEngramBank:
                     "source_url": m.source_url,
                     "timestamp": m.timestamp,
                     "pinned": bool(m.pinned),
+                    "parent_ids": list(m.parent_ids),
+                    "tag": m.tag,
                 }
             )
         return out
@@ -389,6 +545,8 @@ class Hippocampus:
         topic: str | None = None,
         source_url: str | None = None,
         pinned: bool = False,
+        parent_ids: list[str] | None = None,
+        tag: str | None = None,
     ) -> dict[str, Any]:
         cat_norm = (category or "wiedza").strip().lower()
         is_pinned = bool(pinned) or (cat_norm in {"zasada", "tożsamość", "tozsamosc", "fundament"})
@@ -399,6 +557,8 @@ class Hippocampus:
             topic=topic,
             source_url=source_url,
             pinned=is_pinned,
+            parent_ids=list(parent_ids or []),
+            tag=tag,
         )
         self.short_term.add_batch(
             sdrs=sdr.unsqueeze(0) if sdr.ndim == 1 else sdr[:1],
@@ -419,7 +579,78 @@ class Hippocampus:
             "topic": topic,
             "source_url": source_url,
             "pinned": is_pinned,
+            "parent_ids": list(meta.parent_ids),
+            "tag": meta.tag,
         }
+
+    @torch.no_grad()
+    def record_2hop_engram(
+        self,
+        sdr: torch.Tensor,
+        thought_text: str,
+        parent_ids: list[str],
+        tag: str = "dmn_2hop",
+        importance: float = 3.0,
+        day: int = 1,
+        strength: float = 1.5,
+        sparsity_pct: float = 4.0,
+        target_bank: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Store an accepted 2-hop synthesized thought engram with parent IDs [A, B, C],
+        tag (`dmn_2hop` / `rem_2hop`), pinned=False, and moderate importance (~3.0).
+        """
+        bank_name = target_bank or ("rem" if tag == "rem_2hop" else "short_term")
+        category = "refleksja_rem" if bank_name == "rem" else "mysl_dmn"
+        meta = EngramMeta(
+            category=category,
+            preview_label=(thought_text or "")[:200],
+            sparsity_pct=sparsity_pct,
+            pinned=False,
+            parent_ids=[str(x) for x in parent_ids],
+            tag=str(tag),
+        )
+        bank = self.rem if bank_name == "rem" else (self.semantic if bank_name == "semantic" else self.short_term)
+        imp_clamped = float(max(1.0, min(5.0, float(importance))))
+        bank.add_batch(
+            sdrs=sdr.unsqueeze(0) if sdr.ndim == 1 else sdr[:1],
+            metas=[meta],
+            strengths=[float(strength)],
+            importances=[imp_clamped],
+            day=day,
+        )
+        return {
+            "id": meta.id,
+            "bank": bank_name,
+            "category": meta.category,
+            "preview_label": meta.preview_label,
+            "importance": round(imp_clamped, 2),
+            "strength": round(float(strength), 2),
+            "day_created": day,
+            "pinned": False,
+            "parent_ids": list(meta.parent_ids),
+            "tag": meta.tag,
+        }
+
+    @torch.no_grad()
+    def sample_2hop_bridge(
+        self,
+        min_hop_sim: float = 0.45,
+        max_direct_sim: float = 0.25,
+        max_attempts: int = 16,
+        recent_days_window: int = 3,
+        current_day: int | None = None,
+        mark_explored: bool = True,
+    ) -> dict[str, Any] | None:
+        """Discover a novel 2-hop conceptual bridge A -> B -> C on GPU over semantic memory."""
+        return self.semantic.sample_2hop_bridge(
+            min_hop_sim=min_hop_sim,
+            max_direct_sim=max_direct_sim,
+            max_attempts=max_attempts,
+            recent_days_window=recent_days_window,
+            current_day=current_day,
+            mark_explored=mark_explored,
+        )
 
     @torch.no_grad()
     def record_engrams_batch(
