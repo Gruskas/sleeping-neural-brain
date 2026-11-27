@@ -177,7 +177,7 @@ class TestTensorHippocampusHopfieldSHYAndREM(unittest.TestCase):
             day=1,
             sparsity_pct=w_out.sparsity_pct,
         )
-        self.assertEqual(hippo.short_term.engrams.dtype, torch.bfloat16)
+        self.assertIn(hippo.short_term.engrams.dtype, (torch.float8_e4m3fn, torch.int8, torch.bfloat16))
         self.assertEqual(hippo.short_term.engrams.device.type, device.type)
 
         # Ensure weak synapses exist in W_rec so SHY deterministically prunes them
@@ -200,10 +200,10 @@ class TestTensorHippocampusHopfieldSHYAndREM(unittest.TestCase):
         self.assertGreater(report.pruned_synapses, 0)
         self.assertGreaterEqual(report.active_synapses, 0)
 
-        # Short-term cleared, semantic consolidated in bfloat16, REM created vectorized hybrid states
+        # Short-term cleared, semantic consolidated in FP8/bfloat16, REM created vectorized hybrid states
         self.assertEqual(len(hippo.short_term), 0)
         self.assertGreaterEqual(len(hippo.semantic), 4)
-        self.assertEqual(hippo.semantic.engrams.dtype, torch.bfloat16)
+        self.assertIn(hippo.semantic.engrams.dtype, (torch.float8_e4m3fn, torch.int8, torch.bfloat16))
         self.assertGreater(len(hippo.rem), 0)
         self.assertEqual(len(report.rem_reflections), len(hippo.rem))
         self.assertGreater(len(report.rem_new_links), 0)

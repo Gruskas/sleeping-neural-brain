@@ -85,6 +85,7 @@ class SleepingBrain:
             max_semantic_memories=self.cfg.max_semantic_memories,
             max_rem_reflections=self.cfg.max_rem_reflections,
             device=self.device,
+            bio_synapse_dtype=self.cfg.bio_synapse_dtype,
         )
         self.cortex = BiologicalAssociativeCortex(self.cfg, self.device)
         self.concept_cortex = self.cortex  # attribute alias for external callers
@@ -168,6 +169,7 @@ class SleepingBrain:
             target_device="gpu" if self.device.type == "cuda" else "ram",
             memory_budget_mb=4096.0,
             start_background_clock=True,
+            bio_synapse_dtype=self.cfg.bio_synapse_dtype,
         )
         self.living_brain.set_idle_callback(self._on_background_clock_tick)
 
@@ -3180,7 +3182,7 @@ class SleepingBrain:
                             + self.hippocampus.semantic.pinned.float() * 4.0
                         )
                         top_idx = torch.topk(prio, k=k_sync, largest=True, sorted=False).indices
-                        sync_sdrs = self.hippocampus.semantic.engrams.index_select(0, top_idx).float()
+                        sync_sdrs = self.hippocampus.semantic.engrams.dequant_rows(top_idx, out_dtype=torch.float32)
                         sync_imps = self.hippocampus.semantic.importances.index_select(0, top_idx).cpu().tolist()
                         sync_pins = self.hippocampus.semantic.pinned.index_select(0, top_idx).cpu().tolist()
                         sync_cols = self.language_cortex.wernicke_module.sdr_to_columns(sync_sdrs).detach()
@@ -3531,6 +3533,7 @@ class SleepingBrain:
                 max_semantic_memories=self.cfg.max_semantic_memories,
                 max_rem_reflections=self.cfg.max_rem_reflections,
                 device=self.device,
+                bio_synapse_dtype=self.cfg.bio_synapse_dtype,
             )
             self.cortex = BiologicalAssociativeCortex(self.cfg, self.device)
             self.concept_cortex = self.cortex
@@ -3649,6 +3652,9 @@ class SleepingBrain:
                     "sdr_k": self.cfg.sdr_k,
                     "sdr_sparsity_pct": self.cortex.last_sparsity_pct,
                     "active_synapses": active_syn,
+                    "bio_synapse_dtype": self.cortex.bio_synapse_mode,
+                    "cortex_w_rec_mb": self.cortex.synapse_memory_mb(),
+                    "hippocampus_engrams_mb": self.hippocampus.memory_mb(),
                     "attractor_steps": self.cortex.last_attractor_steps,
                     "fluency": lc_fluency,
                     "trained_steps": self.language_cortex.broca_module.trained_steps,

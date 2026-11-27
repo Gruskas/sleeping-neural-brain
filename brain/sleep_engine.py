@@ -236,12 +236,12 @@ class SleepEngine:
           2. Blend each pair with random binary neuron mask + Gaussian noise.
           3. Run parallel attractor settling (Modern Hopfield + W_rec + k-WTA) to novel hybrid z_rem.
         """
-        sem = self.hippocampus.semantic.engrams  # [M, N] bfloat16
+        sem = self.hippocampus.semantic.engrams  # [M, N] QuantizedSynapseMatrix (FP8)
         m = int(sem.shape[0])
         pool_n = min(m, 128)
         if pool_n < m:
             pool_idx = torch.randperm(m, device=self.device)[:pool_n]
-            pool = sem.index_select(0, pool_idx).float()
+            pool = sem.dequant_rows(pool_idx, out_dtype=torch.float32) if hasattr(sem, "dequant_rows") else sem.index_select(0, pool_idx).float()
         else:
             pool_idx = torch.arange(m, device=self.device)
             pool = sem.float()

@@ -26,6 +26,7 @@ class BrainConfig:
     wernicke_rf_anchor_weight: float = 0.12
 
     # Biological Associative Cortex (Modern Continuous Hopfield + k-WTA SDR + Local Plasticity)
+    bio_synapse_dtype: str = "fp8"  # Native Blackwell FP8 E4M3 per-row (fallback: int8 / bf16)
     num_neurons: int = 12288
     sdr_k: int = 492  # ~4.00% sparsity (within 3-5% biological k-WTA range)
     hopfield_beta: float = 12.0

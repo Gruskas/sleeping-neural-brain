@@ -10,6 +10,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from .fp8_synapse import QuantizedSynapseMatrix, resolve_bio_synapse_mode
 from .sensory_wernicke import k_wta
 
 
@@ -85,17 +86,19 @@ class TensorEngramBank:
         sdr_k: int,
         max_capacity: int,
         device: torch.device,
+        bio_synapse_dtype: str = "fp8",
     ) -> None:
         self.num_neurons = num_neurons
         self.sdr_k = sdr_k
         self.max_capacity = max_capacity
         self.device = device
+        self.bio_synapse_mode = resolve_bio_synapse_mode(bio_synapse_dtype, device)
         self.max_explored_pairs = 4096
         self.explored_pairs: OrderedDict[tuple[str, str], None] = OrderedDict()
         self.clear()
 
     def clear(self) -> None:
-        self.engrams = torch.empty((0, self.num_neurons), dtype=torch.bfloat16, device=self.device)
+        self.engrams = QuantizedSynapseMatrix.empty(0, self.num_neurons, self.device, mode=self.bio_synapse_mode)
         self.strengths = torch.empty((0,), dtype=torch.float32, device=self.device)
         self.importances = torch.empty((0,), dtype=torch.float32, device=self.device)
         self.days_created = torch.empty((0,), dtype=torch.int32, device=self.device)
@@ -104,6 +107,15 @@ class TensorEngramBank:
         self.pinned = torch.empty((0,), dtype=torch.bool, device=self.device)
         self.meta: list[EngramMeta] = []
         self.explored_pairs.clear()
+
+    def memory_bytes(self) -> int:
+        total = self.engrams.nbytes()
+        for t in (self.strengths, self.importances, self.days_created, self.last_recalled_days, self.recall_counts, self.pinned):
+            total += int(t.numel() * t.element_size())
+        return total
+
+    def memory_mb(self) -> float:
+        return round(self.memory_bytes() / (1024.0 * 1024.0), 3)
 
     @staticmethod
     def _canonical_pair(id_a: str, id_c: str) -> tuple[str, str]:
@@ -133,13 +145,17 @@ class TensorEngramBank:
         importances: list[float] | torch.Tensor,
         day: int,
     ) -> list[str]:
-        if sdrs.ndim == 1:
-            sdrs = sdrs.unsqueeze(0)
-        m = int(sdrs.shape[0])
+        if isinstance(sdrs, QuantizedSynapseMatrix):
+            sdrs_f = sdrs.float().to(device=self.device)
+        else:
+            if sdrs.ndim == 1:
+                sdrs = sdrs.unsqueeze(0)
+            sdrs_f = sdrs.to(device=self.device, dtype=torch.float32)
+        m = int(sdrs_f.shape[0])
         if m == 0:
             return []
 
-        norm_sdrs = F.normalize(sdrs.to(device=self.device, dtype=torch.float32), dim=-1, eps=1e-6).to(torch.bfloat16)
+        norm_sdrs = F.normalize(sdrs_f, dim=-1, eps=1e-6)
         st_t = (
             strengths.to(device=self.device, dtype=torch.float32)
             if isinstance(strengths, torch.Tensor)
@@ -154,7 +170,7 @@ class TensorEngramBank:
         rec_t = torch.zeros((m,), dtype=torch.int32, device=self.device)
         pin_t = torch.tensor([bool(item.pinned) for item in metas], dtype=torch.bool, device=self.device)
 
-        self.engrams = torch.cat([self.engrams, norm_sdrs], dim=0)
+        self.engrams = self.engrams.cat_rows(norm_sdrs)
         self.strengths = torch.cat([self.strengths, st_t], dim=0)
         self.importances = torch.cat([self.importances, imp_t], dim=0)
         self.days_created = torch.cat([self.days_created, day_t], dim=0)
@@ -224,9 +240,8 @@ class TensorEngramBank:
             }
 
         q = F.normalize(query_sdr.to(device=self.device, dtype=torch.float32).reshape(-1), dim=-1, eps=1e-6)
-        q_bf16 = q.to(torch.bfloat16)
-        # Single matmul on GPU: [M, N] @ [N] -> [M]
-        sims = torch.mv(self.engrams, q_bf16).float()
+        # Native Blackwell FP8 Tensor Core / blockwise BF16 matvec (zero full fp32 copy!)
+        sims = self.engrams.matvec(q)
         weighted = sims * (0.85 + 0.15 * torch.clamp(self.strengths / 3.0, min=0.2, max=1.5))
 
         k = min(int(top_k), n)
@@ -256,7 +271,7 @@ class TensorEngramBank:
             "ids": ids,
             "scores": score_list,
             "indices": idx_list,
-            "engrams": self.engrams.index_select(0, sel_idx),
+            "engrams": self.engrams.dequant_rows(sel_idx, out_dtype=torch.bfloat16),
         }
 
     @torch.no_grad()
@@ -295,7 +310,7 @@ class TensorEngramBank:
             return {
                 "index": int(idx),
                 "id": m.id,
-                "sdr": self.engrams[idx].detach().clone(),
+                "sdr": self.engrams.dequant_row(idx, out_dtype=torch.bfloat16).detach().clone(),
                 "day": int(self.days_created[idx].item()),
                 "importance": float(self.importances[idx].item()),
                 "topic": m.topic,
@@ -304,8 +319,8 @@ class TensorEngramBank:
             }
 
         for idx_a in start_indices:
-            sdr_a = self.engrams[idx_a]
-            sim_a = torch.mv(self.engrams, sdr_a).float()
+            sdr_a = self.engrams.dequant_row(idx_a, out_dtype=torch.float32)
+            sim_a = self.engrams.matvec(sdr_a)
             sim_a[idx_a] = -1.0
 
             b_cand_idx = torch.nonzero(sim_a >= float(min_hop_sim), as_tuple=False).squeeze(-1)
@@ -328,8 +343,8 @@ class TensorEngramBank:
             diff_day_vec = (self.days_created != day_a).float()
 
             for idx_b in b_indices:
-                sdr_b = self.engrams[idx_b]
-                sim_b = torch.mv(self.engrams, sdr_b).float()
+                sdr_b = self.engrams.dequant_row(idx_b, out_dtype=torch.float32)
+                sim_b = self.engrams.matvec(sdr_b)
                 c_mask = (sim_b >= float(min_hop_sim)) & (sim_a <= float(max_direct_sim))
                 c_mask[idx_a] = False
                 c_mask[idx_b] = False
@@ -416,10 +431,20 @@ class TensorEngramBank:
                 "recall_counts": torch.empty((0,), dtype=torch.int32),
                 "pinned": torch.empty((0,), dtype=torch.bool),
             }
-        vals, idxs = torch.topk(self.engrams.float(), k=k, dim=-1, largest=True, sorted=True)
+        # Blockwise top-k export (zero full fp32 copy!)
+        idxs_chunks: list[torch.Tensor] = []
+        vals_chunks: list[torch.Tensor] = []
+        block = 1024
+        for r0 in range(0, n, block):
+            r1 = min(n, r0 + block)
+            r_idx = torch.arange(r0, r1, device=self.device)
+            sub_f = self.engrams.dequant_rows(r_idx, out_dtype=torch.float32)
+            v_b, i_b = torch.topk(sub_f, k=k, dim=-1, largest=True, sorted=True)
+            idxs_chunks.append(i_b.to(dtype=torch.int16).cpu())
+            vals_chunks.append(v_b.to(dtype=torch.bfloat16).cpu())
         return {
-            "indices": idxs.to(dtype=torch.int16).cpu(),
-            "values": vals.to(dtype=torch.bfloat16).cpu(),
+            "indices": torch.cat(idxs_chunks, dim=0),
+            "values": torch.cat(vals_chunks, dim=0),
             "strengths": self.strengths.detach().cpu(),
             "importances": self.importances.detach().cpu(),
             "days_created": self.days_created.detach().cpu(),
@@ -436,9 +461,19 @@ class TensorEngramBank:
         n = int(idxs.shape[0])
         if n == 0:
             return
-        dense = torch.zeros((n, self.num_neurons), dtype=torch.bfloat16, device=self.device)
-        dense.scatter_(-1, idxs.to(device=self.device, dtype=torch.long), vals.to(device=self.device, dtype=torch.bfloat16))
-        self.engrams = dense
+        # Blockwise scatter + direct FP8 per-row quantization (seamless migration of legacy bf16 checkpoints!)
+        block = 1024
+        q_bank = QuantizedSynapseMatrix.empty(0, self.num_neurons, self.device, mode=self.bio_synapse_mode)
+        for r0 in range(0, n, block):
+            r1 = min(n, r0 + block)
+            dense_blk = torch.zeros((r1 - r0, self.num_neurons), dtype=torch.float32, device=self.device)
+            dense_blk.scatter_(
+                -1,
+                idxs[r0:r1].to(device=self.device, dtype=torch.long),
+                vals[r0:r1].to(device=self.device, dtype=torch.float32),
+            )
+            q_bank = q_bank.cat_rows(dense_blk)
+        self.engrams = q_bank
         self.strengths = tensor_state["strengths"].to(device=self.device, dtype=torch.float32)
         self.importances = tensor_state["importances"].to(device=self.device, dtype=torch.float32)
         self.days_created = tensor_state["days_created"].to(device=self.device, dtype=torch.int32)
@@ -522,15 +557,23 @@ class Hippocampus:
         max_semantic_memories: int = 50000,
         max_rem_reflections: int = 500,
         device: torch.device | None = None,
+        bio_synapse_dtype: str = "fp8",
     ) -> None:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.num_neurons = num_neurons
         self.sdr_k = sdr_k
+        self.bio_synapse_mode = resolve_bio_synapse_mode(bio_synapse_dtype, self.device)
 
-        self.short_term = TensorEngramBank(num_neurons, sdr_k, max_short_term_memories, self.device)
-        self.semantic = TensorEngramBank(num_neurons, sdr_k, max_semantic_memories, self.device)
-        self.rem = TensorEngramBank(num_neurons, sdr_k, max_rem_reflections, self.device)
+        self.short_term = TensorEngramBank(num_neurons, sdr_k, max_short_term_memories, self.device, bio_synapse_dtype=bio_synapse_dtype)
+        self.semantic = TensorEngramBank(num_neurons, sdr_k, max_semantic_memories, self.device, bio_synapse_dtype=bio_synapse_dtype)
+        self.rem = TensorEngramBank(num_neurons, sdr_k, max_rem_reflections, self.device, bio_synapse_dtype=bio_synapse_dtype)
         self.studied_topics: dict[str, dict[str, Any]] = {}
+
+    def memory_bytes(self) -> int:
+        return self.short_term.memory_bytes() + self.semantic.memory_bytes() + self.rem.memory_bytes()
+
+    def memory_mb(self) -> float:
+        return round(self.memory_bytes() / (1024.0 * 1024.0), 3)
 
     @torch.no_grad()
     def record_engram(
@@ -715,17 +758,19 @@ class Hippocampus:
         )
 
     @torch.no_grad()
-    def get_hopfield_bank(self, max_engrams: int = 8192) -> torch.Tensor:
+    def get_hopfield_bank(self, max_engrams: int = 8192) -> QuantizedSynapseMatrix:
         """
-        Return a single contiguous bfloat16 tensor [M_total, N] on GPU for Modern Hopfield dynamics.
+        Return a single contiguous FP8 per-row QuantizedSynapseMatrix [M_total, N] on GPU
+        for Modern Hopfield dynamics (2x lower VRAM, zero full fp32 copy!).
         NEVER exposes any string or preview_label.
         """
-        parts = [b.engrams for b in (self.short_term, self.semantic, self.rem) if len(b) > 0]
-        if not parts:
-            return torch.empty((0, self.num_neurons), dtype=torch.bfloat16, device=self.device)
-        combined = torch.cat(parts, dim=0)
+        combined = QuantizedSynapseMatrix.empty(0, self.num_neurons, self.device, mode=self.bio_synapse_mode)
+        for bank in (self.short_term, self.semantic, self.rem):
+            if len(bank) > 0:
+                combined = combined.cat_rows(bank.engrams)
         if combined.shape[0] > max_engrams:
-            combined = combined[-max_engrams:]
+            idx = torch.arange(combined.shape[0] - max_engrams, combined.shape[0], device=self.device)
+            combined = combined.select_rows(idx)
         return combined
 
     @torch.no_grad()
@@ -766,7 +811,7 @@ class Hippocampus:
         fresh_engrams = (
             self.short_term.engrams.clone()
             if st_n > 0
-            else torch.empty((0, self.num_neurons), dtype=torch.bfloat16, device=self.device)
+            else QuantizedSynapseMatrix.empty(0, self.num_neurons, self.device, mode=self.bio_synapse_mode)
         )
 
         if st_n > 0:
@@ -775,35 +820,33 @@ class Hippocampus:
             keep_st_mask = torch.ones(st_n, dtype=torch.bool, device=self.device)
             if st_n > 1:
                 self_sim = st_f @ st_f.T
-                # Upper-triangular mask: if an earlier short-term trace is near-duplicate, merge into it
-                # (never drop pinned short-term engrams during deduplication)
                 tril_sim = torch.tril(self_sim, diagonal=-1)
                 dup_vals, _ = tril_sim.max(dim=1)
                 keep_st_mask = (dup_vals < merge_threshold) | self.short_term.pinned
                 merged_count += int((~keep_st_mask).sum().item())
 
             keep_st_idx = torch.nonzero(keep_st_mask, as_tuple=False).squeeze(-1)
-            cand_engrams = self.short_term.engrams.index_select(0, keep_st_idx)
+            cand_engrams_f = st_f.index_select(0, keep_st_idx)
             cand_strengths = self.short_term.strengths.index_select(0, keep_st_idx)
             cand_imps = self.short_term.importances.index_select(0, keep_st_idx)
             cand_pinned = self.short_term.pinned.index_select(0, keep_st_idx)
             cand_metas = [self.short_term.meta[i] for i in keep_st_idx.cpu().tolist()]
 
-            # 2) Match candidates against long-term semantic bank in a single GPU matmul
-            if len(self.semantic) > 0 and cand_engrams.shape[0] > 0:
-                sim_mat = torch.matmul(cand_engrams.float(), self.semantic.engrams.float().T)  # [C, S]
+            # 2) Match candidates against long-term semantic bank in FP8 (zero full fp32 copy!)
+            if len(self.semantic) > 0 and cand_engrams_f.shape[0] > 0:
+                sim_mat = self.semantic.engrams.matmul_right_t(cand_engrams_f)  # [C, S]
                 best_sim, best_sem_idx = sim_mat.max(dim=1)
                 merge_mask = best_sim >= merge_threshold
                 novel_mask = ~merge_mask
 
                 if merge_mask.any():
-                    m_cand = cand_engrams[merge_mask].float()
+                    m_cand = cand_engrams_f[merge_mask]
                     m_targets = best_sem_idx[merge_mask]
-                    old_vecs = self.semantic.engrams.index_select(0, m_targets).float()
-                    # Generalized prototype update via k-WTA
+                    old_vecs = self.semantic.engrams.dequant_rows(m_targets, out_dtype=torch.float32)
+                    # Generalized prototype update via k-WTA -> re-quantized into FP8 rows
                     blended = 0.70 * old_vecs + 0.30 * m_cand
                     proto, _, _ = k_wta(blended, k=self.sdr_k, normalize=True)
-                    self.semantic.engrams[m_targets] = proto.to(torch.bfloat16)
+                    self.semantic.engrams.set_rows(m_targets, proto, stochastic=False)
                     self.semantic.strengths[m_targets] = torch.clamp(self.semantic.strengths[m_targets] + 0.45, max=6.0)
                     self.semantic.importances[m_targets] = torch.maximum(
                         self.semantic.importances[m_targets], cand_imps[merge_mask]
@@ -822,22 +865,22 @@ class Hippocampus:
                     novel_idx = torch.nonzero(novel_mask, as_tuple=False).squeeze(-1)
                     novel_metas = [cand_metas[i] for i in novel_idx.cpu().tolist()]
                     self.semantic.add_batch(
-                        sdrs=cand_engrams.index_select(0, novel_idx),
+                        sdrs=cand_engrams_f.index_select(0, novel_idx),
                         metas=novel_metas,
                         strengths=cand_strengths.index_select(0, novel_idx),
                         importances=cand_imps.index_select(0, novel_idx),
                         day=current_day,
                     )
                     new_count = int(novel_idx.numel())
-            elif cand_engrams.shape[0] > 0:
+            elif cand_engrams_f.shape[0] > 0:
                 self.semantic.add_batch(
-                    sdrs=cand_engrams,
+                    sdrs=cand_engrams_f,
                     metas=cand_metas,
                     strengths=cand_strengths,
                     importances=cand_imps,
                     day=current_day,
                 )
-                new_count = int(cand_engrams.shape[0])
+                new_count = int(cand_engrams_f.shape[0])
 
         # 3) Biological forgetting curve on long-term semantic bank (vectorized GPU)
         #    Pinned memories (pinned=True) and key knowledge (importance >= 4.0) are strictly immune to decay & forgetting!
@@ -891,13 +934,16 @@ class Hippocampus:
 
         if target_fresh > 0:
             idx_f = torch.randint(0, n_fresh, (target_fresh,), device=self.device)
-            parts.append(fresh_engrams.index_select(0, idx_f).float())
+            if isinstance(fresh_engrams, QuantizedSynapseMatrix):
+                parts.append(fresh_engrams.dequant_rows(idx_f, out_dtype=torch.float32))
+            else:
+                parts.append(fresh_engrams.index_select(0, idx_f).float())
 
         if target_sem > 0:
             weights = torch.clamp(self.semantic.strengths * self.semantic.importances, min=0.1)
             probs = weights / weights.sum()
             idx_s = torch.multinomial(probs, num_samples=target_sem, replacement=(target_sem > n_sem))
-            parts.append(self.semantic.engrams.index_select(0, idx_s).float())
+            parts.append(self.semantic.engrams.dequant_rows(idx_s, out_dtype=torch.float32))
 
         return torch.cat(parts, dim=0)
 

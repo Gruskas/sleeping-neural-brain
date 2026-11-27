@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import BrainConfig
+from .fp8_synapse import QuantizedSynapseMatrix, resolve_bio_synapse_mode
 from .sensory_wernicke import k_wta
 
 
@@ -50,12 +51,15 @@ class BiologicalAssociativeCortex(nn.Module):
         self.sdr_k = cfg.sdr_k
         self.target_sparsity = float(cfg.sdr_k) / float(cfg.num_neurons)
 
-        # Store large W_in / W_rec in bfloat16 on CUDA (2x less VRAM: 576 MB vs 1152 MB, and ~8-12x faster
-        # Tensor Core matmuls in perceive_and_think!) while learn_local accumulates updates in float32.
+        # Store W_in in bfloat16 on CUDA and recurrent W_rec in native Blackwell FP8 per-row (~2x lower VRAM!)
         self.weight_dtype = (
             torch.bfloat16
             if (device.type == "cuda" and torch.cuda.is_bf16_supported())
             else torch.float32
+        )
+        self.bio_synapse_mode = resolve_bio_synapse_mode(
+            str(getattr(cfg, "bio_synapse_dtype", "fp8")),
+            device,
         )
 
         # Register as non-grad buffers so PyTorch NEVER backpropagates through cortical weights
@@ -63,12 +67,17 @@ class BiologicalAssociativeCortex(nn.Module):
         w_in = F.normalize(w_in, dim=-1) * 0.25
         self.register_buffer("W_in", w_in.to(dtype=self.weight_dtype))
 
-        # Sparse initial recurrent connectivity with strictly zero diagonal
+        # Sparse initial recurrent connectivity with strictly zero diagonal stored in QuantizedSynapseMatrix (FP8)
         w_rec = torch.randn(self.num_neurons, self.num_neurons, device=device, dtype=torch.float32) * 0.02
         sparse_mask = (torch.rand_like(w_rec) < 0.08).float()
         w_rec = w_rec * sparse_mask
         w_rec.fill_diagonal_(0.0)
-        self.register_buffer("W_rec", w_rec.to(dtype=self.weight_dtype))
+        self.W_rec: QuantizedSynapseMatrix = QuantizedSynapseMatrix.from_tensor(
+            w_rec,
+            mode=self.bio_synapse_mode,
+            device=device,
+        )
+        self.W_rec.fill_diagonal_(0.0)
 
         self.register_buffer("threshold", torch.zeros(self.num_neurons, device=device, dtype=torch.float32))
         self.register_buffer(
@@ -112,7 +121,13 @@ class BiologicalAssociativeCortex(nn.Module):
         return int(self.W_in.numel() + self.W_rec.numel() + self.threshold.numel())
 
     def active_synapses_count(self) -> int:
-        return int((self.W_rec.abs() > 0).sum().item())
+        return self.W_rec.count_nonzero()
+
+    def synapse_memory_bytes(self) -> int:
+        return self.W_rec.nbytes()
+
+    def synapse_memory_mb(self) -> float:
+        return round(self.W_rec.nbytes() / (1024.0 * 1024.0), 3)
 
     @torch.no_grad()
     def reset_synaptic_weights(self) -> None:
@@ -126,7 +141,8 @@ class BiologicalAssociativeCortex(nn.Module):
         sparse_mask = (torch.rand_like(w_rec) < 0.08).float()
         w_rec.mul_(sparse_mask)
         w_rec.fill_diagonal_(0.0)
-        self.W_rec.copy_(w_rec.to(dtype=self.W_rec.dtype))
+        self.W_rec.copy_(w_rec)
+        self.W_rec.fill_diagonal_(0.0)
         self.threshold.zero_()
         self.avg_activity.fill_(self.target_sparsity)
         self.last_active_sdr.zero_()
@@ -332,11 +348,13 @@ class BiologicalAssociativeCortex(nn.Module):
         z, _, _ = k_wta(init_act, k=self.sdr_k, normalize=True)
 
         has_bank = engram_bank is not None and engram_bank.numel() > 0 and engram_bank.shape[0] > 0
-        e_mat = (
-            F.normalize(engram_bank.to(device=self.device, dtype=torch.float32), dim=-1, eps=1e-6).to(dtype=w_dt)
-            if has_bank
-            else None
-        )
+        e_qmat: QuantizedSynapseMatrix | None = None
+        e_mat: torch.Tensor | None = None
+        if has_bank:
+            if isinstance(engram_bank, QuantizedSynapseMatrix):
+                e_qmat = engram_bank if engram_bank.device == self.device else engram_bank.to(device=self.device)
+            else:
+                e_mat = F.normalize(engram_bank.to(device=self.device, dtype=torch.float32), dim=-1, eps=1e-6).to(dtype=w_dt)
 
         beta = float(self.cfg.hopfield_beta)
         attn_weights: torch.Tensor | None = None
@@ -345,14 +363,21 @@ class BiologicalAssociativeCortex(nn.Module):
         last_h_hop: torch.Tensor | None = None
 
         for step_i in range(n_steps):
-            # Native bfloat16 Tensor Core matmul + zero CPU-GPU .item() sync inside loop!
-            h_rec = F.normalize((z.to(dtype=w_dt) @ self.W_rec.T).float(), dim=-1, eps=1e-6)
+            # Native Blackwell FP8 Tensor Core / blockwise BF16 matmul (zero full fp32 copy!)
+            h_rec = F.normalize(self.W_rec.matmul_right_t(z), dim=-1, eps=1e-6)
 
-            if e_mat is not None:
-                raw_sims = (z.to(dtype=w_dt) @ e_mat.T).float()  # [B, M]
-                logits = beta * raw_sims
-                attn_weights = F.softmax(logits, dim=-1)  # [B, M]
-                h_hop = F.normalize((attn_weights.to(dtype=w_dt) @ e_mat).float(), dim=-1, eps=1e-6)
+            if e_qmat is not None or e_mat is not None:
+                if e_qmat is not None:
+                    raw_sims = e_qmat.matmul_right_t(z)  # [B, M] native FP8 / blockwise BF16
+                    logits = beta * raw_sims
+                    attn_weights = F.softmax(logits, dim=-1)  # [B, M]
+                    h_hop = F.normalize(e_qmat.matmul_left(attn_weights), dim=-1, eps=1e-6)
+                else:
+                    assert e_mat is not None
+                    raw_sims = (z.to(dtype=w_dt) @ e_mat.T).float()  # [B, M]
+                    logits = beta * raw_sims
+                    attn_weights = F.softmax(logits, dim=-1)  # [B, M]
+                    h_hop = F.normalize((attn_weights.to(dtype=w_dt) @ e_mat).float(), dim=-1, eps=1e-6)
                 last_h_hop = h_hop
                 lse_t = torch.logsumexp(logits, dim=-1).mean()
                 energy_t = -(lse_t / max(1e-6, beta)) + 0.5
@@ -492,9 +517,8 @@ class BiologicalAssociativeCortex(nn.Module):
         err_start_t: torch.Tensor | None = None
         err_end_t: torch.Tensor | None = None
         n_steps = max(1, int(steps))
-        # Accumulate local plasticity updates in fp32 so small lr steps never underflow bf16!
+        # Accumulate W_in Predictive Coding in fp32 and update W_rec blockwise in FP8 with stochastic rounding!
         w_in_f = self.W_in.float()
-        w_rec_f = self.W_rec.float()
 
         for step_i in range(n_steps):
             if noise_std > 0.0 and step_i > 0:
@@ -519,11 +543,15 @@ class BiologicalAssociativeCortex(nn.Module):
             scale = torch.clamp(2.5 / row_norms, max=1.0)
             w_in_f.mul_(scale)
 
-            # 2) Local Hebbian plasticity on W_rec with strictly zero diagonal
-            coact = (z.T @ z) / float(b)
-            w_rec_f.add_(float(self.cfg.hebb_lr) * (coact - float(self.cfg.hebb_decay) * w_rec_f))
-            w_rec_f.fill_diagonal_(0.0)
-            w_rec_f.clamp_(-1.0, 1.0)
+            # 2) Blockwise Local Hebbian plasticity on FP8 W_rec (zero full 12288x12288 fp32 copy!)
+            self.W_rec.hebbian_update_from_sdr(
+                z,
+                lr=float(self.cfg.hebb_lr),
+                decay=float(self.cfg.hebb_decay),
+                clamp_min=-1.0,
+                clamp_max=1.0,
+                zero_diag=True,
+            )
 
             # 3) Homeostatic threshold plasticity — strictly bounded to a small fraction (~15%) of
             #    an active k-WTA neuron's amplitude (1/sqrt(sdr_k) ~= 0.039) so homeostasis gently
@@ -536,7 +564,6 @@ class BiologicalAssociativeCortex(nn.Module):
             self.total_local_updates += 1
 
         self.W_in.copy_(w_in_f.to(dtype=self.W_in.dtype))
-        self.W_rec.copy_(w_rec_f.to(dtype=self.W_rec.dtype))
         # Re-evaluate final clean reconstruction error after the last update (single sync at end)
         final_err_t = (s_flat - (z_base @ w_in_f)).pow(2).mean()
         err_start = float(err_start_t.item()) if err_start_t is not None else 0.0
@@ -558,28 +585,14 @@ class BiologicalAssociativeCortex(nn.Module):
         prune_eps: float | None = None,
     ) -> dict[str, int]:
         """
-        Synaptic Homeostasis Hypothesis (SHY):
-          - Global multiplicative downscaling W_rec *= 0.94
-          - Prune weak weights below prune_eps to keep recurrent memory sharp and sparse
+        Synaptic Homeostasis Hypothesis (SHY) on FP8 per-row W_rec:
+          - Exact multiplicative downscaling on row_scale (`*= 0.94`)
+          - Blockwise pruning of weak weights below prune_eps
           - Strictly enforce zero diagonal
         """
         factor = float(downscale if downscale is not None else self.cfg.shy_downscale)
         eps = float(prune_eps if prune_eps is not None else self.cfg.shy_prune_eps)
-
-        self.W_rec.fill_diagonal_(0.0)
-        before = int((self.W_rec.abs() > 0).sum().item())
-        self.W_rec.mul_(factor)
-        prune_mask = (self.W_rec.abs() < eps) & (self.W_rec != 0)
-        pruned = int(prune_mask.sum().item())
-        self.W_rec[prune_mask] = 0.0
-        self.W_rec.fill_diagonal_(0.0)
-        after = int((self.W_rec.abs() > 0).sum().item())
-
-        return {
-            "before_synapses": before,
-            "pruned_synapses": pruned,
-            "active_synapses": after,
-        }
+        return self.W_rec.apply_shy_prune(downscale=factor, eps=eps, zero_diag=True)
 
     @torch.no_grad()
     def compute_2d_projection(
@@ -593,7 +606,6 @@ class BiologicalAssociativeCortex(nn.Module):
         after the last k-WTA onto 2D via GPU SVD/PCA for live visualization in static/index.html.
         """
         n_total = self.num_neurons
-        w_abs = self.W_rec.abs()
 
         # Select top active neurons from last k-WTA + neurons with strongest total recurrent weight
         active_mask = self.last_active_sdr > 0
@@ -605,7 +617,7 @@ class BiologicalAssociativeCortex(nn.Module):
         else:
             chosen_active = []
 
-        neuron_strength = w_abs.sum(dim=1) + w_abs.sum(dim=0)
+        neuron_strength = self.W_rec.row_col_abs_sum()
         top_hubs = torch.topk(neuron_strength, k=min(max_nodes, n_total)).indices.tolist()
 
         selected: list[int] = []
@@ -622,13 +634,18 @@ class BiologicalAssociativeCortex(nn.Module):
 
         cur_dev = self.W_rec.device
         sel_t = torch.tensor(selected, dtype=torch.long, device=cur_dev)
-        sub_w = self.W_rec.index_select(0, sel_t).index_select(1, sel_t).float()  # [K, K]
+        sub_w = self.W_rec.select_submatrix(sel_t, sel_t)  # [K, K]
         # Build feature matrix from synaptic profiles + engram affinity if available
         feats = self.W_in.index_select(0, sel_t).float()  # [K, sensory_dim]
         if engram_bank is not None and engram_bank.numel() > 0:
-            e_sub = engram_bank.to(device=cur_dev, dtype=torch.float32)[:, sel_t].T  # [K, M]
-            if e_sub.shape[1] > 64:
-                e_sub = e_sub[:, -64:]
+            if isinstance(engram_bank, QuantizedSynapseMatrix):
+                m_eb = engram_bank.shape[0]
+                row_sel = torch.arange(max(0, m_eb - 64), m_eb, device=engram_bank.device)
+                e_sub = engram_bank.select_submatrix(row_sel, sel_t.to(engram_bank.device)).to(device=cur_dev).T
+            else:
+                e_sub = engram_bank.to(device=cur_dev, dtype=torch.float32)[:, sel_t].T  # [K, M]
+                if e_sub.shape[1] > 64:
+                    e_sub = e_sub[:, -64:]
             feats = torch.cat([F.normalize(feats, dim=-1), F.normalize(e_sub, dim=-1)], dim=-1)
 
         k_nodes = len(selected)
@@ -721,8 +738,9 @@ class BiologicalAssociativeCortex(nn.Module):
             "num_neurons": self.num_neurons,
             "sensory_dim": self.sensory_dim,
             "sdr_k": self.sdr_k,
+            "bio_synapse_mode": self.bio_synapse_mode,
             "W_in": self.W_in.detach().cpu().to(torch.bfloat16),
-            "W_rec": self.W_rec.detach().cpu().to(torch.bfloat16),
+            "W_rec": self.W_rec.export_state(),
             "threshold": self.threshold.detach().cpu().float(),
             "avg_activity": self.avg_activity.detach().cpu().float(),
             "last_active_sdr": self.last_active_sdr.detach().cpu().to(torch.bfloat16),
@@ -734,7 +752,12 @@ class BiologicalAssociativeCortex(nn.Module):
         if state.get("num_neurons") != self.num_neurons or state.get("sensory_dim") != self.sensory_dim:
             raise ValueError("Incompatible BiologicalAssociativeCortex dimensions in checkpoint")
         self.W_in.copy_(state["W_in"].to(device=self.device, dtype=self.W_in.dtype))
-        self.W_rec.copy_(state["W_rec"].to(device=self.device, dtype=self.W_rec.dtype))
+        # Seamlessly migrate both FP8/INT8 state dicts AND legacy bf16/fp32 W_rec tensors to FP8!
+        self.W_rec = QuantizedSynapseMatrix.from_state(
+            state["W_rec"],
+            device=self.device,
+            mode=self.bio_synapse_mode,
+        )
         self.W_rec.fill_diagonal_(0.0)
         thr_cap = min(0.006, 0.15 / math.sqrt(float(max(1, self.sdr_k))))
         self.threshold.copy_(

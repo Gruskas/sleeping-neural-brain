@@ -11,6 +11,7 @@ import psutil
 import torch
 import torch.nn.functional as F
 
+from .fp8_synapse import QuantizedSynapseMatrix, resolve_bio_synapse_mode, tensor_or_qmat_bytes
 from .sensory_wernicke import k_wta
 
 
@@ -40,10 +41,8 @@ def trim_process_ram() -> None:
         pass
 
 
-def _tensor_bytes(t: torch.Tensor | None) -> int:
-    if t is None:
-        return 0
-    return int(t.numel() * t.element_size())
+def _tensor_bytes(t: Any) -> int:
+    return tensor_or_qmat_bytes(t)
 
 
 def _safe_k_for_size(n: int, ratio: float = 0.04) -> int:
@@ -150,13 +149,16 @@ class LivingBrainEngine:
         target_device: str = "gpu",
         memory_budget_mb: float = 2048.0,
         start_background_clock: bool = False,
+        bio_synapse_dtype: str = "fp8",
     ) -> None:
         self.lock = threading.RLock()
         self.sensory_dim = int(sensory_dim)
         self.target_device_mode = "gpu" if (target_device == "gpu" and torch.cuda.is_available()) else "ram"
         self.device = torch.device("cuda" if self.target_device_mode == "gpu" else "cpu")
-        # Use compact bfloat16 on BOTH GPU and CPU RAM (2x lower RAM usage, zero GPU slowdown!)
+        # Compact working dtype for episodic traces + native FP8 per-row quantization for synaptic matrices
         self.dtype = torch.bfloat16 if (self.device.type == "cpu" or torch.cuda.is_bf16_supported()) else torch.float16
+        self.requested_bio_synapse_dtype: str = str(bio_synapse_dtype or "fp8")
+        self.bio_synapse_mode: str = resolve_bio_synapse_mode(self.requested_bio_synapse_dtype, self.device)
         self.memory_budget_mb = max(MIN_BUDGET_MB, min(MAX_BUDGET_MB, float(memory_budget_mb)))
 
         # Biological floor sizes (allows compacting safely down to ~68 MB without breaking structure)
@@ -206,15 +208,16 @@ class LivingBrainEngine:
     def _init_tensors(self) -> None:
         dev = self.device
         dt = self.dtype
+        syn_mode = self.bio_synapse_mode
 
-        def _sparse_mat(rows: int, cols: int, density: float = 0.12, scale: float = 0.15) -> torch.Tensor:
+        def _sparse_mat(rows: int, cols: int, density: float = 0.12, scale: float = 0.15) -> QuantizedSynapseMatrix:
             w = torch.randn(rows, cols, device=dev, dtype=torch.float32) * scale
             mask = (torch.rand(rows, cols, device=dev) < density).float()
             w.mul_(mask)
             w = F.normalize(w, dim=-1, eps=1e-6) * scale
-            return w.to(dtype=dt)
+            return QuantizedSynapseMatrix.from_tensor(w, mode=syn_mode, device=dev)
 
-        # ── M1 Hierarchical Cortex (L1 <-> L2 <-> L3 <-> Assoc) ──────────────
+        # ── M1 Hierarchical Cortex (L1 <-> L2 <-> L3 <-> Assoc) in native FP8 per-row ──
         self.W_in_L1 = _sparse_mat(self.n_l1, self.sensory_dim, density=0.22, scale=0.25)
         self.G_10 = _sparse_mat(self.sensory_dim, self.n_l1, density=0.22, scale=0.20)
 
@@ -228,8 +231,8 @@ class LivingBrainEngine:
         self.W_assoc_rec = _sparse_mat(self.n_assoc, self.n_assoc, density=0.10, scale=0.10)
         self.W_assoc_rec.fill_diagonal_(0.0)
 
-        # Eligibility traces for Dopamine-gated 3-factor learning (compact float32 on key associative links)
-        self.E_assoc_rec = torch.zeros((self.n_assoc, self.n_assoc), device=dev, dtype=dt)
+        # Eligibility traces for Dopamine-gated 3-factor learning (quantized FP8 per-row)
+        self.E_assoc_rec = QuantizedSynapseMatrix.zeros(self.n_assoc, self.n_assoc, device=dev, mode=syn_mode)
 
         # Live neuron states, short-term fatigue (firing-rate adaptation), long-term homeostatic thresholds & utility
         self.state_l1 = torch.zeros(self.n_l1, device=dev, dtype=torch.float32)
@@ -262,9 +265,8 @@ class LivingBrainEngine:
         self.m2_pinned = torch.empty((0,), device=dev, dtype=torch.bool)
 
         # ── M4 Basal Ganglia (Intrinsic Curiosity, Striatal Prototypes & Valence)
-        self.m4_prototypes = F.normalize(
-            torch.randn(self.n_m4, self.n_assoc, device=dev, dtype=torch.float32), dim=-1
-        ).to(dtype=dt)
+        m4_init = F.normalize(torch.randn(self.n_m4, self.n_assoc, device=dev, dtype=torch.float32), dim=-1)
+        self.m4_prototypes = QuantizedSynapseMatrix.from_tensor(m4_init, mode=syn_mode, device=dev)
         self.m4_visits = torch.zeros(self.n_m4, device=dev, dtype=torch.float32)
         self.m4_err_ema = torch.full((self.n_m4,), 0.45, device=dev, dtype=torch.float32)
         self.m4_values = torch.zeros(self.n_m4, device=dev, dtype=torch.float32)
@@ -327,11 +329,11 @@ class LivingBrainEngine:
     def active_synapses_count(self) -> int:
         with self.lock:
             return int(
-                (self.W_in_L1.abs() > 0).sum().item()
-                + (self.W_12.abs() > 0).sum().item()
-                + (self.W_23.abs() > 0).sum().item()
-                + (self.W_3a.abs() > 0).sum().item()
-                + (self.W_assoc_rec.abs() > 0).sum().item()
+                self.W_in_L1.count_nonzero()
+                + self.W_12.count_nonzero()
+                + self.W_23.count_nonzero()
+                + self.W_3a.count_nonzero()
+                + self.W_assoc_rec.count_nonzero()
             )
 
     def total_neurons_count(self) -> int:
@@ -372,11 +374,12 @@ class LivingBrainEngine:
     def _migrate_device(self, new_mode: str) -> None:
         new_dev = torch.device("cuda" if (new_mode == "gpu" and torch.cuda.is_available()) else "cpu")
         new_dt = torch.bfloat16 if (new_dev.type == "cpu" or torch.cuda.is_bf16_supported()) else torch.float16
-        mat_names = [
+        new_syn_mode = resolve_bio_synapse_mode(self.requested_bio_synapse_dtype, new_dev)
+        qmat_names = [
             "W_in_L1", "G_10", "W_12", "G_21", "W_23", "G_32",
-            "W_3a", "W_assoc_rec", "E_assoc_rec",
-            "m2_assoc_traces", "m2_sensory_traces", "m4_prototypes",
+            "W_3a", "W_assoc_rec", "E_assoc_rec", "m4_prototypes",
         ]
+        m2_mat_names = ["m2_assoc_traces", "m2_sensory_traces"]
         vec_names = [
             "state_l1", "state_l2", "state_l3", "state_assoc",
             "fatigue_l1", "fatigue_l2", "fatigue_l3", "fatigue_assoc",
@@ -385,13 +388,16 @@ class LivingBrainEngine:
             "m2_strengths", "m2_surprises", "m2_last_used", "m2_valences", "m2_pinned",
             "m4_visits", "m4_err_ema", "m4_values",
         ]
-        for name in mat_names:
+        for name in qmat_names:
+            setattr(self, name, getattr(self, name).to(device=new_dev, mode=new_syn_mode).contiguous())
+        for name in m2_mat_names:
             setattr(self, name, getattr(self, name).to(device=new_dev, dtype=new_dt).contiguous())
         for name in vec_names:
             setattr(self, name, getattr(self, name).to(device=new_dev).contiguous())
         self.target_device_mode = new_mode
         self.device = new_dev
         self.dtype = new_dt
+        self.bio_synapse_mode = new_syn_mode
         trim_process_ram()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -455,13 +461,8 @@ class LivingBrainEngine:
         pruned = 0
         for name in ("W_in_L1", "W_12", "W_23", "W_3a", "W_assoc_rec"):
             w = getattr(self, name)
-            w.mul_(downscale)
-            mask = (w.abs() < eps) & (w != 0)
-            c = int(mask.sum().item())
-            if c > 0:
-                w[mask] = 0
-                pruned += c
-        self.W_assoc_rec.fill_diagonal_(0.0)
+            res = w.apply_shy_prune(downscale=downscale, eps=eps, zero_diag=(name == "W_assoc_rec"))
+            pruned += int(res["pruned_synapses"])
         self.total_synapses_pruned += pruned
         return pruned
 
@@ -568,10 +569,9 @@ class LivingBrainEngine:
         if idxa is not None:
             removed_total += self.n_assoc - int(idxa.numel())
             self.n_assoc = int(idxa.numel())
-            self.W_3a = self.W_3a.index_select(0, idxa).contiguous()
-            self.W_assoc_rec = self.W_assoc_rec.index_select(0, idxa).index_select(1, idxa).contiguous()
-            self.W_assoc_rec.fill_diagonal_(0.0)
-            self.E_assoc_rec = self.E_assoc_rec.index_select(0, idxa).index_select(1, idxa).contiguous()
+            self.W_3a = self.W_3a.select_rows(idxa)
+            self.W_assoc_rec = self.W_assoc_rec.select_square(idxa, zero_diag=True)
+            self.E_assoc_rec = self.E_assoc_rec.select_square(idxa, zero_diag=False)
             self.state_assoc = self.state_assoc.index_select(0, idxa).contiguous()
             self.fatigue_assoc = self.fatigue_assoc.index_select(0, idxa).contiguous()
             self.thresh_assoc = self.thresh_assoc.index_select(0, idxa).contiguous()
@@ -582,9 +582,8 @@ class LivingBrainEngine:
                 ).to(dtype=self.dtype).contiguous()
             else:
                 self.m2_assoc_traces = torch.empty((0, self.n_assoc), device=self.device, dtype=self.dtype)
-            self.m4_prototypes = F.normalize(
-                self.m4_prototypes.index_select(1, idxa).float(), dim=-1, eps=1e-6
-            ).to(dtype=self.dtype).contiguous()
+            m4_comp = F.normalize(self.m4_prototypes.select_cols(idxa).float(), dim=-1, eps=1e-6)
+            self.m4_prototypes = QuantizedSynapseMatrix.from_tensor(m4_comp, mode=self.bio_synapse_mode, device=self.device)
 
         # Compact M4 Basal Ganglia units
         if self.n_m4 > self.min_m4:
@@ -626,25 +625,25 @@ class LivingBrainEngine:
             dev = self.device
             dt = self.dtype
 
-            def _sparse_block(rows: int, cols: int, density: float = 0.14, scale: float = 0.16) -> torch.Tensor:
+            def _sparse_block_f32(rows: int, cols: int, density: float = 0.14, scale: float = 0.16) -> torch.Tensor:
                 w = torch.randn(rows, cols, device=dev, dtype=torch.float32) * scale
                 mask = (torch.rand(rows, cols, device=dev) < density).float()
                 w.mul_(mask)
-                return w.to(dtype=dt)
+                return w
 
             born = 0
 
             # Grow L1
             if add_l1 > 0:
-                new_in = _sparse_block(add_l1, self.sensory_dim, density=0.22, scale=0.22)
+                new_in = _sparse_block_f32(add_l1, self.sensory_dim, density=0.22, scale=0.22)
                 if seed_input is not None and seed_input.numel() == self.sensory_dim:
                     # Bias newborn L1 receptive fields gently toward the surprising stimulus!
                     s_vec = F.normalize(seed_input.to(device=dev, dtype=torch.float32).reshape(1, -1), dim=-1)
-                    new_in = F.normalize(new_in.float() + 0.35 * s_vec, dim=-1, eps=1e-6).to(dtype=dt) * 0.25
-                self.W_in_L1 = torch.cat([self.W_in_L1, new_in], dim=0).contiguous()
-                self.G_10 = torch.cat([self.G_10, _sparse_block(self.sensory_dim, add_l1, 0.20, 0.18)], dim=1).contiguous()
-                self.W_12 = torch.cat([self.W_12, _sparse_block(self.n_l2, add_l1, 0.16, 0.18)], dim=1).contiguous()
-                self.G_21 = torch.cat([self.G_21, _sparse_block(add_l1, self.n_l2, 0.16, 0.18)], dim=0).contiguous()
+                    new_in = F.normalize(new_in + 0.35 * s_vec, dim=-1, eps=1e-6) * 0.25
+                self.W_in_L1 = self.W_in_L1.cat_rows(new_in)
+                self.G_10 = self.G_10.cat_cols(_sparse_block_f32(self.sensory_dim, add_l1, 0.20, 0.18))
+                self.W_12 = self.W_12.cat_cols(_sparse_block_f32(self.n_l2, add_l1, 0.16, 0.18))
+                self.G_21 = self.G_21.cat_rows(_sparse_block_f32(add_l1, self.n_l2, 0.16, 0.18))
                 self.state_l1 = torch.cat([self.state_l1, torch.zeros(add_l1, device=dev)], dim=0)
                 self.fatigue_l1 = torch.cat([self.fatigue_l1, torch.zeros(add_l1, device=dev)], dim=0)
                 self.thresh_l1 = torch.cat([self.thresh_l1, torch.zeros(add_l1, device=dev)], dim=0)
@@ -654,10 +653,10 @@ class LivingBrainEngine:
 
             # Grow L2
             if add_l2 > 0:
-                self.W_12 = torch.cat([self.W_12, _sparse_block(add_l2, self.n_l1, 0.16, 0.20)], dim=0).contiguous()
-                self.G_21 = torch.cat([self.G_21, _sparse_block(self.n_l1, add_l2, 0.16, 0.18)], dim=1).contiguous()
-                self.W_23 = torch.cat([self.W_23, _sparse_block(self.n_l3, add_l2, 0.16, 0.18)], dim=1).contiguous()
-                self.G_32 = torch.cat([self.G_32, _sparse_block(add_l2, self.n_l3, 0.16, 0.18)], dim=0).contiguous()
+                self.W_12 = self.W_12.cat_rows(_sparse_block_f32(add_l2, self.n_l1, 0.16, 0.20))
+                self.G_21 = self.G_21.cat_cols(_sparse_block_f32(self.n_l1, add_l2, 0.16, 0.18))
+                self.W_23 = self.W_23.cat_cols(_sparse_block_f32(self.n_l3, add_l2, 0.16, 0.18))
+                self.G_32 = self.G_32.cat_rows(_sparse_block_f32(add_l2, self.n_l3, 0.16, 0.18))
                 self.state_l2 = torch.cat([self.state_l2, torch.zeros(add_l2, device=dev)], dim=0)
                 self.fatigue_l2 = torch.cat([self.fatigue_l2, torch.zeros(add_l2, device=dev)], dim=0)
                 self.thresh_l2 = torch.cat([self.thresh_l2, torch.zeros(add_l2, device=dev)], dim=0)
@@ -667,9 +666,9 @@ class LivingBrainEngine:
 
             # Grow L3
             if add_l3 > 0:
-                self.W_23 = torch.cat([self.W_23, _sparse_block(add_l3, self.n_l2, 0.16, 0.20)], dim=0).contiguous()
-                self.G_32 = torch.cat([self.G_32, _sparse_block(self.n_l2, add_l3, 0.16, 0.18)], dim=1).contiguous()
-                self.W_3a = torch.cat([self.W_3a, _sparse_block(self.n_assoc, add_l3, 0.18, 0.18)], dim=1).contiguous()
+                self.W_23 = self.W_23.cat_rows(_sparse_block_f32(add_l3, self.n_l2, 0.16, 0.20))
+                self.G_32 = self.G_32.cat_cols(_sparse_block_f32(self.n_l2, add_l3, 0.16, 0.18))
+                self.W_3a = self.W_3a.cat_cols(_sparse_block_f32(self.n_assoc, add_l3, 0.18, 0.18))
                 self.state_l3 = torch.cat([self.state_l3, torch.zeros(add_l3, device=dev)], dim=0)
                 self.fatigue_l3 = torch.cat([self.fatigue_l3, torch.zeros(add_l3, device=dev)], dim=0)
                 self.thresh_l3 = torch.cat([self.thresh_l3, torch.zeros(add_l3, device=dev)], dim=0)
@@ -681,18 +680,19 @@ class LivingBrainEngine:
             if add_assoc > 0:
                 old_a = self.n_assoc
                 new_a = old_a + add_assoc
-                self.W_3a = torch.cat([self.W_3a, _sparse_block(add_assoc, self.n_l3, 0.18, 0.20)], dim=0).contiguous()
-                new_rec = torch.zeros((new_a, new_a), device=dev, dtype=dt)
-                new_rec[:old_a, :old_a] = self.W_assoc_rec
-                new_rec[old_a:, :old_a] = _sparse_block(add_assoc, old_a, 0.08, 0.08)
-                new_rec[:old_a, old_a:] = _sparse_block(old_a, add_assoc, 0.08, 0.08)
-                new_rec[old_a:, old_a:] = _sparse_block(add_assoc, add_assoc, 0.08, 0.08)
-                new_rec.fill_diagonal_(0.0)
-                self.W_assoc_rec = new_rec.contiguous()
-
-                new_etrace = torch.zeros((new_a, new_a), device=dev, dtype=dt)
-                new_etrace[:old_a, :old_a] = self.E_assoc_rec
-                self.E_assoc_rec = new_etrace.contiguous()
+                self.W_3a = self.W_3a.cat_rows(_sparse_block_f32(add_assoc, self.n_l3, 0.18, 0.20))
+                self.W_assoc_rec = self.W_assoc_rec.grow_square(
+                    bottom_left=_sparse_block_f32(add_assoc, old_a, 0.08, 0.08),
+                    top_right=_sparse_block_f32(old_a, add_assoc, 0.08, 0.08),
+                    bottom_right=_sparse_block_f32(add_assoc, add_assoc, 0.08, 0.08),
+                    zero_diag=True,
+                )
+                self.E_assoc_rec = self.E_assoc_rec.grow_square(
+                    bottom_left=torch.zeros((add_assoc, old_a), device=dev, dtype=torch.float32),
+                    top_right=torch.zeros((old_a, add_assoc), device=dev, dtype=torch.float32),
+                    bottom_right=torch.zeros((add_assoc, add_assoc), device=dev, dtype=torch.float32),
+                    zero_diag=False,
+                )
 
                 self.state_assoc = torch.cat([self.state_assoc, torch.zeros(add_assoc, device=dev)], dim=0)
                 self.fatigue_assoc = torch.cat([self.fatigue_assoc, torch.zeros(add_assoc, device=dev)], dim=0)
@@ -705,8 +705,9 @@ class LivingBrainEngine:
                 else:
                     self.m2_assoc_traces = torch.empty((0, new_a), device=dev, dtype=dt)
 
-                pad_m4 = torch.zeros((self.n_m4, add_assoc), device=dev, dtype=dt)
-                self.m4_prototypes = torch.cat([self.m4_prototypes, pad_m4], dim=1).contiguous()
+                self.m4_prototypes = self.m4_prototypes.cat_cols(
+                    torch.zeros((self.n_m4, add_assoc), device=dev, dtype=torch.float32)
+                )
 
                 self.n_assoc = new_a
                 born += add_assoc
@@ -715,8 +716,8 @@ class LivingBrainEngine:
             if add_m4 > 0:
                 new_proto = F.normalize(
                     torch.randn(add_m4, self.n_assoc, device=dev, dtype=torch.float32), dim=-1
-                ).to(dtype=dt)
-                self.m4_prototypes = torch.cat([self.m4_prototypes, new_proto], dim=0).contiguous()
+                )
+                self.m4_prototypes = self.m4_prototypes.cat_rows(new_proto)
                 self.m4_visits = torch.cat([self.m4_visits, torch.zeros(add_m4, device=dev)], dim=0)
                 self.m4_err_ema = torch.cat([self.m4_err_ema, torch.full((add_m4,), 0.45, device=dev)], dim=0)
                 self.m4_values = torch.cat([self.m4_values, torch.zeros(add_m4, device=dev)], dim=0)
@@ -741,7 +742,7 @@ class LivingBrainEngine:
             )
             raw = noise_unit * (0.35 * osc)
             if self.state_l1.abs().max().item() > 1e-6:
-                pred_unit = F.normalize(self.G_10.float() @ self.state_l1, dim=-1, eps=1e-6)
+                pred_unit = F.normalize(self.G_10.matvec(self.state_l1), dim=-1, eps=1e-6)
                 raw = raw + 0.78 * pred_unit
             return F.normalize(raw, dim=-1, eps=1e-6)
 
@@ -831,9 +832,9 @@ class LivingBrainEngine:
                 cos = float(F.cosine_similarity(target.unsqueeze(0), pred.unsqueeze(0)).item())
                 return max(0.0, min(1.0, 0.5 * (1.0 - cos)))
 
-            pred_l2 = F.normalize(self.G_32.float() @ self.state_l3, dim=-1, eps=1e-6) if self.state_l3.abs().max() > 1e-6 else torch.zeros_like(self.state_l2)
-            pred_l1 = F.normalize(self.G_21.float() @ self.state_l2, dim=-1, eps=1e-6) if self.state_l2.abs().max() > 1e-6 else torch.zeros_like(self.state_l1)
-            pred_x = F.normalize(self.G_10.float() @ self.state_l1, dim=-1, eps=1e-6) if self.state_l1.abs().max() > 1e-6 else torch.zeros_like(x)
+            pred_l2 = F.normalize(self.G_32.matvec(self.state_l3), dim=-1, eps=1e-6) if self.state_l3.abs().max() > 1e-6 else torch.zeros_like(self.state_l2)
+            pred_l1 = F.normalize(self.G_21.matvec(self.state_l2), dim=-1, eps=1e-6) if self.state_l2.abs().max() > 1e-6 else torch.zeros_like(self.state_l1)
+            pred_x = F.normalize(self.G_10.matvec(self.state_l1), dim=-1, eps=1e-6) if self.state_l1.abs().max() > 1e-6 else torch.zeros_like(x)
 
             # Bottom-up prediction error & Scale-Invariant Predictive Suppression
             err_x = x - pred_x
@@ -845,7 +846,7 @@ class LivingBrainEngine:
 
             # ── Bottom-up + Top-down k-WTA with Fatigue & Homeostasis (Pillar 5)
             # Layer L1
-            raw_l1 = (self.W_in_L1.float() @ (0.55 * x + 0.45 * suppressed_err_x)) * theta_gate
+            raw_l1 = self.W_in_L1.matvec(0.55 * x + 0.45 * suppressed_err_x) * theta_gate
             err_l1 = raw_l1 - 0.35 * pred_l1
             surprise_l1 = _norm_pe(raw_l1, pred_l1)
             pre_l1 = raw_l1 + 0.25 * err_l1 - self.thresh_l1 - self.fatigue_l1 + gamma_mod
@@ -853,7 +854,7 @@ class LivingBrainEngine:
             z_l1 = z_l1.squeeze(0)
 
             # Layer L2
-            raw_l2 = (self.W_12.float() @ z_l1) * theta_gate
+            raw_l2 = self.W_12.matvec(z_l1) * theta_gate
             err_l2 = raw_l2 - 0.35 * pred_l2
             surprise_l2 = _norm_pe(raw_l2, pred_l2)
             pre_l2 = raw_l2 + 0.25 * err_l2 - self.thresh_l2 - self.fatigue_l2 + gamma_mod
@@ -861,16 +862,17 @@ class LivingBrainEngine:
             z_l2 = z_l2.squeeze(0)
 
             # Layer L3
-            raw_l3 = (self.W_23.float() @ z_l2) * theta_gate
+            raw_l3 = self.W_23.matvec(z_l2) * theta_gate
             pre_l3 = raw_l3 - self.thresh_l3 - self.fatigue_l3 + gamma_mod
             z_l3, _, _ = k_wta(pre_l3.unsqueeze(0), k=_safe_k_for_size(self.n_l3), normalize=True)
             z_l3 = z_l3.squeeze(0)
 
-            # Associative Hub (M1_assoc) integrating L3 + recurrent W_assoc_rec + M2 recall when ACh is low
-            h_rec = self.W_assoc_rec.float() @ self.state_assoc
+            # Associative Hub (M1_assoc) integrating L3 + recurrent W_assoc_rec (FP8) + M2 recall when ACh is low
+            h_rec = self.W_assoc_rec.matvec(self.state_assoc)
             m2_recall_drive = torch.zeros_like(self.state_assoc)
+            w3a_drive = self.W_3a.matvec(z_l3)
             if self.m2_assoc_traces.shape[0] > 0 and self.neuromod.acetylcholine < 0.75:
-                q_a = F.normalize(self.W_3a.float() @ z_l3, dim=-1, eps=1e-6)
+                q_a = F.normalize(w3a_drive, dim=-1, eps=1e-6)
                 sims = self.m2_assoc_traces.float() @ q_a
                 attn = F.softmax(10.0 * sims, dim=0)
                 m2_recall_drive = F.normalize(attn @ self.m2_assoc_traces.float(), dim=-1, eps=1e-6)
@@ -878,7 +880,7 @@ class LivingBrainEngine:
                 self.m2_last_used[top_i] = self.tick_count
 
             pre_assoc = (
-                0.70 * (self.W_3a.float() @ z_l3)
+                0.70 * w3a_drive
                 + 0.20 * h_rec
                 + (1.0 - self.neuromod.acetylcholine) * 0.22 * m2_recall_drive
                 - self.thresh_assoc
@@ -892,7 +894,7 @@ class LivingBrainEngine:
             self.prev_surprise = total_surprise
 
             # ── Pillar 3: M4 Basal Ganglia — Intrinsic Curiosity & Openness ──
-            m4_sims = self.m4_prototypes.float() @ z_assoc  # [n_m4]
+            m4_sims = self.m4_prototypes.matvec(z_assoc)  # [n_m4]
             best_m4_idx = int(torch.argmax(m4_sims).item())
             best_m4_sim = float(m4_sims[best_m4_idx].item())
             # Calibrate sparse k-WTA prototype similarity + hierarchical PE into [0, 1] uncertainty
@@ -978,25 +980,31 @@ class LivingBrainEngine:
             self._local_predictive_update(self.G_21, z_l1 - pred_l1, z_l2, lr_eff * 1.10)
             self._local_predictive_update(self.G_32, z_l2 - pred_l2, z_l3, lr_eff * 1.10)
 
-            # Dopamine-gated eligibility trace on recurrent associative matrix W_assoc_rec
+            # Dopamine-gated eligibility trace on recurrent associative matrix W_assoc_rec (FP8 stochastic rounding)
             active_a = torch.nonzero(z_assoc > 0, as_tuple=False).squeeze(-1)
             if active_a.numel() > 0:
                 za_sub = z_assoc[active_a]
-                coact_sub = torch.outer(za_sub, za_sub).to(dtype=self.dtype)
-                # Decay eligibility trace & accumulate local co-activation
-                self.E_assoc_rec.mul_(0.88)
-                self.E_assoc_rec[active_a.unsqueeze(1), active_a.unsqueeze(0)] += 0.25 * coact_sub
+                coact_sub = torch.outer(za_sub, za_sub)
+                self.E_assoc_rec.decay_and_add_submatrix(0.88, active_a, coact_sub, alpha=0.25)
                 da_scale = float(0.015 * self.neuromod.dopamine * (0.5 + 0.5 * self.neuromod.noradrenaline))
                 if abs(da_scale) > 1e-6:
-                    self.W_assoc_rec.add_(self.E_assoc_rec, alpha=da_scale)
-                    self.W_assoc_rec.fill_diagonal_(0.0)
-                    self.W_assoc_rec.clamp_(-1.0, 1.0)
+                    self.W_assoc_rec.add_scaled_and_clamp(
+                        self.E_assoc_rec,
+                        alpha=da_scale,
+                        clamp_min=-1.0,
+                        clamp_max=1.0,
+                        zero_diag=True,
+                    )
 
             # Update M4 prototype toward active associative state (competitive local Hebb)
             p_upd = F.normalize(
-                (1.0 - 0.12) * self.m4_prototypes[best_m4_idx].float() + 0.12 * z_assoc, dim=-1, eps=1e-6
+                (1.0 - 0.12) * self.m4_prototypes.dequant_row(best_m4_idx) + 0.12 * z_assoc, dim=-1, eps=1e-6
             )
-            self.m4_prototypes[best_m4_idx] = p_upd.to(dtype=self.dtype)
+            self.m4_prototypes.set_rows(
+                torch.tensor([best_m4_idx], device=self.device, dtype=torch.long),
+                p_upd.unsqueeze(0),
+                stochastic=True,
+            )
 
             # ── Pillar 2 & 4: High ACh + Surprise (or pinned identity) -> Write Episode to M2 (Hippocampus)
             m2_encoded = False
@@ -1073,16 +1081,20 @@ class LivingBrainEngine:
     @torch.no_grad()
     def _oja_hebb_update(
         self,
-        W: torch.Tensor,
+        W: QuantizedSynapseMatrix | torch.Tensor,
         y: torch.Tensor,
         x: torch.Tensor,
         lr: float,
         decay: float = 0.04,
+        zero_diag: bool = False,
     ) -> None:
         """
         Sparse Oja-Hebb local rule (ONLY updates active postsynaptic rows y > 0 -> ultra fast!):
             dW_i = lr * y_i * (x - decay * y_i * W_i)
         """
+        if isinstance(W, QuantizedSynapseMatrix):
+            W.oja_hebb_update(y, x, lr=lr, decay=decay, max_row_norm=1.2, zero_diag=zero_diag)
+            return
         active = torch.nonzero(y > 0, as_tuple=False).squeeze(-1)
         if active.numel() == 0:
             return
@@ -1090,7 +1102,6 @@ class LivingBrainEngine:
         w_sub = W.index_select(0, active).float()  # [k, in_dim]
         dw = lr * y_a * (x.unsqueeze(0) - decay * y_a * w_sub)
         w_new = w_sub + dw
-        # Keep rows norm-bounded locally
         norms = w_new.norm(dim=-1, keepdim=True).clamp(min=1e-6)
         w_new = w_new * torch.clamp(1.2 / norms, max=1.0)
         W[active] = w_new.to(dtype=W.dtype)
@@ -1104,19 +1115,19 @@ class LivingBrainEngine:
         thought_vec: torch.Tensor | None = None,
     ) -> dict[str, float]:
         """
-        Gently strengthen bidirectional A <-> C associative links in M1 `W_assoc_rec`
+        Gently strengthen bidirectional A <-> C associative links in M1 `W_assoc_rec` (FP8)
         using local Oja-Hebb plasticity (zero backprop) when a 2-hop DMN/REM insight is accepted.
         """
         with self.lock:
             def _to_assoc_sdr(v: torch.Tensor) -> torch.Tensor:
                 x0 = self._project_sensory(v)
-                h1 = F.relu(self.W_in_L1.float() @ x0)
+                h1 = F.relu(self.W_in_L1.matvec(x0))
                 s1, _, _ = k_wta(h1, k=_safe_k_for_size(self.n_l1, 0.05), normalize=True)
-                h2 = F.relu(self.W_12.float() @ s1)
+                h2 = F.relu(self.W_12.matvec(s1))
                 s2, _, _ = k_wta(h2, k=_safe_k_for_size(self.n_l2, 0.05), normalize=True)
-                h3 = F.relu(self.W_23.float() @ s2)
+                h3 = F.relu(self.W_23.matvec(s2))
                 s3, _, _ = k_wta(h3, k=_safe_k_for_size(self.n_l3, 0.05), normalize=True)
-                ha = F.relu(self.W_3a.float() @ s3)
+                ha = F.relu(self.W_3a.matvec(s3))
                 sa, _, _ = k_wta(ha, k=_safe_k_for_size(self.n_assoc, 0.06), normalize=True)
                 return sa
 
@@ -1124,8 +1135,8 @@ class LivingBrainEngine:
             assoc_c = _to_assoc_sdr(vec_c)
             w_before = self.W_assoc_rec.float().clone()
             eff_lr = max(1e-4, min(0.08, float(lr)))
-            self._oja_hebb_update(self.W_assoc_rec, assoc_a, assoc_c, lr=eff_lr, decay=0.04)
-            self._oja_hebb_update(self.W_assoc_rec, assoc_c, assoc_a, lr=eff_lr, decay=0.04)
+            self._oja_hebb_update(self.W_assoc_rec, assoc_a, assoc_c, lr=eff_lr, decay=0.04, zero_diag=True)
+            self._oja_hebb_update(self.W_assoc_rec, assoc_c, assoc_a, lr=eff_lr, decay=0.04, zero_diag=True)
             self.W_assoc_rec.fill_diagonal_(0.0)
             delta_norm = float((self.W_assoc_rec.float() - w_before).norm().item())
 
@@ -1145,16 +1156,18 @@ class LivingBrainEngine:
     @torch.no_grad()
     def _local_predictive_update(
         self,
-        G: torch.Tensor,
+        G: QuantizedSynapseMatrix | torch.Tensor,
         err: torch.Tensor,
         src_sdr: torch.Tensor,
         lr: float,
     ) -> None:
         """Local Predictive Coding update on top-down generative weights G (ONLY active presynaptic cols!)."""
+        if isinstance(G, QuantizedSynapseMatrix):
+            G.local_predictive_update(err, src_sdr, lr=lr, max_col_norm=1.2)
+            return
         active = torch.nonzero(src_sdr > 0, as_tuple=False).squeeze(-1)
         if active.numel() == 0:
             return
-        s_a = src_sdr[active].unsqueeze(0)  # [1, k]
         g_sub = G.index_select(1, active).float()  # [out_dim, k]
         dg = lr * torch.outer(err, src_sdr[active])
         g_new = g_sub + dg
@@ -1359,6 +1372,7 @@ class LivingBrainEngine:
             util_pct = round(min(100.0, (used_mb / max(MIN_BUDGET_MB, eff_budget)) * 100.0), 1)
             return {
                 "target_device": self.target_device_mode,
+                "bio_synapse_dtype": self.bio_synapse_mode,
                 "cuda_available": torch.cuda.is_available(),
                 "memory_budget_mb": round(self.memory_budget_mb, 1),
                 "effective_budget_mb": eff_budget,
@@ -1397,8 +1411,14 @@ class LivingBrainEngine:
 
     def export_state(self) -> dict[str, Any]:
         with self.lock:
+            def _export_item(val: Any) -> Any:
+                if isinstance(val, QuantizedSynapseMatrix):
+                    return val.export_state()
+                return val.detach().cpu()
+
             return {
                 "target_device_mode": self.target_device_mode,
+                "bio_synapse_mode": self.bio_synapse_mode,
                 "memory_budget_mb": self.memory_budget_mb,
                 "n_l1": self.n_l1,
                 "n_l2": self.n_l2,
@@ -1414,7 +1434,7 @@ class LivingBrainEngine:
                 "total_replay_cycles": self.total_replay_cycles,
                 "total_explorations": self.total_explorations,
                 "tensors": {
-                    k: getattr(self, k).detach().cpu()
+                    k: _export_item(getattr(self, k))
                     for k in (
                         "W_in_L1", "G_10", "W_12", "G_21", "W_23", "G_32",
                         "W_3a", "W_assoc_rec", "E_assoc_rec",
@@ -1439,9 +1459,10 @@ class LivingBrainEngine:
             self.device = torch.device("cuda" if self.target_device_mode == "gpu" else "cpu")
             self.dtype = (
                 torch.bfloat16
-                if (self.device.type == "cuda" and torch.cuda.is_bf16_supported())
-                else torch.float32
+                if (self.device.type == "cpu" or torch.cuda.is_bf16_supported())
+                else torch.float16
             )
+            self.bio_synapse_mode = resolve_bio_synapse_mode(self.requested_bio_synapse_dtype, self.device)
             self.memory_budget_mb = max(MIN_BUDGET_MB, min(MAX_BUDGET_MB, float(state.get("memory_budget_mb", self.memory_budget_mb))))
             self.n_l1 = int(state.get("n_l1", self.n_l1))
             self.n_l2 = int(state.get("n_l2", self.n_l2))
@@ -1457,20 +1478,24 @@ class LivingBrainEngine:
             self.total_replay_cycles = int(state.get("total_replay_cycles", 0))
             self.total_explorations = int(state.get("total_explorations", 0))
 
-            mat_set = {
+            qmat_set = {
                 "W_in_L1", "G_10", "W_12", "G_21", "W_23", "G_32",
-                "W_3a", "W_assoc_rec", "E_assoc_rec",
-                "m2_assoc_traces", "m2_sensory_traces", "m4_prototypes",
+                "W_3a", "W_assoc_rec", "E_assoc_rec", "m4_prototypes",
             }
+            m2_mat_set = {"m2_assoc_traces", "m2_sensory_traces"}
             tensors = state["tensors"]
             for k, t in tensors.items():
-                if isinstance(t, torch.Tensor):
-                    if k in mat_set:
+                if k in qmat_set:
+                    # Seamlessly migrate both quantized FP8/INT8 dicts AND legacy bf16/fp32 tensors to FP8!
+                    setattr(self, k, QuantizedSynapseMatrix.from_state(t, device=self.device, mode=self.bio_synapse_mode))
+                elif isinstance(t, torch.Tensor):
+                    if k in m2_mat_set:
                         setattr(self, k, t.to(device=self.device, dtype=self.dtype).contiguous())
                     elif k == "m2_pinned":
                         setattr(self, k, t.to(device=self.device, dtype=torch.bool).contiguous())
                     else:
                         setattr(self, k, t.to(device=self.device).contiguous())
+            self.W_assoc_rec.fill_diagonal_(0.0)
             m2_n = int(self.m2_assoc_traces.shape[0])
             if "m2_pinned" not in tensors or int(self.m2_pinned.shape[0]) != m2_n:
                 self.m2_pinned = torch.zeros((m2_n,), device=self.device, dtype=torch.bool)
