@@ -69,6 +69,7 @@ class BrainConfig:
     peer_weight_decay: float = 1e-4
     broca_dropout: float = 0.2
     broca_max_seq_len: int = 1024
+    broca_use_cuda_graphs: bool = True
     broca_lr: float = 4.0e-4
     broca_weight_decay: float = 0.05
     broca_label_smoothing: float = 0.05

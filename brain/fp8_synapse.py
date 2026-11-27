@@ -5,10 +5,19 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from .cuda_ops import HAS_CUDA_EXT, quantize_rows_cuda, shy_prune_rows_cuda
+
 FP8_E4M3_MAX: float = 448.0
 INT8_MAX: float = 127.0
 _MIN_SCALE: float = 1e-8
 _MODE_CACHE: dict[tuple[str, str], str] = {}
+_CUDA_SEED_COUNTER: int = 1337
+
+
+def _next_cuda_seed() -> int:
+    global _CUDA_SEED_COUNTER
+    _CUDA_SEED_COUNTER += 1
+    return (_CUDA_SEED_COUNTER * 0x9E3779B97F4A7C15) & 0x7FFFFFFFFFFFFFFF
 
 
 def resolve_bio_synapse_mode(requested: str, device: torch.device) -> str:
@@ -66,6 +75,7 @@ def _quantize_rows(
     src_f32: torch.Tensor,
     mode: str,
     stochastic: bool = False,
+    _force_pytorch: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Per-row quantization into `float8_e4m3fn` (range [-448, 448]), `int8` ([-127, 127]),
@@ -90,6 +100,11 @@ def _quantize_rows(
             torch.empty((rows, cols), device=dev, dtype=dt),
             torch.ones((rows,), device=dev, dtype=torch.float32),
         )
+
+    if (not _force_pytorch) and HAS_CUDA_EXT and src_f32.is_cuda and mode in ("fp8", "int8"):
+        mode_id = 0 if mode == "fp8" else 1
+        seed = _next_cuda_seed() if stochastic else 0
+        return quantize_rows_cuda(src_f32, mode_id, bool(stochastic), seed)
 
     f = torch.nan_to_num(src_f32.float(), nan=0.0, posinf=0.0, neginf=0.0)
     amax = f.abs().amax(dim=-1)  # [rows]
@@ -162,11 +177,21 @@ class QuantizedSynapseMatrix:
         mode: str = "fp8",
         device: torch.device | None = None,
         stochastic: bool = False,
+        _force_pytorch: bool = False,
     ) -> "QuantizedSynapseMatrix":
         dev = device or tensor.device
         resolved = resolve_bio_synapse_mode(mode, dev)
-        src = tensor.to(device=dev, dtype=torch.float32) if tensor.device != dev or tensor.dtype != torch.float32 else tensor
-        q, s = _quantize_rows(src, resolved, stochastic=stochastic)
+        if (
+            (not _force_pytorch)
+            and HAS_CUDA_EXT
+            and dev.type == "cuda"
+            and resolved in ("fp8", "int8")
+            and tensor.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        ):
+            src = tensor.to(device=dev) if tensor.device != dev else tensor
+        else:
+            src = tensor.to(device=dev, dtype=torch.float32) if tensor.device != dev or tensor.dtype != torch.float32 else tensor
+        q, s = _quantize_rows(src, resolved, stochastic=stochastic, _force_pytorch=_force_pytorch)
         return cls(q, s, mode=resolved)
 
     @classmethod
@@ -675,6 +700,7 @@ class QuantizedSynapseMatrix:
         eps: float = 0.008,
         zero_diag: bool = True,
         block_rows: int = 2048,
+        _force_pytorch: bool = False,
     ) -> dict[str, int]:
         """
         Synaptic Homeostasis Hypothesis (SHY) in FP8:
@@ -684,6 +710,30 @@ class QuantizedSynapseMatrix:
         if zero_diag and self.shape[0] == self.shape[1]:
             self.fill_diagonal_(0.0)
         before = self.count_nonzero()
+        if (
+            (not _force_pytorch)
+            and HAS_CUDA_EXT
+            and self.device.type == "cuda"
+            and self.mode in ("fp8", "int8")
+            and self.row_scale is not None
+        ):
+            m, n = self.shape
+            self.data = self.data.contiguous()
+            self.row_scale = self.row_scale.contiguous()
+            pruned = shy_prune_rows_cuda(
+                self.data,
+                self.row_scale,
+                float(downscale),
+                float(eps),
+                bool(zero_diag and m == n),
+            )
+            after = max(0, before - pruned)
+            return {
+                "before_synapses": before,
+                "pruned_synapses": pruned,
+                "active_synapses": after,
+            }
+
         if self.row_scale is not None:
             self.row_scale.mul_(float(downscale)).clamp_(min=_MIN_SCALE)
         else:

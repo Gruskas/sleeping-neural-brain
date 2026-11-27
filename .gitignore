@@ -7,6 +7,17 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
+# C++ / CUDA native build artifacts
+brain/csrc/build/
+*.pyd
+*.so
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+
 # Runtime state & model weights (large binary files)
 brain_state/
 *.pt

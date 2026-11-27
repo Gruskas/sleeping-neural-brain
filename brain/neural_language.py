@@ -334,6 +334,8 @@ class _BrocaDecoderBlock(nn.Module):
         cross_kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         film_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         cache_pos: int | None = None,
+        cache_pos_tensor: torch.Tensor | None = None,
+        self_attn_mask: torch.Tensor | None = None,
         memory_mask: torch.Tensor | None = None,
         token_mask: torch.Tensor | None = None,
         compute_aux: bool = True,
@@ -350,7 +352,15 @@ class _BrocaDecoderBlock(nn.Module):
         q = apply_rope(q, rope_cos, rope_sin)
         k = apply_rope(k, rope_cos, rope_sin)
 
-        if self_kv_cache is not None and cache_pos is not None:
+        if self_kv_cache is not None and cache_pos_tensor is not None:
+            k_buf, v_buf = self_kv_cache
+            k_buf.index_copy_(2, cache_pos_tensor, k)
+            v_buf.index_copy_(2, cache_pos_tensor, v)
+            k_view = k_buf
+            v_view = v_buf
+            new_self_kv = (k_buf, v_buf)
+            is_causal = False
+        elif self_kv_cache is not None and cache_pos is not None:
             k_buf, v_buf = self_kv_cache
             k_buf[:, :, cache_pos : cache_pos + t, :] = k
             v_buf[:, :, cache_pos : cache_pos + t, :] = v
@@ -373,6 +383,7 @@ class _BrocaDecoderBlock(nn.Module):
             q,
             k_view,
             v_view,
+            attn_mask=self_attn_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
             is_causal=is_causal,
         )
@@ -904,6 +915,140 @@ class BrocaByteTransformer(nn.Module):
         return ce_loss
 
     @torch.no_grad()
+    def _create_stream_step_runner(
+        self,
+        *,
+        z_mem: torch.Tensor,
+        z_summary: torch.Tensor,
+        cross_kvs: list[tuple[torch.Tensor, torch.Tensor]],
+        film_caches: list[tuple[torch.Tensor, torch.Tensor]],
+        bos_prefix: torch.Tensor,
+        out_z_bias: torch.Tensor,
+        cos_all: torch.Tensor,
+        sin_all: torch.Tensor,
+        mem_mask: torch.Tensor | None,
+        max_bytes: int,
+        device: torch.device,
+        kv_dtype: torch.dtype,
+        force_eager: bool = False,
+    ) -> tuple[Any, torch.Tensor, torch.Tensor, bool]:
+        """
+        Build a single-byte autoregressive step runner with static GPU buffers.
+        Uses CUDA Graphs when enabled (``ffn_mode in ("moe", "dense")`` on CUDA),
+        falling back transparently to eager execution on CPU, ``peer`` mode, or capture failure.
+        Returns ``(run_step_fn(step) -> logits [260], cur_id, kv_valid_mask, used_cuda_graph)``.
+        """
+        self_kvs: list[tuple[torch.Tensor, torch.Tensor]] = [
+            (
+                torch.zeros((1, self.n_heads, max_bytes, self.head_dim), device=device, dtype=kv_dtype),
+                torch.zeros((1, self.n_heads, max_bytes, self.head_dim), device=device, dtype=kv_dtype),
+            )
+            for _ in self.blocks
+        ]
+        conv_buf = torch.zeros((1, self.dim, 4), device=device, dtype=kv_dtype)
+        conv_buf_next = torch.zeros((1, self.dim, 4), device=device, dtype=kv_dtype)
+        cur_id = torch.tensor([[BOS_BYTE]], dtype=torch.long, device=device)
+
+        pos_indices = torch.arange(max_bytes, dtype=torch.long, device=device)
+        pos_t = torch.zeros((1,), dtype=torch.long, device=device)
+        cos_step = cos_all[:1].clone()
+        sin_step = sin_all[:1].clone()
+        one_scale = torch.ones((1, 1, 1), dtype=kv_dtype, device=device)
+        zero_scale = torch.zeros((1, 1, 1), dtype=kv_dtype, device=device)
+        step0_scale = one_scale.clone()
+        kv_valid_mask = torch.zeros((1, 1, 1, max_bytes), dtype=torch.bool, device=device)
+        logits_out = torch.empty((BYTE_VOCAB_SIZE,), dtype=torch.float32, device=device)
+
+        def _core_step() -> None:
+            with amp_autocast(device):
+                emb_step = self.byte_emb(cur_id)
+                emb_step = emb_step + bos_prefix * step0_scale
+                conv_buf_next[:, :, :-1].copy_(conv_buf[:, :, 1:])
+                conv_buf_next[:, :, -1].copy_(emb_step[:, 0, :].to(dtype=kv_dtype))
+                conv_buf.copy_(conv_buf_next)
+                local_ctx = self.local_patch_conv(conv_buf).transpose(1, 2)
+                x = emb_step + self.local_patch_gate * local_ctx
+
+                for i, blk in enumerate(self.blocks):
+                    x, self_kvs[i], _, _ = blk(
+                        x,
+                        z_mem,
+                        z_summary=z_summary,
+                        rope_cos=cos_step,
+                        rope_sin=sin_step,
+                        self_kv_cache=self_kvs[i],
+                        cross_kv_cache=cross_kvs[i],
+                        film_cache=film_caches[i],
+                        cache_pos_tensor=pos_t,
+                        self_attn_mask=kv_valid_mask,
+                        memory_mask=mem_mask,
+                        compute_aux=False,
+                    )
+
+                logits_step = self.lm_head(self.final_norm(x) + out_z_bias)[:, -1, :].float().squeeze(0)
+            logits_out.copy_(logits_step)
+
+        def _reset_buffers() -> None:
+            conv_buf.zero_()
+            conv_buf_next.zero_()
+            kv_valid_mask.zero_()
+            for k_buf, v_buf in self_kvs:
+                k_buf.zero_()
+                v_buf.zero_()
+
+        use_graph = bool(
+            (not force_eager)
+            and getattr(self.cfg, "broca_use_cuda_graphs", True)
+            and device.type == "cuda"
+            and self.ffn_mode in ("moe", "dense")
+            and not self.training
+        )
+        captured_graph: torch.cuda.CUDAGraph | None = None
+        if use_graph:
+            try:
+                capture_stream = torch.cuda.Stream(device=device)
+                capture_stream.wait_stream(torch.cuda.current_stream(device=device))
+                with torch.cuda.stream(capture_stream):
+                    for warm_idx in range(2):
+                        pos_t.copy_(pos_indices[warm_idx : warm_idx + 1])
+                        cos_step.copy_(cos_all[warm_idx : warm_idx + 1])
+                        sin_step.copy_(sin_all[warm_idx : warm_idx + 1])
+                        step0_scale.copy_(one_scale if warm_idx == 0 else zero_scale)
+                        kv_valid_mask[:, :, :, warm_idx].fill_(True)
+                        _core_step()
+                    captured_graph = torch.cuda.CUDAGraph()
+                    cap_pos = min(2, max_bytes - 1)
+                    pos_t.copy_(pos_indices[cap_pos : cap_pos + 1])
+                    cos_step.copy_(cos_all[cap_pos : cap_pos + 1])
+                    sin_step.copy_(sin_all[cap_pos : cap_pos + 1])
+                    step0_scale.copy_(zero_scale)
+                    kv_valid_mask[:, :, :, cap_pos].fill_(True)
+                    with torch.cuda.graph(captured_graph, stream=capture_stream):
+                        _core_step()
+                torch.cuda.current_stream(device=device).wait_stream(capture_stream)
+                _reset_buffers()
+            except Exception as exc:
+                _logger.warning("Broca CUDA Graph capture failed, falling back to eager decoding: %s", exc)
+                captured_graph = None
+                _reset_buffers()
+
+        used_cuda_graph = captured_graph is not None
+
+        def _run_step(step: int) -> torch.Tensor:
+            pos_t.copy_(pos_indices[step : step + 1])
+            cos_step.copy_(cos_all[step : step + 1])
+            sin_step.copy_(sin_all[step : step + 1])
+            step0_scale.copy_(one_scale if step == 0 else zero_scale)
+            kv_valid_mask[:, :, :, step].fill_(True)
+            if captured_graph is not None:
+                captured_graph.replay()
+            else:
+                _core_step()
+            return logits_out.clone()
+
+        return _run_step, cur_id, kv_valid_mask, used_cuda_graph
+
+    @torch.no_grad()
     def generate_stream(
         self,
         memory_columns: torch.Tensor,
@@ -915,7 +1060,7 @@ class BrocaByteTransformer(nn.Module):
     ) -> Iterator[str]:
         """
         Fast GPU autoregressive UTF-8 streaming strictly from Z_ctx [1, M_total, D]:
-          - Static pre-allocated KV-cache (zero torch.cat per byte)
+          - Static pre-allocated KV-cache + CUDA Graphs replay (zero torch.cat per byte)
           - Precomputed Cross-KV + FiLM + out_z_proj (computed ONCE per reply)
           - Vectorized GPU repetition penalty (zero CPU-GPU sync loops)
           - Stochastic nucleus sampling (NEVER pure argmax)
@@ -948,17 +1093,21 @@ class BrocaByteTransformer(nn.Module):
                 bos_prefix = self._norm_z_proj(self.bos_z_proj(z_summary)).unsqueeze(1)  # [1, 1, D]
                 out_z_bias = 0.50 * self._norm_z_proj(self.out_z_proj(z_summary)).unsqueeze(1)  # [1, 1, D]
 
-            # Static pre-allocated KV-cache buffers per layer (eliminates O(T^2) allocations!)
-            self_kvs: list[tuple[torch.Tensor, torch.Tensor]] = [
-                (
-                    torch.empty((1, self.n_heads, max_bytes, self.head_dim), device=device, dtype=kv_dtype),
-                    torch.empty((1, self.n_heads, max_bytes, self.head_dim), device=device, dtype=kv_dtype),
-                )
-                for _ in self.blocks
-            ]
-            # Fixed double-buffered conv ring (ZERO per-byte allocations!) & repetition penalty mask
-            conv_buf = torch.zeros((1, self.dim, 4), device=device, dtype=kv_dtype)
-            conv_buf_next = torch.zeros((1, self.dim, 4), device=device, dtype=kv_dtype)
+            run_step, cur_id, _kv_valid_mask, _used_graph = self._create_stream_step_runner(
+                z_mem=z_mem,
+                z_summary=z_summary,
+                cross_kvs=cross_kvs,
+                film_caches=film_caches,
+                bos_prefix=bos_prefix,
+                out_z_bias=out_z_bias,
+                cos_all=cos_all,
+                sin_all=sin_all,
+                mem_mask=mem_mask,
+                max_bytes=max_bytes,
+                device=device,
+                kv_dtype=kv_dtype,
+            )
+
             recent_ids = torch.full((32,), PAD_BYTE, dtype=torch.long, device=device)
             rep_mask = torch.zeros(BYTE_VOCAB_SIZE, dtype=torch.bool, device=device)
 
@@ -972,37 +1121,9 @@ class BrocaByteTransformer(nn.Module):
             static_ban[127] = True
 
             utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
-            cur_id = torch.tensor([[BOS_BYTE]], dtype=torch.long, device=device)
 
             for step in range(max_bytes):
-                with amp_autocast(device):
-                    emb_step = self.byte_emb(cur_id)  # [1, 1, D]
-                    if step == 0:
-                        emb_step = emb_step + bos_prefix
-                    conv_buf_next[:, :, :-1].copy_(conv_buf[:, :, 1:])
-                    conv_buf_next[:, :, -1].copy_(emb_step[:, 0, :].to(dtype=kv_dtype))
-                    conv_buf, conv_buf_next = conv_buf_next, conv_buf
-                    local_ctx = self.local_patch_conv(conv_buf).transpose(1, 2)  # [1, 1, D]
-                    x = emb_step + self.local_patch_gate * local_ctx
-
-                    cos_s = cos_all[step : step + 1]
-                    sin_s = sin_all[step : step + 1]
-                    for i, blk in enumerate(self.blocks):
-                        x, self_kvs[i], _, _ = blk(
-                            x,
-                            z_mem,
-                            z_summary=z_summary,
-                            rope_cos=cos_s,
-                            rope_sin=sin_s,
-                            self_kv_cache=self_kvs[i],
-                            cross_kv_cache=cross_kvs[i],
-                            film_cache=film_caches[i],
-                            cache_pos=step,
-                            memory_mask=mem_mask,
-                            compute_aux=False,
-                        )
-
-                    logits = self.lm_head(self.final_norm(x) + out_z_bias)[:, -1, :].float().squeeze(0)  # [260]
+                logits = run_step(step)
 
                 logits.masked_fill_(static_ban, -1e9)
                 if step == 0:
