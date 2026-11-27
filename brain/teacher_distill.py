@@ -86,6 +86,30 @@ TEACHER_PROMPT_POOL: list[str] = [
     "brzmi ciekawie", "zgadzam się z tobą", "nie zgadzam się",
     "dobra robota", "źle to wytłumaczyłeś", "spróbuj jeszcze raz",
     "możesz krócej?", "powiedz coś więcej", "a co jeszcze?",
+    # 8. Pytania codzienne, hipotetyczne, luźne reakcje i meta-rozmowa o kontekście
+    "chyba git a jak tobie?", "spoko a co u ciebie słychać?",
+    "co byś zjadł na śniadanie jakbyś był człowiekiem?",
+    "gdybyś mógł wybrać jedną supermoc to jaką?",
+    "jaka jest twoja ulubiona pora roku i dlaczego?",
+    "co byś zrobił gdybyś wygrał milion złotych?",
+    "czemu piszesz jakieś dziwne rzeczy niezwiązane z tematem?",
+    "dlaczego odpowiedziałeś coś zupełnie innego niż pytałem?",
+    "pamiętasz co przed chwilą napisałem?",
+]
+
+MULTI_TURN_FOLLOWUPS: list[str] = [
+    "a dlaczego tak uważasz?",
+    "rozwiń to trochę bardziej",
+    "podaj konkretny przykład do tego co napisałeś",
+    "pamiętasz o czym właśnie rozmawialiśmy?",
+    "a gdyby było dokładnie na odwrót?",
+    "wytłumacz to jeszcze prościej",
+    "serio? a jak byś to uzasadnił?",
+    "aha i to działa?",
+    "jak to się łączy z codziennym życiem?",
+    "a co byś powiedział komuś kto się z tym nie zgadza?",
+    "powiedz na prostym przykładzie z życia",
+    "a co z tego wynika w praktyce?",
 ]
 
 # Rich topic bank + natural Polish templates so requesting 250, 500, or 1000 dialogues
@@ -443,7 +467,7 @@ def generate_bielik_teacher_dialogues(
                     with torch.inference_mode():
                         out_ids = model.generate(
                             **enc,
-                            max_new_tokens=80,
+                            max_new_tokens=110,
                             do_sample=True,
                             temperature=0.72,
                             top_p=0.90,
@@ -462,17 +486,79 @@ def generate_bielik_teacher_dialogues(
                 start += len(batch_qs)
 
                 batch_generated: list[dict[str, str]] = []
+                batch_pairs: list[tuple[str, str]] = []
                 for i, q in enumerate(batch_qs):
                     if len(generated_pairs) >= target_n:
                         break
                     gen_tokens = out_ids[i, in_len:]
                     raw_ans = tok.decode(gen_tokens, skip_special_tokens=True)
-                    clean_ans = _clean_teacher_reply(raw_ans, max_chars=230)
+                    clean_ans = _clean_teacher_reply(raw_ans, max_chars=320)
                     if len(clean_ans) >= 8 and not is_ai_corporate_reply(clean_ans):
                         rec = {"q": q, "a": clean_ans, "teacher": model_id, "ts": int(time.time())}
                         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         generated_pairs.append((q, clean_ans))
+                        batch_pairs.append((q, clean_ans))
                         batch_generated.append({"q": q, "a": clean_ans})
+
+                # Multi-turn synthetic follow-ups (~37.5% of valid pairs in each batch)
+                mt_cands = [
+                    pair for pair in batch_pairs
+                    if not _fold_pl(pair[0].lower()).startswith(("dobranoc", "narazie", "pa"))
+                ]
+                mt_n = min(len(mt_cands), max(1, (len(batch_pairs) * 3) // 8)) if (mt_cands and len(generated_pairs) < target_n) else 0
+                if mt_n > 0:
+                    mt_selected = rng.sample(mt_cands, k=mt_n)
+                    mt_followups = [rng.choice(MULTI_TURN_FOLLOWUPS) for _ in mt_selected]
+                    mt_prompts: list[str] = []
+                    for (q1, a1), q2 in zip(mt_selected, mt_followups):
+                        msgs2 = [
+                            {"role": "system", "content": sys_msg},
+                            {"role": "user", "content": q1},
+                            {"role": "assistant", "content": a1},
+                            {"role": "user", "content": q2},
+                        ]
+                        try:
+                            pt2 = tok.apply_chat_template(msgs2, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+                        except TypeError:
+                            pt2 = tok.apply_chat_template(msgs2, tokenize=False, add_generation_prompt=True)
+                        mt_prompts.append(pt2)
+                    enc2 = tok(mt_prompts, return_tensors="pt", padding=True, truncation=True, max_length=512).to(dev)
+                    in_len2 = enc2["input_ids"].shape[1]
+                    try:
+                        with torch.inference_mode():
+                            out_ids2 = model.generate(
+                                **enc2,
+                                max_new_tokens=110,
+                                do_sample=True,
+                                temperature=0.72,
+                                top_p=0.90,
+                                top_k=40,
+                                repetition_penalty=1.08,
+                                use_cache=True,
+                                pad_token_id=tok.pad_token_id,
+                                eos_token_id=tok.eos_token_id,
+                            )
+                    except torch.cuda.OutOfMemoryError:
+                        out_ids2 = None
+                        torch.cuda.empty_cache()
+                    if out_ids2 is not None:
+                        for j, ((q1, a1), q2) in enumerate(zip(mt_selected, mt_followups)):
+                            if len(generated_pairs) >= target_n:
+                                break
+                            raw_a2 = tok.decode(out_ids2[j, in_len2:], skip_special_tokens=True)
+                            clean_a2 = _clean_teacher_reply(raw_a2, max_chars=320)
+                            if len(clean_a2) >= 8 and not is_ai_corporate_reply(clean_a2):
+                                mt_q = f"Kontekst rozmowy: Użytkownik: {q1[:110]} | Ja: {a1[:130]} || Odpowiedz na: {q2}"
+                                rec2 = {
+                                    "q": mt_q,
+                                    "a": clean_a2,
+                                    "multi_turn": True,
+                                    "teacher": model_id,
+                                    "ts": int(time.time()),
+                                }
+                                fh.write(json.dumps(rec2, ensure_ascii=False) + "\n")
+                                generated_pairs.append((mt_q, clean_a2))
+                                batch_generated.append({"q": mt_q, "a": clean_a2})
                 fh.flush()
 
                 if progress_callback:

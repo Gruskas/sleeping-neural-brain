@@ -74,8 +74,8 @@ class BrainConfig:
     broca_weight_decay: float = 0.05
     broca_label_smoothing: float = 0.05
     broca_dialogue_lr: float = 2.5e-4
-    broca_dialogue_label_smoothing: float = 0.01
-    broca_dialogue_early_stop_loss: float = 0.16
+    broca_dialogue_label_smoothing: float = 0.06
+    broca_dialogue_early_stop_loss: float = 0.65
     broca_decoder_byte_dropout: float = 0.12
     broca_early_stop_loss: float = 0.90
     broca_z_noise_std: float = 0.03
@@ -101,10 +101,10 @@ class BrainConfig:
 
     # Autonomous 2-hop Concept Graph (DMN idle thinking & REM bridge synthesis)
     dmn_enabled: bool = True
-    idle_think_delay_sec: float = 50.0
-    dmn_think_interval_sec: float = 40.0
+    idle_think_delay_sec: float = 25.0
+    dmn_think_interval_sec: float = 25.0
     rem_2hop_steps: int = 5
-    dmn_bridge_min_hop_sim: float = 0.45
+    dmn_bridge_min_hop_sim: float = 0.32
     dmn_bridge_max_direct_sim: float = 0.25
 
     # Memory Limits (Expanded Prefrontal Working Memory + Tensor Engram Banks on GPU)

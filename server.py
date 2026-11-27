@@ -16,6 +16,13 @@ from brain.agent import SleepingBrain
 from brain.teacher_distill import load_teacher_dialogues
 
 
+def _json_default(obj: Any) -> Any:
+    """Safely serialize unexpected PyTorch tensors instead of raising TypeError."""
+    if hasattr(obj, "detach") and hasattr(obj, "numel"):
+        return obj.detach().item() if obj.numel() == 1 else f"<Tensor {tuple(obj.shape)}>"
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -51,7 +58,7 @@ class BrainServer:
                 status: int = 200,
                 extra_headers: dict[str, str] | None = None,
             ) -> None:
-                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                body = json.dumps(payload, ensure_ascii=False, default=_json_default).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -239,6 +246,28 @@ class BrainServer:
                         count = int(body.get("topics_count", 200))
                         res = brain.start_turbo_learn_async(topics_count=count)
                         self._send_json({"ok": True, **res})
+                        return
+
+                    if parsed.path == "/api/study/course":
+                        res = brain.start_concept_synthesis_course_async()
+                        self._send_json({"ok": True, **res})
+                        return
+
+                    if parsed.path == "/api/dmn/think":
+                        res = brain.run_dmn_2hop_step(non_blocking=True)
+                        clean_res = None
+                        if isinstance(res, dict):
+                            clean_res = {
+                                k: v
+                                for k, v in res.items()
+                                if k not in ("thought_sdr", "bridge_columns") and not hasattr(v, "detach")
+                            }
+                        self._send_json({
+                            "ok": True,
+                            "accepted": bool(res and res.get("accepted")),
+                            "result": clean_res,
+                            "dmn_thoughts": brain.dmn_thoughts[-25:],
+                        })
                         return
 
                     if parsed.path == "/api/sleep":

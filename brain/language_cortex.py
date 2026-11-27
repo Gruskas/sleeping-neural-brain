@@ -544,7 +544,7 @@ class LanguageCortex:
         cortex: BiologicalAssociativeCortex,
         engram_bank: torch.Tensor | None = None,
         creativity_level: float = 0.70,
-        max_new_bytes: int = 128,
+        max_new_bytes: int = 220,
         num_candidates: int = 2,
         min_joint_coherence: float = 0.16,
         max_copy_sim: float = 0.88,
@@ -637,7 +637,7 @@ class LanguageCortex:
             gen_batch = self._broca_raw.generate_batch(
                 memory_columns_batch=z_ctx.expand(k_cand, -1, -1),
                 temperatures=temps,
-                max_new_bytes=max(32, min(220, int(max_new_bytes))),
+                max_new_bytes=max(32, min(320, int(max_new_bytes))),
                 memory_mask=z_ctx_mask.expand(k_cand, -1),
             )
         finally:
@@ -753,6 +753,7 @@ class LanguageCortex:
         neuromod: Any | None = None,
         living_telemetry: Any | None = None,
         working_memory_slots: torch.Tensor | None = None,
+        context_user_message: str | None = None,
     ) -> dict[str, Any]:
         """
         Sequential System-2 Latent Chain-of-Thought + Arcuate Fasciculus Self-Hearing & Active Self-Correction:
@@ -803,6 +804,10 @@ class LanguageCortex:
         cre_noise = 0.010 * cre + 0.008 * cur_boost
 
         w_out, q_sim, _ = self.perceive_for_chat(user_message)
+        grounded_known = q_sim >= 0.78
+        w_ctx: WernickeOutput | None = None
+        if context_user_message and context_user_message.strip():
+            w_ctx = self.perceive_one(context_user_message.strip())
 
         thoughts: list[CortexThought] = []
         temps: list[float] = []
@@ -831,19 +836,20 @@ class LanguageCortex:
             working_memory_slots=working_memory_slots,
         )
         thoughts.append(th0)
-        grounded_known = q_sim >= 0.78
         temps.append(0.18 if grounded_known else round(max(0.36, eff_base_t - 0.08), 3))
         labels.append("Precyzyjna")
         latent_slots.append(F.normalize(th0.columns_star.mean(dim=1, keepdim=True), dim=-1, eps=1e-6))
 
-        # Step 2: Kontekstowa (feeds Step-1 latent thought slot + Z*_0 back into Associative Cortex & Hopfield)
-        # On well-known queries (q_sim >= 0.78), keep sensory_columns grounded on w_out and omit
-        # untrained thought_slots so System-2 deliberation never drifts away from the trained attractor!
+        ctx_w = w_ctx if w_ctx is not None else w_out
+        if w_ctx is not None:
+            chain_notes.append("Kontekst rozmowy (multi-turn)")
+
+        # Step 2: Kontekstowa (feeds Step-1 latent thought slot + multi-turn context into Associative Cortex & Hopfield)
         if k_cand >= 2:
             thought_cat_1 = None if grounded_known else torch.cat(latent_slots, dim=1)
             th1 = cortex.perceive_and_think(
-                sensory_columns=w_out.columns if grounded_known else th0.columns_star,
-                sensory_sdr=w_out.sdr if grounded_known else th0.z_star,
+                sensory_columns=w_ctx.columns if w_ctx is not None else (w_out.columns if grounded_known else th0.columns_star),
+                sensory_sdr=w_ctx.sdr if w_ctx is not None else (w_out.sdr if grounded_known else th0.z_star),
                 engram_bank=engram_bank,
                 sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
                 steps=min(6, eff_steps + 1),
@@ -856,8 +862,8 @@ class LanguageCortex:
                 living_blend=living_blend,
                 neuromod=neuromod,
                 living_telemetry=living_telemetry,
-                sensory_patch_columns=w_out.patch_columns,
-                sensory_patch_mask=w_out.patch_mask,
+                sensory_patch_columns=ctx_w.patch_columns,
+                sensory_patch_mask=ctx_w.patch_mask,
                 working_memory_slots=working_memory_slots,
                 thought_slots=thought_cat_1,
             )
@@ -865,8 +871,8 @@ class LanguageCortex:
                 th1.recalled_columns = th0.recalled_columns
                 th1.context_columns, th1.context_mask = cortex.build_context_columns(
                     columns_star=th1.columns_star,
-                    sensory_patch_columns=w_out.patch_columns,
-                    sensory_patch_mask=w_out.patch_mask,
+                    sensory_patch_columns=ctx_w.patch_columns,
+                    sensory_patch_mask=ctx_w.patch_mask,
                     recalled_columns=th1.recalled_columns,
                     working_memory_slots=working_memory_slots,
                     thought_slots=thought_cat_1,
@@ -898,8 +904,8 @@ class LanguageCortex:
                 living_blend=living_blend,
                 neuromod=neuromod,
                 living_telemetry=living_telemetry,
-                sensory_patch_columns=w_out.patch_columns,
-                sensory_patch_mask=w_out.patch_mask,
+                sensory_patch_columns=ctx_w.patch_columns,
+                sensory_patch_mask=ctx_w.patch_mask,
                 working_memory_slots=working_memory_slots,
                 thought_slots=thought_cat_2,
             )
@@ -907,8 +913,8 @@ class LanguageCortex:
                 th2.recalled_columns = prev_th.recalled_columns
                 th2.context_columns, th2.context_mask = cortex.build_context_columns(
                     columns_star=th2.columns_star,
-                    sensory_patch_columns=w_out.patch_columns,
-                    sensory_patch_mask=w_out.patch_mask,
+                    sensory_patch_columns=ctx_w.patch_columns,
+                    sensory_patch_mask=ctx_w.patch_mask,
                     recalled_columns=th2.recalled_columns,
                     working_memory_slots=working_memory_slots,
                     thought_slots=thought_cat_2,
@@ -977,7 +983,7 @@ class LanguageCortex:
             )
         if chain_notes:
             critique_notes.append(
-                chain_notes[-1]
+                " · ".join(chain_notes)
                 + f" · Z_ctx={m_max} slotów"
                 + (" (z kolumnami Hipokampu)" if has_recalled_mem else "")
             )
@@ -1000,7 +1006,8 @@ class LanguageCortex:
                 else 0.0
             )
             prec_bonus = 0.05 if (grounded_known and labels[idx] == "Precyzyjna" and diag["quality"] >= 0.85) else 0.0
-            total = round(min(1.0, float(diag["total"]) + cre_bonus + prec_bonus), 4)
+            ctx_bonus = 0.035 if (w_ctx is not None and labels[idx] == "Kontekstowa" and diag["quality"] >= 0.75 and diag["alignment"] >= 0.25) else 0.0
+            total = round(min(1.0, float(diag["total"]) + cre_bonus + prec_bonus + ctx_bonus), 4)
             cand = {
                 "label": labels[idx],
                 "thought": thoughts[idx],
@@ -1453,7 +1460,7 @@ class LanguageCortex:
           4. Pinned entries (`pinned=True`) can NEVER be evicted from `_learned_qa_replay`.
         """
         clean_new = [
-            (q.strip(), a.strip()[:210])
+            (q.strip(), a.strip()[:600])
             for q, a in pairs
             if q and a and len(q.strip()) >= 2 and len(a.strip()) >= 6 and not is_ai_corporate_reply(a)
         ]
@@ -1514,7 +1521,7 @@ class LanguageCortex:
             )
 
             is_cuda = self.device.type == "cuda"
-            tgt_cap = min(240, self.cfg.broca_max_seq_len)
+            tgt_cap = min(640, self.cfg.broca_max_seq_len - 2)
 
             def _encode_ctx_and_tgt(pair_list: list[tuple[str, str]]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
                 qs_p = [x[0] for x in pair_list]
@@ -1668,6 +1675,8 @@ class LanguageCortex:
         priority_probe_pairs: list[tuple[str, str]] | None = None,
         freeze_wernicke: bool = False,
         train_recalled_columns: bool = False,
+        train_working_memory: bool = True,
+        parquet_replay_pairs: list[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
         """
         Tokenless Dialogue + Q&A Fine-Tuning through the full cognitive pipeline:
@@ -1741,10 +1750,23 @@ class LanguageCortex:
         pre_q_alt: list[np.ndarray] = []
         pre_ans: list[np.ndarray] = []
         pre_ans_lens: list[int] = []
-        for raw_q, raw_a in clean_pairs:
+        train_working_memory = bool(train_working_memory)
+        clean_replay: list[tuple[str, str]] = [
+            (q.strip(), a.strip())
+            for q, a in (parquet_replay_pairs or [])
+            if q and a and len(q.strip()) >= 4 and len(a.strip()) >= 8
+        ]
+        n_dialogue_only = len(clean_pairs)
+        train_pairs = clean_pairs + clean_replay
+
+        pre_q_orig: list[np.ndarray] = []
+        pre_q_alt: list[np.ndarray] = []
+        pre_ans: list[np.ndarray] = []
+        pre_ans_lens: list[int] = []
+        for raw_q, raw_a in train_pairs:
             qb = raw_q.encode("utf-8")[:in_cap]
             pre_q_orig.append(np.frombuffer(qb, dtype=np.uint8))
-            if not raw_q.startswith("__"):
+            if not raw_q.startswith("__") and "Kontekst rozmowy:" not in raw_q:
                 alt_s = _strip_pl(raw_q).rstrip("?!.").strip()
                 alt_b = (alt_s if len(alt_s) >= 2 else raw_q).encode("utf-8")[:in_cap]
                 pre_q_alt.append(np.frombuffer(alt_b, dtype=np.uint8))
@@ -1753,6 +1775,35 @@ class LanguageCortex:
             ab = raw_a.encode("utf-8")[:tgt_cap]
             pre_ans.append(np.frombuffer(ab, dtype=np.uint8))
             pre_ans_lens.append(len(ab))
+
+        def _synth_wm_slots(batch_idxs_list: list[int], z_cols: torch.Tensor) -> torch.Tensor | None:
+            b_sz = z_cols.shape[0]
+            if not train_working_memory or b_sz < 2:
+                return None
+            mt_positions: list[int] = []
+            mt_prefixes: list[str] = []
+            for r_i, p_idx in enumerate(batch_idxs_list):
+                rq = train_pairs[p_idx][0]
+                if "Kontekst rozmowy:" in rq and "|| Odpowiedz na:" in rq:
+                    mt_positions.append(r_i)
+                    mt_prefixes.append(rq.split("|| Odpowiedz na:", 1)[0].strip())
+            if not mt_positions and random.random() >= 0.35:
+                return None
+
+            base_mean = z_cols.detach().mean(dim=1)
+            s0 = torch.roll(base_mean, shifts=1, dims=0)
+            s1 = torch.roll(base_mean, shifts=2, dims=0)
+            if mt_prefixes:
+                with torch.no_grad():
+                    w_prev = self._wernicke_raw.encode_texts(
+                        mt_prefixes, device=self.device, batch_size=len(mt_prefixes)
+                    )
+                    prev_means = w_prev.columns.mean(dim=1).to(dtype=base_mean.dtype)
+                    for k_i, r_i in enumerate(mt_positions):
+                        s0[r_i] = prev_means[k_i]
+            slots = torch.stack([s0, s1], dim=1)
+            slots = self._normalize_z_columns(slots + torch.randn_like(slots) * 0.06)
+            return slots
 
         def _pack_preencoded_batch(
             idxs: list[int],
@@ -1823,16 +1874,15 @@ class LanguageCortex:
             epochs_run = 0
             ep_loss_gpu = torch.zeros((), device=self.device, dtype=torch.float32)
 
-            probe_pool = [
-                (q.strip(), a.strip())
-                for q, a in (priority_probe_pairs or [])
-                if q and a and not q.strip().startswith("__") and 2 <= len(q.strip()) <= 180 and len(a.strip()) >= 4
-            ]
-            if not probe_pool:
-                probe_pool = [
-                    (q, a) for q, a in clean_pairs
-                    if not q.startswith("__") and 2 <= len(q) <= 140 and len(a) >= 6
-                ]
+            seen_probe_q: set[str] = set()
+            probe_pool: list[tuple[str, str]] = []
+            for q_raw, a_raw in list(priority_probe_pairs or []) + clean_pairs:
+                qs, as_ = (q_raw or "").strip(), (a_raw or "").strip()
+                if qs and as_ and not qs.startswith("__") and 2 <= len(qs) <= 180 and len(as_) >= 4:
+                    q_key = qs.lower()
+                    if q_key not in seen_probe_q:
+                        seen_probe_q.add(q_key)
+                        probe_pool.append((qs, as_))
             if probe_pool:
                 random.shuffle(probe_pool)
             probe_idx = 0
@@ -1855,7 +1905,10 @@ class LanguageCortex:
                 sample_target = ""
                 sample_brain = ""
                 if do_probe:
-                    sample_q, sample_target = probe_pool[probe_idx % len(probe_pool)]
+                    if probe_idx >= len(probe_pool):
+                        random.shuffle(probe_pool)
+                        probe_idx = 0
+                    sample_q, sample_target = probe_pool[probe_idx]
                     probe_idx += 1
                     self._wernicke_raw.eval()
                     self._broca_raw.eval()
@@ -1875,7 +1928,7 @@ class LanguageCortex:
                             )
                             gen_p = self.decode_columns(
                                 t_p.context_columns if t_p.context_columns is not None else t_p.columns_star,
-                                max_new_bytes=min(96, self.cfg.broca_max_seq_len),
+                                max_new_bytes=min(512, self.cfg.broca_max_new_bytes, self.cfg.broca_max_seq_len - 2),
                                 temperature=0.55,
                                 memory_mask=t_p.context_mask,
                             )
@@ -1906,7 +1959,8 @@ class LanguageCortex:
                 except Exception:
                     pass
 
-            all_indices = list(range(len(clean_pairs)))
+            all_indices = list(range(len(train_pairs)))
+            dialogue_indices = list(range(n_dialogue_only))
             # Keep at most 2 async batches queued on GPU so VRAM stays flat (zero WDDM RAM spill!)
             cuda_ev_ring = [torch.cuda.Event(), torch.cuda.Event()] if is_cuda else []
             ev_slot = 0
@@ -1996,11 +2050,13 @@ class LanguageCortex:
                                 rec_cols_in = synth_rec
                             else:
                                 rec_cols_in = thought.recalled_columns
+                            wm_slots_in = _synth_wm_slots(batch_idxs, z_star)
                             z_ctx, z_ctx_mask = cortex.build_context_columns(
                                 columns_star=z_star,
                                 sensory_patch_columns=w_out.patch_columns if use_patches else None,
                                 sensory_patch_mask=w_out.patch_mask if use_patches else None,
                                 recalled_columns=rec_cols_in,
+                                working_memory_slots=wm_slots_in,
                             )
                             ce_loss, aux_loss, z_loss = self._broca_raw.compute_loss(
                                 tgt_bytes,
@@ -2056,8 +2112,8 @@ class LanguageCortex:
                     eval_bs = bs if is_cuda else 16
                     from .sensory_wernicke import BYTE_VOCAB_SIZE
                     with torch.no_grad():
-                        for i in range(0, len(all_indices), eval_bs):
-                            chunk_idxs = all_indices[i : i + eval_bs]
+                        for i in range(0, len(dialogue_indices), eval_bs):
+                            chunk_idxs = dialogue_indices[i : i + eval_bs]
                             in_b, in_m, tgt_b = _pack_preencoded_batch(chunk_idxs, use_alt_prob=0.0, mask_p=0.0)
                             with amp_autocast(self.device):
                                 w_c = self._wernicke_raw(in_b, in_m)
@@ -2228,6 +2284,7 @@ class LanguageCortex:
         early_stop_loss: float | None = None,
         freeze_wernicke: bool = False,
         train_recalled_columns: bool = False,
+        parquet_replay_pairs: list[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
         if cortex is not None:
             merged_extra = list(self._learned_qa_replay)
@@ -2256,6 +2313,7 @@ class LanguageCortex:
                 priority_probe_pairs=priority_probe_pairs,
                 freeze_wernicke=freeze_wernicke,
                 train_recalled_columns=train_recalled_columns,
+                parquet_replay_pairs=parquet_replay_pairs,
             )
         corpus = build_denoising_corpus(
             extra_texts=extra_texts,
@@ -2664,7 +2722,7 @@ class LanguageCortex:
                                 )
                             gen = self.decode_columns(
                                 p_cols,
-                                max_new_bytes=90,
+                                max_new_bytes=min(384, self.cfg.broca_max_new_bytes, self.cfg.broca_max_seq_len - 2),
                                 temperature=0.72,
                                 memory_mask=p_mask,
                             )

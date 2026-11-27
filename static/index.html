@@ -753,7 +753,7 @@
               <div class="pipe-fields">
                 <div class="pipe-field">
                   <span>Liczba dialogów (0–2000)</span>
-                  <input type="number" id="pp_bd_num" min="0" max="2000" value="250" onchange="savePipelinePlanToStorage()" />
+                  <input type="number" id="pp_bd_num" min="0" max="2000" value="400" onchange="savePipelinePlanToStorage()" />
                 </div>
               </div>
               <div class="sub">Tylko generacja do bazy (bez dublowania treningu Broki).</div>
@@ -766,7 +766,7 @@
               <div class="pipe-fields">
                 <div class="pipe-field">
                   <span>Przykłady (0–1200)</span>
-                  <input type="number" id="pp_br_num" min="0" max="1200" value="150" onchange="savePipelinePlanToStorage()" />
+                  <input type="number" id="pp_br_num" min="0" max="1200" value="200" onchange="savePipelinePlanToStorage()" />
                 </div>
               </div>
               <div class="sub">Relacje + Logika + Niewiedza (wspólny transfer CPU/GPU z etapem 2).</div>
@@ -779,11 +779,11 @@
               <div class="pipe-fields">
                 <div class="pipe-field">
                   <span>Epoki (10–600)</span>
-                  <input type="number" id="pp_dt_ep" min="10" max="600" value="160" onchange="savePipelinePlanToStorage()" />
+                  <input type="number" id="pp_dt_ep" min="10" max="600" value="65" onchange="savePipelinePlanToStorage()" />
                 </div>
                 <div class="pipe-field">
                   <span>Target loss</span>
-                  <input type="number" id="pp_dt_loss" min="0.01" max="10" step="0.02" value="0.16" onchange="savePipelinePlanToStorage()" />
+                  <input type="number" id="pp_dt_loss" min="0.01" max="10" step="0.02" value="0.65" onchange="savePipelinePlanToStorage()" />
                 </div>
               </div>
               <div class="pipe-fields">
@@ -798,6 +798,7 @@
               </div>
               <div class="pipe-fields">
                 <label class="pipe-chk"><input type="checkbox" id="pp_kn_elem" checked onchange="savePipelinePlanToStorage()"> Szkoła Podstawowa</label>
+                <label class="pipe-chk"><input type="checkbox" id="pp_kn_course" checked onchange="savePipelinePlanToStorage()"> Kurs łączenia pojęć</label>
                 <label class="pipe-chk"><input type="checkbox" id="pp_kn_facts" checked onchange="savePipelinePlanToStorage()"> Fakty i logika z Bielika</label>
               </div>
               <div class="pipe-fields">
@@ -895,6 +896,7 @@
           </div>
           <div class="chips">
             <button id="schoolBtn" onclick="installSchoolFoundation()" style="padding:5px 10px;font-size:12px">Podstawy szkolne</button>
+            <button id="courseBtn" onclick="startConceptCourse()" style="padding:5px 10px;font-size:12px" title="60 modułów przyczynowości, analogii i twórczego budowania zdań">🎓 Kurs Wiedzy i Łączenia Pojęć (60 modułów)</button>
             <button id="trainLangBtn" onclick="trainLanguageNow()" style="padding:5px 10px;font-size:12px">Wykształć dialogi</button>
             <button id="continuousStudyBtn" onclick="startContinuousLearning(60)" style="padding:5px 10px;font-size:12px">Auto-nauka 1h</button>
             <button id="schoolWebBtn" onclick="startSchoolWebCourse()" style="padding:5px 10px;font-size:12px">Kurs z Wikipedii</button>
@@ -963,6 +965,19 @@
         </div>
         <input id="memFilter" type="text" placeholder="Filtruj..." oninput="if(latestState) renderMemoryTab(latestState)" style="padding:6px 10px;font-size:12px" />
         <div id="memListBox" class="mem-list"></div>
+      </section>
+
+      <section class="panel">
+        <h2 style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <span>💭 Strumień Myśli (DMN — na żywo)</span>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span id="dmnStatusLine" class="sub">Oczekiwanie na bezczynność...</span>
+            <button id="dmnThinkBtn" onclick="triggerDmnThink()" style="padding:3px 9px;font-size:11.5px" title="Wyzwól jedną spontaniczną myśl 2-hop z pamięci trwałej">💭 Pomyśl teraz</button>
+          </div>
+        </h2>
+        <div id="dmnThoughtsBox" class="train-feed-box" style="max-height:195px">
+          <div class="sub" style="padding:6px 4px">Gdy nie piszesz przez ~25s i mózg ma ≥3 engramy w pamięci trwałej, zaczyna samodzielnie kojarzyć odległe fakty.</div>
+        </div>
       </section>
 
       <section class="panel">
@@ -1532,6 +1547,7 @@
 
       renderChat(s);
       renderMemoryTab(s);
+      renderDmnThoughts(s);
 
       // Sleep table (Pred Error + SHY Pruned Synapses + Broca Loss + REM)
       const tbody = document.getElementById("sleepTableBody");
@@ -1855,35 +1871,35 @@
       }
     }
 
-    const PIPELINE_STORAGE_KEY = "sleeping_brain_pipeline_plan_v1";
+    const PIPELINE_STORAGE_KEY = "sleeping_brain_pipeline_plan_v2";
     let lastPipelinePreset = "standard";
 
     const PIPELINE_PRESETS = {
       quick: {
         preset: "Szybki test",
-        parquet: { enabled: true, filename: "__ALL__", max_steps: 1500, target_loss: 2.2, batch_size: 0 },
-        bielik_dialogues: { enabled: true, num_dialogues: 60 },
-        bielik_reasoning: { enabled: true, num_samples: 60 },
-        dialogue_train: { enabled: true, epochs: 80, target_loss: 0.20, freeze_wernicke: true, train_recalled_columns: true },
-        knowledge: { enabled: true, include_elementary: true, include_bielik_facts: true, turbo_topics: 0 },
+        parquet: { enabled: true, filename: "__ALL__", max_steps: 2000, target_loss: 2.1, batch_size: 0 },
+        bielik_dialogues: { enabled: true, num_dialogues: 100 },
+        bielik_reasoning: { enabled: true, num_samples: 80 },
+        dialogue_train: { enabled: true, epochs: 45, target_loss: 0.70, freeze_wernicke: true, train_recalled_columns: true },
+        knowledge: { enabled: true, include_elementary: true, include_synthesis_course: true, include_bielik_facts: true, turbo_topics: 0 },
         sleep: { enabled: true, cycles: 1 },
       },
       standard: {
         preset: "Standard",
-        parquet: { enabled: true, filename: "__ALL__", max_steps: 8000, target_loss: 1.55, batch_size: 0 },
-        bielik_dialogues: { enabled: true, num_dialogues: 250 },
-        bielik_reasoning: { enabled: true, num_samples: 150 },
-        dialogue_train: { enabled: true, epochs: 160, target_loss: 0.16, freeze_wernicke: true, train_recalled_columns: true },
-        knowledge: { enabled: true, include_elementary: true, include_bielik_facts: true, turbo_topics: 0 },
+        parquet: { enabled: true, filename: "__ALL__", max_steps: 10000, target_loss: 1.50, batch_size: 0 },
+        bielik_dialogues: { enabled: true, num_dialogues: 400 },
+        bielik_reasoning: { enabled: true, num_samples: 200 },
+        dialogue_train: { enabled: true, epochs: 65, target_loss: 0.65, freeze_wernicke: true, train_recalled_columns: true },
+        knowledge: { enabled: true, include_elementary: true, include_synthesis_course: true, include_bielik_facts: true, turbo_topics: 0 },
         sleep: { enabled: true, cycles: 1 },
       },
       full: {
         preset: "Pełny / Nocny",
         parquet: { enabled: true, filename: "__ALL__", max_steps: 40000, target_loss: 1.35, batch_size: 0 },
         bielik_dialogues: { enabled: true, num_dialogues: 1000 },
-        bielik_reasoning: { enabled: true, num_samples: 600 },
-        dialogue_train: { enabled: true, epochs: 180, target_loss: 0.14, freeze_wernicke: true, train_recalled_columns: true },
-        knowledge: { enabled: true, include_elementary: true, include_bielik_facts: true, turbo_topics: 100 },
+        bielik_reasoning: { enabled: true, num_samples: 500 },
+        dialogue_train: { enabled: true, epochs: 90, target_loss: 0.55, freeze_wernicke: true, train_recalled_columns: true },
+        knowledge: { enabled: true, include_elementary: true, include_synthesis_course: true, include_bielik_facts: true, turbo_topics: 100 },
         sleep: { enabled: true, cycles: 2 },
       },
     };
@@ -1915,6 +1931,7 @@
       setChk("pp_dt_recall", dt.train_recalled_columns);
       setChk("pp_kn_en", kn.enabled);
       setChk("pp_kn_elem", kn.include_elementary);
+      setChk("pp_kn_course", kn.include_synthesis_course !== undefined ? kn.include_synthesis_course : true);
       setChk("pp_kn_facts", kn.include_bielik_facts);
       setVal("pp_kn_turbo", kn.turbo_topics);
       setChk("pp_sl_en", sl.enabled);
@@ -1931,28 +1948,29 @@
         parquet: {
           enabled: getChk("pp_pq_en", true),
           filename: String(getVal("pp_pq_file", "__ALL__") || "__ALL__"),
-          max_steps: Math.max(1, Math.round(getNum("pp_pq_steps", 8000))),
-          target_loss: Math.max(0.05, getNum("pp_pq_loss", 1.55)),
+          max_steps: Math.max(1, Math.round(getNum("pp_pq_steps", 10000))),
+          target_loss: Math.max(0.05, getNum("pp_pq_loss", 1.50)),
           batch_size: bsRaw > 0 ? Math.round(bsRaw) : null,
         },
         bielik_dialogues: {
           enabled: getChk("pp_bd_en", true),
-          num_dialogues: Math.max(0, Math.round(getNum("pp_bd_num", 250))),
+          num_dialogues: Math.max(0, Math.round(getNum("pp_bd_num", 400))),
         },
         bielik_reasoning: {
           enabled: getChk("pp_br_en", true),
-          num_samples: Math.max(0, Math.round(getNum("pp_br_num", 150))),
+          num_samples: Math.max(0, Math.round(getNum("pp_br_num", 200))),
         },
         dialogue_train: {
           enabled: getChk("pp_dt_en", true),
-          epochs: Math.max(1, Math.round(getNum("pp_dt_ep", 160))),
-          target_loss: Math.max(0.01, getNum("pp_dt_loss", 0.16)),
+          epochs: Math.max(1, Math.round(getNum("pp_dt_ep", 65))),
+          target_loss: Math.max(0.01, getNum("pp_dt_loss", 0.65)),
           freeze_wernicke: getChk("pp_dt_freeze", true),
           train_recalled_columns: getChk("pp_dt_recall", true),
         },
         knowledge: {
           enabled: getChk("pp_kn_en", true),
           include_elementary: getChk("pp_kn_elem", true),
+          include_synthesis_course: getChk("pp_kn_course", true),
           include_bielik_facts: getChk("pp_kn_facts", true),
           turbo_topics: Math.max(0, Math.round(getNum("pp_kn_turbo", 0))),
         },
@@ -2183,7 +2201,82 @@
       savedDialoguesPreview = null;
       lastTrainingFeedHash = "";
       await api("/api/training_feed/clear", {});
-      poll();
+      await poll();
+    }
+
+    let lastDmnHash = "";
+    function renderDmnThoughts(s) {
+      const box = document.getElementById("dmnThoughtsBox");
+      const stEl = document.getElementById("dmnStatusLine");
+      const btn = document.getElementById("dmnThinkBtn");
+      if (!box) return;
+      const st = s.dmn_status || {};
+      const semCount = Number(st.semantic_count || (s.memory && s.memory.semantic_memory_count) || 0);
+      const idleSec = Number(st.idle_seconds || 0);
+      const delaySec = Number(st.idle_delay_sec || 25);
+      if (stEl) {
+        if (!st.enabled) {
+          stEl.textContent = "DMN wyłączone";
+        } else if (st.thinking_now) {
+          stEl.textContent = "⚡ Kojarzy pojęcia...";
+        } else if (semCount < 3) {
+          stEl.textContent = `Potrzeba min. 3 engramów trwałych (jest ${semCount})`;
+        } else if (idleSec < delaySec) {
+          stEl.textContent = `Kolejna myśl za ~${Math.max(1, Math.round(delaySec - idleSec))}s · trwałe: ${semCount}`;
+        } else {
+          stEl.textContent = `Aktywne w tle · trwałe: ${semCount} · myśli: ${Number(st.total_thoughts || 0)}`;
+        }
+      }
+      if (btn) {
+        const busy = Boolean(s.study && s.study.active) || s.state_mode !== "AWAKE";
+        btn.disabled = busy || semCount < 3;
+      }
+
+      const items = Array.isArray(s.dmn_thoughts) ? s.dmn_thoughts.slice().reverse() : [];
+      const hash = JSON.stringify(items.map(x => [x.t, x.engram_id, x.thought]));
+      if (hash === lastDmnHash) return;
+      lastDmnHash = hash;
+      if (!items.length) {
+        box.innerHTML = `<div class="sub" style="padding:6px 4px">Brak zapisanych myśli DMN — kliknij „💭 Pomyśl teraz” lub poczekaj ~25s bezczynności po śnie / treningu.</div>`;
+        return;
+      }
+      box.innerHTML = items.map(it => {
+        const pl = it.parent_labels || {};
+        const bridge = (pl.a && pl.b && pl.c)
+          ? `<div class="sub" style="margin-top:3px">Most: <em>${escapeHtml(pl.a)}</em> —(<strong>${escapeHtml(pl.b)}</strong>)→ <em>${escapeHtml(pl.c)}</em></div>`
+          : "";
+        const coh = it.joint_coherence !== undefined && it.joint_coherence !== null
+          ? ` · spójność ${(Number(it.joint_coherence) * 100).toFixed(0)}%`
+          : "";
+        return `
+          <div class="tf-card">
+            <div class="tf-meta">
+              <span class="tf-tag">${escapeHtml((it.tag || "dmn_2hop").toUpperCase())}${escapeHtml(coh)}</span>
+              <span>${escapeHtml(it.t || "")}</span>
+            </div>
+            <div class="tf-bubble tf-brain" style="margin-top:2px">${escapeHtml(it.thought || "")}</div>
+            ${bridge}
+          </div>`;
+      }).join("");
+    }
+
+    async function triggerDmnThink() {
+      const btn = document.getElementById("dmnThinkBtn");
+      if (btn) btn.disabled = true;
+      try {
+        const res = await api("/api/dmn/think", {});
+        if (!res.ok) alert(res.error || "Nie udało się wywołać myśli DMN.");
+      } finally {
+        await poll();
+      }
+    }
+
+    async function startConceptCourse() {
+      savedDialoguesPreview = null;
+      trainingFeedCollapsed = false;
+      const res = await api("/api/study/course", {});
+      if (!res.ok) alert(res.error || "Nie udało się uruchomić Kursu Wiedzy i Łączenia Pojęć.");
+      await poll();
     }
 
     async function loadSavedTeacherDialogues() {

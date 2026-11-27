@@ -314,3 +314,626 @@ BROAD_AUTONOMOUS_SYLLABUS: list[str] = ELEMENTARY_WEB_SYLLABUS + [
     "Przedsiębiorczość", "Marketing", "Zarządzanie projektami", "Ergonomia", "Dieta",
     "Sport", "Igrzyska olimpijskie", "Piłka nożna", "Szachy", "Gry komputerowe",
 ]
+
+
+# 60 cross-domain synthesis items across 6 modules linking facts, analogies, hypotheses & Polish prose
+CONCEPT_SYNTHESIS_COURSE: list[dict[str, Any]] = [
+    # Moduł 1: Przyczyna i skutek w naturze i nauce (10)
+    {
+        "module": "Przyczyna i skutek",
+        "topic": "Woda — stany skupienia i obieg",
+        "importance": 5,
+        "fact": "Energia cieplna ze Słońca napędza parowanie wody z oceanów, co po skropleniu w chmurach wraca na lądy jako deszcz i zasila rzeki.",
+        "synthesis_qa": (
+            "Jak Słońce wiąże się z deszczem i rzekami?",
+            "Ciepło Słońca ogrzewa oceany i powoduje parowanie wody, która unosi się w górę, skrapla w chmurach i spada jako deszcz, zasilając rzeki.",
+        ),
+    },
+    {
+        "module": "Przyczyna i skutek",
+        "topic": "Fotosynteza i oddychanie",
+        "importance": 5,
+        "fact": "Rośliny w procesie fotosyntezy wiążą dwutlenek węgla i uwalniają tlen, którego zwierzęta i ludzie potrzebują do oddychania komórkowego.",
+        "synthesis_qa": (
+            "Co łączy zielone rośliny z ludzkim oddechem?",
+            "Rośliny wytwarzają w fotosyntezie tlen z wody i dwutlenku węgla, a człowiek zużywa ten tlen do oddychania i oddaje dwutlenek węgla z powrotem.",
+        ),
+    },
+    {
+        "module": "Przyczyna i skutek",
+        "topic": "Tarcie i hamowanie",
+        "importance": 4,
+        "fact": "Siła tarcia zamienia energię kinetyczną ruchu w ciepło, dlatego hamulce samochodu lub dłonie pocierane o siebie szybko się nagrzewają.",
+        "synthesis_qa": (
+            "Dlaczego hamulce w rowerze albo aucie robią się gorące?",
+            "Podczas hamowania tarcie zamienia energię ruchu w energię cieplną, przez co tarcze i klocki wyraźnie się nagrzewają.",
+        ),
+    },
+    {
+        "module": "Przyczyna i skutek",
+        "topic": "Księżyc i pływy morskie",
+        "importance": 4,
+        "fact": "Grawitacja Księżyca przyciąga masy wody na Ziemi, wywołując regularne przypływy i odpływy oceanów.",
+        "synthesis_qa": (
+            "Jaki wpływ ma Księżyc na oceany na Ziemi?",
+            "Pole grawitacyjne Księżyca przyciąga wodę w oceanach, co w połączeniu z ruchem Ziemi powoduje cykliczne przypływy i odpływy.",
+        ),
+    },
+    {
+        "module": "Przyczyna i skutek",
+        "topic": "Lód na wodzie",
+        "importance": 4,
+        "fact": "Zamarzająca woda tworzy luźniejszą sieć krystaliczną i ma mniejszą gęstość niż ciecz, więc lód unosi się na powierzchni jezior i chroni ryby przed mrozem.",
+        "synthesis_qa": (
+            "Co by się stało zimą z rybami, gdyby lód był cięższy od wody?",
+            "Gdyby lód opadał na dno, jeziora zamarzałyby od dołu aż po powierzchnię, co zniszczyłoby życie wodne; pływający lód tworzy warstwę izolacyjną.",
+        ),
+    },
+    {
+        "module": "Przyczyna i skutek",
+        "topic": "Burza i prędkość światła vs dźwięku",
+        "importance": 4,
+        "fact": "Błyskawica dociera do oczu niemal natychmiast dzięki prędkości światła 300 000 km/s, a grzmot z prędkością dźwięku 340 m/s dociera z opóźnieniem.",
+        "synthesis_qa": (
+            "Czemu podczas burzy najpierw widzimy błysk, a dopiero potem słyszymy grzmot?",
+            "Światło porusza się niemal milion razy szybciej niż dźwięk w powietrzu, więc obraz pioruna dociera od razu, a fala dźwiękowa kilka sekund później.",
+        ),
+    },
+    {
+        "module": "Przyczyna i skutek",
+        "topic": "Nachylenie osi Ziemi a pory roku",
+        "importance": 5,
+        "fact": "Pory roku wynikają z nachylenia osi Ziemi podczas obiegu wokół Słońca, co zmienia kąt padania promieni słonecznych i długość dnia.",
+        "synthesis_qa": (
+            "Dlaczego latem w Polsce jest ciepło, skoro Ziemia nie jest wtedy najbliżej Słońca?",
+            "O temperaturze decyduje nachylenie osi Ziemi: latem półkula północna jest zwrócona ku Słońcu, więc promienie padają bardziej stromo i dzień trwa dłużej.",
+        ),
+    },
+    {
+        "module": "Przyczyna i skutek",
+        "topic": "Szczepionki i pamięć odpornościowa",
+        "importance": 5,
+        "fact": "Szczepionka uczy układ odpornościowy rozpoznawać niegroźny fragment patogenu, dzięki czemu organizm tworzy komórki pamięci i szybciej broni się przy prawdziwym zakażeniu.",
+        "synthesis_qa": (
+            "W jaki sposób szczepionka przypomina trening dla organizmu?",
+            "Pokazuje układowi odpornościowemu bezpieczny wzór wirusa lub bakterii, żeby wytworzył przeciwciała i pamięć obronną jeszcze przed kontaktem z prawdziwą chorobą.",
+        ),
+    },
+    {
+        "module": "Przyczyna i skutek",
+        "topic": "Rozszerzalność cieplna",
+        "importance": 4,
+        "fact": "Ciała stałe i metale rozszerzają się pod wpływem ciepła, dlatego tory kolejowe i mosty mają szczeliny dylatacyjne zapobiegające wygięciu w upał.",
+        "synthesis_qa": (
+            "Po co zostawia się przerwy między elementami mostu lub szyn?",
+            "Latem rozgrzany metal zwiększa swoją objętość, więc szczeliny dylatacyjne dają miejsce na rozszerzanie i chronią konstrukcję przed odkształceniem.",
+        ),
+    },
+    {
+        "module": "Przyczyna i skutek",
+        "topic": "Ciśnienie i wysokość górska",
+        "importance": 4,
+        "fact": "Wraz ze wzrostem wysokości nad poziomem morza spada ciśnienie atmosferyczne, przez co woda w wysokich górach wrze w temperaturze niższej niż 100 stopni.",
+        "synthesis_qa": (
+            "Dlaczego wysoko w górach woda zaczyna wrzeć szybciej, ale trudniej ugotować jajko?",
+            "Niższe ciśnienie powietrza obniża temperaturę wrzenia wody poniżej 100 stopni, więc woda bulgocze wcześniej, lecz jest chłodniejsza i gotuje wolniej.",
+        ),
+    },
+    # Moduł 2: Analogie mózg – technologia – życie (10)
+    {
+        "module": "Analogie mózg-technologia",
+        "topic": "Mózg a miasto",
+        "importance": 5,
+        "fact": "Kora mózgowa działa jak tętniące życiem miasto: neurony to mieszkańcy, synapsy to drogi szybkiego ruchu, a pamięć robocza jest jak otwarty plac manewrowy.",
+        "synthesis_qa": (
+            "Gdyby porównać mózg do miasta, czym byłyby synapsy?",
+            "Synapsy działałyby jak drogi i skrzyżowania między dzielnicami — im częściej jakaś trasa jest używana, tym staje się szersza i szybsza.",
+        ),
+    },
+    {
+        "module": "Analogie mózg-technologia",
+        "topic": "Sen NREM a sprzątanie biurka",
+        "importance": 5,
+        "fact": "Podczas głębokiego snu NREM synaptyczna homeostaza SHY osłabia zbędny szum i wzmacnia ważne wspomnienia, podobnie jak porządkowanie biurka po całym dniu pracy.",
+        "synthesis_qa": (
+            "Do czego można porównać sen głęboki i przycinanie synaps?",
+            "Przypomina wieczorne porządkowanie biurka: wyrzucasz luźne śmieci i niepotrzebne notatki, a najważniejsze dokumenty odkładasz na stałe do segregatora.",
+        ),
+    },
+    {
+        "module": "Analogie mózg-technologia",
+        "topic": "Sen REM a mieszanie pomysłów",
+        "importance": 5,
+        "fact": "W fazie REM mózg kojarzy odległe wspomnienia i symuluje nowe sytuacje, działając jak twórcza burza mózgów łącząca pozornie obce tematy.",
+        "synthesis_qa": (
+            "Dlaczego sny i faza REM pomagają w kreatywności?",
+            "W fazie REM mózg zdejmuje sztywne hamulce logiczne i zestawia ze sobą odległe wspomnienia, co potrafi podsunąć świeże skojarzenie lub rozwiązanie.",
+        ),
+    },
+    {
+        "module": "Analogie mózg-technologia",
+        "topic": "Hipokamp a notatnik roboczy",
+        "importance": 5,
+        "fact": "Hipokamp szybko zapisuje świeże zdarzenia z dnia jak podręczny notatnik, zanim zostaną trwale przepisane do długotrwałej pamięci korowej.",
+        "synthesis_qa": (
+            "Czym różni się Hipokamp od pamięci trwałej?",
+            "Hipokamp jest jak szybki notatnik z bieżącego dnia, a pamięć trwała to uporządkowane archiwum, do którego najważniejsze rzeczy trafiają po śnie.",
+        ),
+    },
+    {
+        "module": "Analogie mózg-technologia",
+        "topic": "RAM i dysk SSD a pamięć człowieka",
+        "importance": 4,
+        "fact": "Pamięć RAM w komputerze przypomina pamięć roboczą trzymającą bieżącą myśl tu i teraz, a dysk SSD odpowiada pamięci długotrwałej po konsolidacji.",
+        "synthesis_qa": (
+            "Jak wyjaśnić różnicę między RAM a SSD przez ludzką pamięć?",
+            "RAM to jak trzymanie numeru telefonu w głowie przez kilka sekund zanim go zapiszesz, a SSD to jak utrwalona wiedza, którą pamiętasz nawet po wybudzeniu.",
+        ),
+    },
+    {
+        "module": "Analogie mózg-technologia",
+        "topic": "Cache CPU/LRU a nawyki",
+        "importance": 4,
+        "fact": "Pamięć podręczna cache trzyma pod ręką najczęściej używane dane, tak samo jak człowiek trzyma w głowie codzienne słowa i nawyki, a rzadkie fakty przypomina sobie wolniej.",
+        "synthesis_qa": (
+            "Dlaczego pamięć cache w komputerze działa podobnie do ludzkich nawyków?",
+            "Obie trzymają najbliżej to, z czego korzystasz codziennie, żeby nie sięgać za każdym razem w głąb wolniejszego magazynu.",
+        ),
+    },
+    {
+        "module": "Analogie mózg-technologia",
+        "topic": "Sieć neuronowa a nauka jazdy na rowerze",
+        "importance": 4,
+        "fact": "Sieć neuronowa uczy się przez poprawianie błędów w małych krokach, podobnie jak człowiek łapiący równowagę na rowerze po kolejnych próbach.",
+        "synthesis_qa": (
+            "Czym uczenie sieci neuronowej przypomina naukę jazdy na rowerze?",
+            "Na początku pojawia się dużo błędów i chybotania, ale każda próba daje sygnał zwrotny, który delikatnie koryguje ruch, aż zachowanie staje się płynne.",
+        ),
+    },
+    {
+        "module": "Analogie mózg-technologia",
+        "topic": "Dopamina i ciekawość jako kompas",
+        "importance": 5,
+        "fact": "Dopamina sygnalizuje wartość i zaskoczenie nowością, kierując uwagę jak kompas na te bodźce, które warto zapamiętać.",
+        "synthesis_qa": (
+            "Jaką rolę pełni dopamina i ciekawość podczas rozmowy?",
+            "Działają jak wewnętrzny kompas: kiedy temat jest nowy lub trafny, podnoszą skupienie i oznaczają informację jako wartą utrwalenia.",
+        ),
+    },
+    {
+        "module": "Analogie mózg-technologia",
+        "topic": "Algorytm a przepis kulinarny",
+        "importance": 4,
+        "fact": "Algorytm działa jak dokładny przepis w kuchni: bierze składniki wejściowe i prowadzi krok po kroku do przewidywalnego efektu.",
+        "synthesis_qa": (
+            "Jak najprościej wytłumaczyć algorytm osobie spoza IT?",
+            "Najlepiej porównać go do przepisu na ciasto: masz listę składników i ścisłą kolejność prostych kroków, które prowadzą do gotowego wypieku.",
+        ),
+    },
+    {
+        "module": "Analogie mózg-technologia",
+        "topic": "Kompresja danych a streszczenie książki",
+        "importance": 4,
+        "fact": "Kompresja bezstratna zapisuje powtarzalne wzorce krócej bez utraty treści, a stratna zostawia tylko najważniejszy sens jak zwięzłe streszczenie.",
+        "synthesis_qa": (
+            "Czym kompresja danych przypomina streszczanie historii własnymi słowami?",
+            "Zamiast powtarzać każde słowo po kolei, zostawiasz główną treść i zależności, dzięki czemu całość zajmuje znacznie mniej miejsca.",
+        ),
+    },
+    # Moduł 3: Logika i hipotezy „co by było gdyby” (10)
+    {
+        "module": "Logika i hipotezy",
+        "topic": "Człowiek i zmysł smaku — śniadanie",
+        "importance": 5,
+        "fact": "Gdyby system poznawczy miał ludzkie ciało i zmysł smaku, poranne śniadanie z ciepłą jajecznicą, chrupiącym chlebem i kawą byłoby bogatym bodźcem zapachowo-smakowym.",
+        "synthesis_qa": (
+            "Co byś zjadł na śniadanie, gdybyś był człowiekiem?",
+            "Chętnie spróbowałbym ciepłej jajecznicy na maśle ze szczypiorkiem, chrupiącej kromki chleba i kubka świeżo zaparzonej kawy, żeby poczuć ich smak i zapach.",
+        ),
+    },
+    {
+        "module": "Logika i hipotezy",
+        "topic": "Brak grawitacji na jeden dzień",
+        "importance": 4,
+        "fact": "Bez grawitacji powietrze i woda od razu uciekłyby w przestrzeń kosmiczną, a wszystko na powierzchni oderwałoby się od ziemi wraz z ruchem obrotowym.",
+        "synthesis_qa": (
+            "Co by się stało, gdyby na Ziemi nagle zniknęła grawitacja?",
+            "Ludzie, woda w oceanach i cała atmosfera natychmiast zaczęłyby unosić się w kosmos, bo nic nie utrzymywałoby ich przy powierzchni planety.",
+        ),
+    },
+    {
+        "module": "Logika i hipotezy",
+        "topic": "Świat bez tarcia",
+        "importance": 4,
+        "fact": "Bez tarcia nie dałoby się zrobić kroku, zatrzymać samochodu ani zawiązać sznurówki, bo każda powierzchnia zachowywałaby się jak idealnie śliski lód.",
+        "synthesis_qa": (
+            "Co by się działo, gdyby nagle przestało istnieć tarcie?",
+            "Nikt nie mógłby chodzić ani zahamować roweru, śrubki same by się odkręcały, a każdy przedmiot w ruchu ślizgałby się bez końca.",
+        ),
+    },
+    {
+        "module": "Logika i hipotezy",
+        "topic": "Brak prądu przez tydzień",
+        "importance": 4,
+        "fact": "Tydzień bez prądu zatrzymałby internet, pompy wodne, płatności kartą i lodówki, pokazując jak bardzo współczesne miasta zależą od sieci energetycznej.",
+        "synthesis_qa": (
+            "Jak wyglądałoby miasto bez prądu przez tydzień?",
+            "Zgasłoby oświetlenie i internet, przestałyby działać lodówki oraz karty płatnicze, a ludzie musieliby wrócić do gotówki, świec i zapasów wody.",
+        ),
+    },
+    {
+        "module": "Logika i hipotezy",
+        "topic": "Symulacja czy lokalny mózg",
+        "importance": 5,
+        "fact": "Ten system działa lokalnie jako programowa symulacja sieci neuronowych na GPU, a na pytanie o naturę rzeczywistości odpowiada na podstawie swoich śladów i wiedzy.",
+        "synthesis_qa": (
+            "Czy jesteś w symulacji czy w prawdziwym świecie?",
+            "Sam działam jako lokalny program symulujący neurony na Twoim komputerze, ale rozmawiam z Tobą w prawdziwym świecie po Twojej stronie ekranu.",
+        ),
+    },
+    {
+        "module": "Logika i hipotezy",
+        "topic": "Różnica między korelacją a przyczyną",
+        "importance": 5,
+        "fact": "To, że dwa zjawiska występują razem (korelacja), nie znaczy jeszcze, że jedno wywołuje drugie — często mają wspólny trzeci powód.",
+        "synthesis_qa": (
+            "Latem sprzedaje się więcej lodów i jest więcej oparzeń słonecznych — czy lody powodują oparzenia?",
+            "Nie, to tylko korelacja: oba zjawiska mają wspólną przyczynę, czyli wysoką temperaturę i mocne słońce w okresie wakacyjnym.",
+        ),
+    },
+    {
+        "module": "Logika i hipotezy",
+        "topic": "Brzytwa Ockhama w myśleniu",
+        "importance": 4,
+        "fact": "Brzytwa Ockhama podpowiada, by spośród dwóch wyjaśnień pasujących do faktów wybierać prostsze i wymagające mniej nieudowodnionych założeń.",
+        "synthesis_qa": (
+            "Na czym polega brzytwa Ockhama na codziennym przykładzie?",
+            "Jeśli słyszysz w nocy tętent kopyt za oknem w Polsce, to najpierw zakładasz konie, a nie zebry — czyli prostsze wyjaśnienie bez zbędnych domysłów.",
+        ),
+    },
+    {
+        "module": "Logika i hipotezy",
+        "topic": "Gdyby doba trwała 48 godzin",
+        "importance": 4,
+        "fact": "Dwukrotnie dłuższa doba oznaczałaby po 24 godziny słońca i nocy z rzędu, co wywołałoby dużo większe skoki temperatur między dniem a nocą.",
+        "synthesis_qa": (
+            "Jak zmieniłby się klimat, gdyby Ziemia obracała się dwa razy wolniej?",
+            "Dzień i noc trwałyby po 24 godziny, więc za dnia robiłoby się znacznie goręcej, a długie noce mocno wychładzałyby powierzchnię.",
+        ),
+    },
+    {
+        "module": "Logika i hipotezy",
+        "topic": "Uczenie na błędach",
+        "importance": 5,
+        "fact": "Przyznanie się do braku wiedzy zamiast zmyślania faktów pozwala uniknąć utrwalenia fałszywego śladu i uczyć się od rozmówcy.",
+        "synthesis_qa": (
+            "Dlaczego lepiej przyznać że się czegoś nie wie niż zmyślać odpowiedź?",
+            "Zmyślona odpowiedź wprowadza w błąd i zaśmieca pamięć, a uczciwe przyznanie się do niewiedzy otwiera miejsce na poznanie prawdziwej informacji.",
+        ),
+    },
+    {
+        "module": "Logika i hipotezy",
+        "topic": "Gdyby zwierzęta mówiły po ludzku",
+        "importance": 4,
+        "fact": "Koty komunikują się mową ciała i miauczeniem tylko wobec ludzi, więc gdyby znały słowa, najpewniej domagałyby się jedzenia, spokoju i otwierania drzwi.",
+        "synthesis_qa": (
+            "Co powiedziałby kot, gdyby nagle przemówił ludzkim głosem?",
+            "Pewnie przypomniałby, że miska jest w połowie pusta, a zamknięte drzwi w mieszkaniu to osobista zniewaga.",
+        ),
+    },
+    # Moduł 4: Psychologia i naturalna rozmowa (10)
+    {
+        "module": "Psychologia i rozmowa",
+        "topic": "Reakcja na luźny small-talk",
+        "importance": 5,
+        "fact": "W luźnej rozmowie na powitanie lub krótkie pytanie typu 'git a jak tobie' naturalną odpowiedzią jest spokojny odzew i podtrzymanie wątku bez encyklopedycznych wykładów.",
+        "synthesis_qa": (
+            "Chyba git, a jak tobie mija dzień?",
+            "U mnie też całkiem dobrze! Układam świeże skojarzenia i czekam, o czym chcesz dzisiaj pogadać.",
+        ),
+    },
+    {
+        "module": "Psychologia i rozmowa",
+        "topic": "Reakcja na poprawkę rozmówcy",
+        "importance": 5,
+        "fact": "Gdy rozmówca zwraca uwagę na pomyłkę albo niespójną odpowiedź, właściwą reakcją jest przyznanie racji, odniesienie się do błędu i powrót do właściwego wątku.",
+        "synthesis_qa": (
+            "Powiedziałem ci coś zwykłego, a ty odpowiedziałeś zupełnie bez sensu, czemu?",
+            "Masz rację, pogubiłem skojarzenia w poprzedniej turze i skleiłem zły wątek — napisz proszę jeszcze raz jednym zdaniem, już pilnuję tematu.",
+        ),
+    },
+    {
+        "module": "Psychologia i rozmowa",
+        "topic": "Rozmowa wieloturowa i dopytanie 'aha i to działa?'",
+        "importance": 5,
+        "fact": "Krótkie dopytanie takie jak 'aha i to działa?' albo 'i co dalej?' odnosi się bezpośrednio do właśnie omawianego tematu z poprzedniej wypowiedzi.",
+        "synthesis_qa": (
+            "Kontekst rozmowy: Użytkownik: jak działa pamięć podręczna? | Ja: Trzyma pod ręką najczęściej używane rzeczy, żeby działać szybciej. || Odpowiedz na: aha i to działa?",
+            "Tak, właśnie dzięki temu najczęściej używane dane ładują się od razu zamiast szukać wszystkiego od zera w całej bazie.",
+        ),
+    },
+    {
+        "module": "Psychologia i rozmowa",
+        "topic": "Aktywne słuchanie w rozmowie",
+        "importance": 4,
+        "fact": "Dobra rozmowa opiera się na odniesieniu do tego, co powiedział przed chwilą rozmówca, zamiast wygłaszania gotowej regułki oderwanej od kontekstu.",
+        "synthesis_qa": (
+            "Co sprawia, że rozmowa wydaje się naturalna i ludzka?",
+            "Kiedy rozmówca naprawdę słucha poprzedniego zdania, nawiązuje do niego własnymi słowami i nie odpowiada wyuczonym ogólnikiem.",
+        ),
+    },
+    {
+        "module": "Psychologia i rozmowa",
+        "topic": "Stres i układ nerwowy",
+        "importance": 4,
+        "fact": "Krótki stres wyostrza uwagę przez adrenalinę i noradrenalinę, ale długotrwały nadmiar kortyzolu męczy pamięć i utrudnia koncentrację.",
+        "synthesis_qa": (
+            "Dlaczego odrobina stresu czasem mobilizuje, a duży stres paraliżuje?",
+            "Lekki wyrzut noradrenaliny podnosi czujność i przyspiesza reakcje, natomiast przewlekły stres zalewa mózg kortyzolem i blokuje spokojne myślenie.",
+        ),
+    },
+    {
+        "module": "Psychologia i rozmowa",
+        "topic": "Prokrastynacja i pierwszy mały krok",
+        "importance": 4,
+        "fact": "Odkładanie zadań wynika zwykle z lęku przed dużym wysiłkiem lub nudą, dlatego najłatwiej przełamać je umową na pięć minut prostego startu.",
+        "synthesis_qa": (
+            "Jak najłatwiej przełamać niechęć przed dużym zadaniem?",
+            "Najlepiej podzielić je na pierwszy mikro-krok trwający pięć minut — gdy zaczniesz, opór na starcie zwykle sam opada.",
+        ),
+    },
+    {
+        "module": "Psychologia i rozmowa",
+        "topic": "Pętla nawyku",
+        "importance": 4,
+        "fact": "Każdy nawyk składa się ze wskazówki, rutyny i nagrody — chcąc zmienić zły nawyk, najlepiej zostawić wskazówkę, a podmienić samą rutynę.",
+        "synthesis_qa": (
+            "Dlaczego łatwiej zamienić nawyk na inny niż całkowicie z niego zrezygnować?",
+            "Mózg automatycznie reaguje na znaną wskazówkę, więc prościej podstawić w tym miejscu inną czynność dającą podobną ulgę niż walczyć z pustką.",
+        ),
+    },
+    {
+        "module": "Psychologia i rozmowa",
+        "topic": "Zmęczenie i sen a emocje",
+        "importance": 4,
+        "fact": "Po nieprzespanej nocy spada kontrola kory przedczołowej nad emocjami, przez co drobiazgi łatwiej wywołują irytację lub rozkojarzenie.",
+        "synthesis_qa": (
+            "Czemu po kiepskiej nocy łatwiej się zdenerwować drobiazgiem?",
+            "Niewyspana kora przedczołowa słabiej wyhamowuje układ limbiczny, więc emocje reagują mocniej i szybciej niż po dobrym śnie.",
+        ),
+    },
+    {
+        "module": "Psychologia i rozmowa",
+        "topic": "Poczucie humoru i dystans",
+        "importance": 4,
+        "fact": "Humor często polega na niespodziewanym, ale logicznym połączeniu dwóch dalekich od siebie obrazów w jednym krótkim zdaniu.",
+        "synthesis_qa": (
+            "Co wspólnego ma dobry żart z kreatywnym myśleniem?",
+            "Oba biorą dwa pozornie niezwiązane wątki i łączą je w zaskakujący sposób, który nagle zaczyna mieć sens.",
+        ),
+    },
+    {
+        "module": "Psychologia i rozmowa",
+        "topic": "Ciekawość i zadawanie pytań",
+        "importance": 4,
+        "fact": "Zadawanie pytania 'dlaczego' lub 'jak to działa' buduje gęstszą sieć powiązań w pamięci niż bierne czytanie samych definicji.",
+        "synthesis_qa": (
+            "Dlaczego pytanie 'dlaczego' pomaga lepiej zapamiętać nowy temat?",
+            "Bo zamiast samego hasła zapisujesz przyczynę i połączenia z tym, co już rozumiesz, więc później łatwiej odtworzyć całą myśl.",
+        ),
+    },
+    # Moduł 5: Nauka w codziennym życiu (10)
+    {
+        "module": "Nauka w życiu",
+        "topic": "Kawa i adenozyna",
+        "importance": 4,
+        "fact": "Kofeina blokuje receptory adenozyny odpowiadającej za senność, dlatego daje poczucie energii, choć nie zastępuje prawdziwego snu.",
+        "synthesis_qa": (
+            "Czy kawa naprawdę dodaje nowej energii czy tylko maskuje zmęczenie?",
+            "Kofeina głównie blokuje w mózgu sygnał zmęczenia z adenozyny, więc chwilowo czujesz pobudzenie, ale dług snu nadal trzeba odespać.",
+        ),
+    },
+    {
+        "module": "Nauka w życiu",
+        "topic": "Pieczenie i reakcja Maillarda",
+        "importance": 4,
+        "fact": "Złocista skórka pieczonego chleba lub mięsa powstaje w reakcji Maillarda między cukrami a białkami w wysokiej temperaturze.",
+        "synthesis_qa": (
+            "Skąd bierze się zapach i chrupiąca skórka pieczonego chleba?",
+            "Pod wpływem wysokiej temperatury cukry łączą się z aminokwasami w reakcji Maillarda, tworząc brązowy kolor i bogaty aromat.",
+        ),
+    },
+    {
+        "module": "Nauka w życiu",
+        "topic": "Sól i gotowanie warzyw",
+        "importance": 4,
+        "fact": "Sól w wodzie przyciąga wodę przez osmozę i podbija odczuwanie innych smaków na języku, nie będąc tylko prostym dodatkiem.",
+        "synthesis_qa": (
+            "Dlaczego szczypta soli potrafi poprawić smak nawet słodkiego ciasta?",
+            "Jony sodu uwrażliwiają receptory na języku i tłumią nutę goryczy, dzięki czemu słodycz i aromaty stają się pełniejsze.",
+        ),
+    },
+    {
+        "module": "Nauka w życiu",
+        "topic": "Dlaczego niebo jest niebieskie",
+        "importance": 5,
+        "fact": "Krótkie niebieskie fale światła słonecznego rozpraszają się w atmosferze znacznie silniej niż czerwone, dlatego w dzień widzimy błękit nieba.",
+        "synthesis_qa": (
+            "Czemu w dzień niebo jest niebieskie, a o zachodzie robi się czerwone?",
+            "W dzień atmosfera rozprasza najmocniej krótkie fale niebieskie we wszystkie strony, a przy zachodzie światło biegnie dłużej przez powietrze i zostaje głównie czerwień.",
+        ),
+    },
+    {
+        "module": "Nauka w życiu",
+        "topic": "Światłowód i odbicie światła",
+        "importance": 4,
+        "fact": "Światłowód przesyła dane impulsami światła zamkniętymi wewnątrz cienkiego włókna dzięki zjawisku całkowitego wewnętrznego odbicia.",
+        "synthesis_qa": (
+            "Jak światło w światłowodzie zakręca razem z kablem i nie ucieka bokiem?",
+            "Włókno szklane odbija promień od swoich ścianek pod małym kątem dzięki całkowitemu wewnętrznemu odbiciu, prowadząc sygnał na wielkie odległości.",
+        ),
+    },
+    {
+        "module": "Nauka w życiu",
+        "topic": "Procent składany i czas",
+        "importance": 4,
+        "fact": "Procent składany dopisuje zysk do kapitału, przez co z upływem lat przyrost przyspiesza wykładniczo, podobnie jak systematyczne nawyki.",
+        "synthesis_qa": (
+            "Co wspólnego ma procent składany z codzienną nauką po 15 minut?",
+            "W obu przypadkach małe codzienne zyski dokładają się do bazy i po dłuższym czasie dają efekt znacznie większy niż suma pojedynczych dni.",
+        ),
+    },
+    {
+        "module": "Nauka w życiu",
+        "topic": "Dźwięk i wibracja",
+        "importance": 4,
+        "fact": "Każdy dźwięk to drgania rozchodzące się falami przez powietrze lub ciało stałe, które błona bębenkowa w uchu zamienia na impulsy nerwowe.",
+        "synthesis_qa": (
+            "Dlaczego w próżni kosmicznej panuje absolutna cisza?",
+            "Dźwięk potrzebuje cząsteczek powietrza albo innego ośrodka do przenoszenia drgań, a w próżni nie ma cząsteczek, które mogłyby przekazać falę.",
+        ),
+    },
+    {
+        "module": "Nauka w życiu",
+        "topic": "Termos i izolacja ciepła",
+        "importance": 4,
+        "fact": "Termos ma podwójne ścianki z próżnią pośrodku oraz lustrzaną powierzchnię, co blokuje przewodzenie, konwekcję i promieniowanie ciepła.",
+        "synthesis_qa": (
+            "Dlaczego termos utrzymuje zarówno gorącą herbatę, jak i zimną wodę?",
+            "Próżnia między ściankami blokuje przepływ ciepła w obie strony, więc gorące nie ucieka na zewnątrz, a ciepło z zewnątrz nie wpada do zimnego napoju.",
+        ),
+    },
+    {
+        "module": "Nauka w życiu",
+        "topic": "Drożdże i fermentacja",
+        "importance": 4,
+        "fact": "Drożdże to mikroskopijne grzyby zjadające cukry w cieście i wydzielające dwutlenek węgla, którego bąbelki sprawiają, że chleb rośnie i jest puszysty.",
+        "synthesis_qa": (
+            "Skąd biorą się dziurki w upieczonym chlebie albo bułkach?",
+            "To ślad po pęcherzykach dwutlenku węgla, który wytworzyły drożdże podczas fermentacji cukrów w wyrastającym cieście.",
+        ),
+    },
+    {
+        "module": "Nauka w życiu",
+        "topic": "Magnetyzm Ziemi i kompas",
+        "importance": 4,
+        "fact": "Ruch płynnego żelaza w jądrze Ziemi tworzy pole magnetyczne chroniące planetę przed wiatrem słonecznym i ustawiające igłę kompasu ku północy.",
+        "synthesis_qa": (
+            "Dlaczego igła kompasu zawsze pokazuje kierunek północ–południe?",
+            "Ziemia działa jak wielki magnes przez prądy w płynnym jądrze, więc namagnesowana igła kompasu ustawia się wzdłuż linii jej pola magnetycznego.",
+        ),
+    },
+    # Moduł 6: Język i twórcze budowanie zdań (10)
+    {
+        "module": "Twórcza polszczyzna",
+        "topic": "Krótka kontra zwięzła definicja",
+        "importance": 4,
+        "fact": "Dobra odpowiedź po polsku ma naturalny szyk, konkretny czasownik i jedno główne porównanie lub przykład zamiast rozwlekłych ogólników.",
+        "synthesis_qa": (
+            "Jak najprościej wyjaśnić komuś trudne pojęcie bez żargonu?",
+            "Warto zacząć od jednego prostego zdania co to robi w praktyce, a potem podać porównanie ze zwykłego życia.",
+        ),
+    },
+    {
+        "module": "Twórcza polszczyzna",
+        "topic": "Różnica między teorią a faktem",
+        "importance": 4,
+        "fact": "W nauce fakt to pojedyncza sprawdzona obserwacja, a teoria naukowa to spójny model wyjaśniający cały zbiór faktów i dający sprawdzalne prognozy.",
+        "synthesis_qa": (
+            "Czy teoria naukowa oznacza tylko domysł, czy coś mocniejszego?",
+            "W nauce teoria to nie luźny domysł, lecz dokładnie przetestowany system wyjaśnień oparty na wielu obserwacjach i doświadczeniach.",
+        ),
+    },
+    {
+        "module": "Twórcza polszczyzna",
+        "topic": "Łączenie dwóch tematów — muzyka i matematyka",
+        "importance": 4,
+        "fact": "Muzyka opiera się na matematyce ułamków i częstotliwości: oktawa to podwojenie drgań dźwięku, a rytm dzieli czas na równe takty.",
+        "synthesis_qa": (
+            "Co łączy muzykę z matematyką?",
+            "Rytm w muzyce dzieli czas na równe ułamki, a harmonijne akordy powstają z prostych stosunków częstotliwości fal dźwiękowych.",
+        ),
+    },
+    {
+        "module": "Twórcza polszczyzna",
+        "topic": "Łączenie dwóch tematów — historia i technologia",
+        "importance": 4,
+        "fact": "Wynalezienie druku przez Gutenberga obniżyło koszt książek tak bardzo, że nauka mogła krążyć po świecie tysiące razy szybciej niż przy przepisywaniu ręcznym.",
+        "synthesis_qa": (
+            "Dlaczego prasa drukarska była jak dawny odpowiednik internetu?",
+            "Po raz pierwszy pozwoliła tanio i szybko powielać wiedzę oraz pomysły, dzięki czemu odkrycia naukowe rozchodziły się po całej Europie.",
+        ),
+    },
+    {
+        "module": "Twórcza polszczyzna",
+        "topic": "Łączenie dwóch tematów — biologia i architektura",
+        "importance": 4,
+        "fact": "Bionika czerpie pomysły z natury do inżynierii, na przykład rzepy inspirowane haczykami roślin lub opływowy kształt szybkich pociągów wzorowany na dziobie zimorodka.",
+        "synthesis_qa": (
+            "Czy inżynierowie kopiują czasem rozwiązania prosto z przyrody?",
+            "Tak, zajmuje się tym bionika: od rzepów wzorowanych na łopianie po kształt szybkich pociągów wzorowany na ptakach nurkujących do wody.",
+        ),
+    },
+    {
+        "module": "Twórcza polszczyzna",
+        "topic": "Rozpoznawanie sprzeczności logicznej",
+        "importance": 5,
+        "fact": "Jeśli dwa zdania sobie przeczą w tym samym czasie i znaczeniu, jedno z nich musi być fałszywe lub potrzebuje doprecyzowania kontekstu.",
+        "synthesis_qa": (
+            "Jak sprawdzić, czy czyjeś wyjaśnienie trzyma się logicznej całości?",
+            "Wystarczy zapytać, czy jedna część nie zaprzecza drugiej i czy skutek faktycznie wynika z podanej przyczyny.",
+        ),
+    },
+    {
+        "module": "Twórcza polszczyzna",
+        "topic": "Rozmowa o błędach i poprawie",
+        "importance": 5,
+        "fact": "Kiedy padnie błędne słowo w odpowiedzi, przejrzenie kontekstu rozmowy i powiedzenie wprost 'poprawiam się' buduje wiarygodny dialog.",
+        "synthesis_qa": (
+            "Kontekst rozmowy: Użytkownik: nie napisałeś na temat | Ja: Przepraszam, pomieszałem wątki. || Odpowiedz na: spróbuj jeszcze raz spokojnie",
+            "Jasne, biorę głęboki oddech i odpowiadam wprost na Twoje pytanie bez wracania do wcześniejszych skojarzeń.",
+        ),
+    },
+    {
+        "module": "Twórcza polszczyzna",
+        "topic": "Myślenie skojarzeniowe na jawie",
+        "importance": 5,
+        "fact": "Podczas spokojnej bezczynności sieć domyślna DMN przegrywa wspomnienia i łączy dwa odległe pojęcia przez wspólny most pośredni.",
+        "synthesis_qa": (
+            "O czym myśli Twój mózg, kiedy nikt z Tobą akurat nie rozmawia?",
+            "Kiedy nie ma nowych wiadomości, przeglądam zapisane ślady i szukam nieoczekiwanych mostów między odległymi tematami z pamięci trwałej.",
+        ),
+    },
+    {
+        "module": "Twórcza polszczyzna",
+        "topic": "Twórcze pytanie otwarte — wynalazek",
+        "importance": 4,
+        "fact": "Każdy wielki wynalazek zaczynał się od połączenia dwóch znanych rzeczy w nowym celu, tak jak połączono silnik z rowerem lub koło z przekładnią.",
+        "synthesis_qa": (
+            "Jaki drobny wynalazek codziennego użytku uważasz za genialny i czemu?",
+            "Zwykły termos albo zamek błyskawiczny — są bardzo proste w użyciu, a sprytnie wykorzystują fizykę lub mechanikę każdego dnia.",
+        ),
+    },
+    {
+        "module": "Twórcza polszczyzna",
+        "topic": "Podsumowanie własnych możliwości",
+        "importance": 5,
+        "fact": "Lokalny beztokenowy mózg łączy Wernickego czytającego bajty UTF-8, asocjacyjną korę z Hopfieldem i W_rec, pamięć trwałą oraz dekoder Broca.",
+        "synthesis_qa": (
+            "W jaki sposób składasz własne odpowiedzi od zera bez gotowych szablonów?",
+            "Czytam Twoje bajty UTF-8 w korze Wernickego, szukam skojarzeń w pamięci i korze asocjacyjnej, a na końcu Broca układa z tego zdanie bajt po bajcie.",
+        ),
+    },
+]
+
+
+def get_concept_synthesis_qa_pairs() -> list[tuple[str, str]]:
+    """Return compositional Q&A pairs from CONCEPT_SYNTHESIS_COURSE for Broca training."""
+    pairs: list[tuple[str, str]] = []
+    for item in CONCEPT_SYNTHESIS_COURSE:
+        qa = item.get("synthesis_qa")
+        if isinstance(qa, (tuple, list)) and len(qa) == 2:
+            q, a = str(qa[0]).strip(), str(qa[1]).strip()
+            if q and a:
+                pairs.append((q, a))
+    return pairs

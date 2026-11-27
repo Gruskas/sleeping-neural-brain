@@ -27,8 +27,10 @@ from .teacher_distill import (
 from .config import BrainConfig
 from .curriculum import (
     BROAD_AUTONOMOUS_SYLLABUS,
+    CONCEPT_SYNTHESIS_COURSE,
     ELEMENTARY_FOUNDATION_PACK,
     ELEMENTARY_WEB_SYLLABUS,
+    get_concept_synthesis_qa_pairs,
 )
 from .hippocampus import Hippocampus
 from .language_cortex import LanguageCortex, _strip_pl
@@ -101,15 +103,15 @@ def normalize_training_pipeline_plan(plan: dict[str, Any] | None, cfg: BrainConf
         },
         "bielik_dialogues": {
             "enabled": bool(bd_in.get("enabled", True)),
-            "num_dialogues": max(0, min(2000, int(bd_in.get("num_dialogues", 300)))),
+            "num_dialogues": max(0, min(2000, int(bd_in.get("num_dialogues", 400)))),
         },
         "bielik_reasoning": {
             "enabled": bool(br_in.get("enabled", True)),
-            "num_samples": max(0, min(1200, int(br_in.get("num_samples", 180)))),
+            "num_samples": max(0, min(1200, int(br_in.get("num_samples", 200)))),
         },
         "dialogue_train": {
             "enabled": bool(dt_in.get("enabled", True)),
-            "epochs": max(1, min(600, int(dt_in.get("epochs", 160)))),
+            "epochs": max(1, min(600, int(dt_in.get("epochs", 65)))),
             "target_loss": max(0.01, min(10.0, float(dt_in.get("target_loss", cfg.broca_dialogue_early_stop_loss)))),
             "freeze_wernicke": freeze_val,
             "train_recalled_columns": bool(dt_in.get("train_recalled_columns", True)),
@@ -118,6 +120,7 @@ def normalize_training_pipeline_plan(plan: dict[str, Any] | None, cfg: BrainConf
             "enabled": bool(kn_in.get("enabled", True)),
             "include_elementary": bool(kn_in.get("include_elementary", True)),
             "include_bielik_facts": bool(kn_in.get("include_bielik_facts", True)),
+            "include_synthesis_course": bool(kn_in.get("include_synthesis_course", True)),
             "turbo_topics": max(0, min(300, int(kn_in.get("turbo_topics", 0)))),
         },
         "sleep": {
@@ -442,10 +445,22 @@ class SleepingBrain:
                 if self._is_busy_for_dmn() or len(self.hippocampus.semantic) < 3:
                     return None
                 bridge = self.hippocampus.sample_2hop_bridge(
-                    min_hop_sim=float(getattr(self.cfg, "dmn_bridge_min_hop_sim", 0.45)),
+                    min_hop_sim=float(getattr(self.cfg, "dmn_bridge_min_hop_sim", 0.32)),
                     max_direct_sim=float(getattr(self.cfg, "dmn_bridge_max_direct_sim", 0.25)),
                     current_day=self.day,
                 )
+                if bridge is None:
+                    bridge = self.hippocampus.sample_2hop_bridge(
+                        min_hop_sim=0.18,
+                        max_direct_sim=0.55,
+                        current_day=self.day,
+                    )
+                if bridge is None:
+                    bridge = self.hippocampus.sample_2hop_bridge(
+                        min_hop_sim=0.0,
+                        max_direct_sim=1.01,
+                        current_day=self.day,
+                    )
             finally:
                 self.lock.release()
 
@@ -637,12 +652,46 @@ class SleepingBrain:
         k = self._wm_slot_count if max_slots is None else min(self._wm_slot_count, max(1, int(max_slots)))
         return self._wm_slot_buf[self._wm_slot_count - k : self._wm_slot_count].unsqueeze(0)
 
+    _NON_TOPIC_WORDS: frozenset[str] = frozenset({
+        "hej", "hejka", "siema", "czesc", "elo", "witaj", "yo", "halo",
+        "git", "spoko", "ok", "okej", "super", "dobrze", "zle", "nic", "cos",
+        "tam", "tutaj", "teraz", "dzis", "dzisiaj", "wczoraj", "jutro",
+        "tobie", "ciebie", "mnie", "ty", "ja", "my", "wy", "ono", "oni", "one",
+        "chyba", "raczej", "tak", "nie", "no", "aha", "ej", "kurwa", "xd", "xddd",
+        "haha", "hehe", "dobra", "niewazne", "serio", "dzieki", "dziekuje",
+    })
+
+    @staticmethod
+    def _is_smalltalk_or_greeting(msg: str) -> bool:
+        """Detect greetings, reciprocal small-talk, and meta-chat so auto_web never scrapes Wikipedia for them."""
+        low = _strip_pl((msg or "").strip().lower()).rstrip("?!., ")
+        if not low:
+            return True
+        greetings = ("siema", "czesc", "hej", "hejka", "elo", "dzien dobry", "dobry wieczor", "witaj", "dobranoc", "pa", "nara", "yo", "halo")
+        if low in greetings or any(low.startswith(g + " ") for g in greetings):
+            return True
+        casual_exact = {
+            "git", "chyba git", "spoko", "ok", "okej", "super", "dobrze", "zle", "niezle",
+            "dzieki", "dziekuje", "haha", "hehe", "xd", "xddd", "dobra", "niewazne",
+            "serio", "nie wiem", "wiem to", "o co chodzi", "nic", "nudzi mi sie",
+        }
+        if low in casual_exact:
+            return True
+        reciprocal_or_meta = (
+            "a jak tobie", "a jak u ciebie", "a u ciebie", "jak tobie", "jak u ciebie",
+            "co u ciebie", "co tam", "jak leci", "jak mija dzien", "co slychac", "jak sie masz",
+            "piszesz", "odpisujesz", "odpowiadasz", "powiedzialem ci", "napisalem ci", "co przed chwila",
+        )
+        return any(f" {cue} " in f" {low} " or low == cue for cue in reciprocal_or_meta)
+
     @staticmethod
     def _is_followup_query(msg: str) -> bool:
         s = msg.strip()
-        low = _strip_pl(s.lower())
-        greetings = ("siema", "czesc", "hej", "hejka", "elo", "dzien dobry", "dobry wieczor", "witaj", "pa", "nara")
-        if low in greetings or any(low.startswith(g + " ") for g in greetings):
+        low = _strip_pl(s.lower()).rstrip("?!., ")
+        if SleepingBrain._is_smalltalk_or_greeting(s):
+            return False
+        non_followup_casual = ("chyba git", "a jak tobie", "a jak u ciebie", "a u ciebie", "a ty", "u ciebie")
+        if any(c in low for c in non_followup_casual):
             return False
         followup_cues = (
             "dlaczego", "czemu", "rozwin", "powiedz wiecej", "wiecej o tym", "a co", "a jak",
@@ -653,18 +702,60 @@ class SleepingBrain:
         return any(low.startswith(c) or f" {c}" in f" {low} " for c in followup_cues)
 
     def _extract_recent_topic(self) -> str:
-        """Extract the active subject/topic from the most recent turns in working_chat."""
+        """Extract the active subject/topic from the most recent substantive turn in working_chat."""
         with self.lock:
-            recent = list(self.working_chat[-4:])
+            recent = list(self.working_chat[-6:])
         for m in reversed(recent):
             if m.get("role") != "user":
                 continue
             raw = str(m.get("content", "")).strip()
-            if not raw or self._is_followup_query(raw):
+            if not raw or self._is_smalltalk_or_greeting(raw) or self._is_followup_query(raw):
                 continue
             cand = clean_search_query(raw)
-            if 2 <= len(cand) <= 50 and len(cand.split()) <= 5:
+            words = [w for w in _strip_pl(cand.lower()).split() if w]
+            if len(cand) < 3 or len(words) > 5:
+                continue
+            if all(w in self._NON_TOPIC_WORDS for w in words):
+                continue
+            if self._is_factual_web_query(raw) or (
+                len(cand) >= 4 and any(w not in self._NON_TOPIC_WORDS for w in words)
+            ):
                 return cand
+        return ""
+
+    def _build_conversation_context_text(
+        self,
+        current_msg: str,
+        max_turns: int = 3,
+        max_chars: int = 440,
+    ) -> str:
+        """Build a bounded multi-turn prompt wrapping recent working_chat turns + current message."""
+        cur = (current_msg or "").strip()
+        if not cur:
+            return ""
+        with self.lock:
+            recent = list(self.working_chat[-(max_turns * 2 + 1) :])
+        if recent and recent[-1].get("role") == "user" and str(recent[-1].get("content", "")).strip() == cur:
+            recent = recent[:-1]
+        recent = recent[-(max_turns * 2) :]
+        if not recent:
+            return ""
+
+        segments: list[str] = []
+        for item in recent:
+            role = "Użytkownik" if item.get("role") == "user" else "Ja"
+            txt = re.sub(r"\s+", " ", str(item.get("content", "")).strip())
+            if not txt:
+                continue
+            if len(txt) > 110:
+                txt = txt[:107].rstrip() + "..."
+            segments.append(f"{role}: {txt}")
+
+        while segments:
+            joined = f"Kontekst rozmowy: {' | '.join(segments)} || Odpowiedz na: {cur}"
+            if len(joined) <= max_chars:
+                return joined
+            segments.pop(0)
         return ""
 
     @staticmethod
@@ -884,6 +975,207 @@ class SleepingBrain:
         finally:
             if not _from_nested:
                 self._release_op("study")
+
+    def _sample_parquet_replay_pairs(self, limit: int = 240) -> list[tuple[str, str]]:
+        """Sample Polish prose context->continuation pairs from approved Parquet corpora for anti-forgetting replay."""
+        if limit <= 0:
+            return []
+        try:
+            paths = self._approved_parquet_paths()
+        except Exception:
+            paths = []
+        if not paths:
+            return []
+        pairs: list[tuple[str, str]] = []
+        try:
+            for src_s, tgt_s in iter_parquet_polish_pairs(paths, max_pairs=limit * 2, shuffle=True):
+                q_s = str(src_s).strip()[:220]
+                a_s = str(tgt_s).strip()[:260]
+                if len(q_s) >= 8 and len(a_s) >= 12:
+                    pairs.append((q_s, a_s))
+                    if len(pairs) >= limit:
+                        break
+        except Exception:
+            pass
+        return pairs
+
+    def _ingest_synthesis_course_facts(self) -> int:
+        with self.lock:
+            already_done = "kurs wiedzy i łączenia pojęć" in self.hippocampus.studied_topics
+        if already_done:
+            return 0
+        texts = [str(item["fact"]) for item in CONCEPT_SYNTHESIS_COURSE]
+        imps = [int(item.get("importance", 4)) for item in CONCEPT_SYNTHESIS_COURSE]
+        ids = self._ingest_sensory_texts(
+            texts=texts,
+            category="wiedza",
+            importances=imps,
+            topic="Kurs Wiedzy i Łączenia Pojęć",
+            pinned_flags=[imp >= 4 for imp in imps],
+        )
+        added = len(ids)
+        with self.lock:
+            self.hippocampus.studied_topics["kurs wiedzy i łączenia pojęć"] = {
+                "topic": "Kurs Wiedzy i Łączenia Pojęć",
+                "mastery": 95.0,
+                "facts_learned": added,
+                "pages_read": 0,
+                "day": self.day,
+                "summary": "60 modułów przyczynowo-skutkowych, analogii i twórczego łączenia pojęć.",
+                "sources": [],
+            }
+            self._log("STUDY", f"🎓 Zasilono Hipokamp kursem łączenia pojęć (+{added} engramów SDR).")
+        return added
+
+    def run_concept_synthesis_course(
+        self,
+        consolidate: bool = True,
+        epochs: int = 35,
+        _op_acquired: bool = False,
+        _from_nested: bool = False,
+    ) -> dict[str, Any]:
+        """Run the 60-module Concept Synthesis & Compositional Fluency course."""
+        if not _op_acquired and not _from_nested:
+            self._acquire_op("study")
+        eff_epochs = max(1, int(epochs))
+        with self.lock:
+            self.state_mode = "STUDYING"
+            self.study_state = {
+                "active": True,
+                "topic": "🎓 Kurs Wiedzy i Łączenia Pojęć (60 modułów)",
+                "round": 0,
+                "max_rounds": eff_epochs,
+                "mastery": 10.0,
+                "pages_read": 0,
+                "facts_learned": 0,
+                "current_action": "Koduję 60 faktów i analogii do Hipokampu oraz W_rec...",
+                "sources": [],
+                "summary": "",
+            }
+        try:
+            import random
+            from .language_trainer import build_dialogue_qa_pairs
+
+            added_facts = self._ingest_synthesis_course_facts()
+            course_qa = get_concept_synthesis_qa_pairs()
+            base_pool = build_dialogue_qa_pairs(include_curriculum=True, min_chars=2)
+            base_sample = random.sample(base_pool, k=min(90, len(base_pool))) if base_pool else []
+            merged_pairs = course_qa + list(self.language_cortex._learned_qa_replay[-40:]) + base_sample
+            pq_replay = self._sample_parquet_replay_pairs(limit=120)
+            with self.lock:
+                engram_bank = self.hippocampus.get_hopfield_bank()
+                self.study_state["facts_learned"] = added_facts
+                self.study_state["mastery"] = 35.0
+                self.study_state["current_action"] = (
+                    f"Trenuję łączenie pojęć ({len(merged_pairs)} par + {len(pq_replay)} próbek Parquet)..."
+                )
+
+            def _on_course_prog(st: dict[str, Any]) -> None:
+                ep = int(st.get("epoch", 0))
+                tot = max(1, int(st.get("total_epochs", eff_epochs)))
+                loss_n = float(st.get("loss_now", 0.0))
+                pct = 35.0 + 55.0 * (ep / tot)
+                with self.lock:
+                    self.study_state["round"] = ep
+                    self.study_state["max_rounds"] = tot
+                    self.study_state["mastery"] = round(min(92.0, pct), 1)
+                    self.study_state["current_action"] = f"Kurs łączenia pojęć · Epoka {ep}/{tot} · loss {loss_n:.2f}"
+                    if st.get("fresh_probe") and st.get("sample_q"):
+                        self._push_training_dialogue(
+                            mode="dialogue_train",
+                            tag=f"Kurs pojęć {ep}/{tot} · loss {loss_n:.2f}",
+                            prompt_role="Pytanie",
+                            prompt=str(st["sample_q"]),
+                            teacher_role="Wzorzec",
+                            teacher_reply=str(st.get("sample_target", "")),
+                            brain_role="Twój mózg (na żywo)",
+                            brain_reply=str(st.get("sample_brain", "")) or "(odpowiada...)",
+                        )
+
+            train_res = self.language_cortex.train_dialogue_finetune(
+                pairs=merged_pairs,
+                cortex=self.cortex,
+                engram_bank=engram_bank,
+                epochs=eff_epochs,
+                lr=self.cfg.broca_dialogue_lr,
+                label_smoothing=self.cfg.broca_dialogue_label_smoothing,
+                early_stop_loss=self.cfg.broca_dialogue_early_stop_loss,
+                register_questions=False,
+                progress_callback=_on_course_prog,
+                stop_event=self._study_stop_event,
+                priority_probe_pairs=course_qa,
+                freeze_wernicke=self.language_cortex.broca_module.trained_steps > 0,
+                train_recalled_columns=True,
+                train_working_memory=True,
+                parquet_replay_pairs=pq_replay,
+            )
+            self.language_cortex._register_known_questions([q for q, _ in course_qa], replace=False)
+            self.language_cortex.ensure_familiarity_bank(force_rebuild=False)
+
+            dmn_thoughts_made = 0
+            if consolidate and len(self.hippocampus.semantic) < 3 and len(self.hippocampus.short_term) > 0:
+                self.sleep_now(visual_pacing=False, _from_nested=True)
+            if consolidate and len(self.hippocampus.semantic) >= 3:
+                for _ in range(2):
+                    res_dmn = self.run_dmn_2hop_step(non_blocking=False)
+                    if res_dmn and res_dmn.get("accepted"):
+                        dmn_thoughts_made += 1
+
+            with self.lock:
+                total_sem = len(self.hippocampus.semantic)
+                msg = (
+                    f"🎓 Zakończono **Kurs Wiedzy i Łączenia Pojęć** (+{added_facts} engramów, "
+                    f"loss {train_res.get('loss_start', 0)}→{train_res.get('loss_end', 0)}, "
+                    f"mostów DMN: +{dmn_thoughts_made})."
+                )
+                self.study_state["mastery"] = 100.0
+                self.study_state["current_action"] = msg
+                self._log("STUDY", msg)
+                if not _from_nested:
+                    self._append_chat(
+                        "assistant",
+                        msg,
+                        meta={"kind": "study_done", "topic": "Kurs Wiedzy i Łączenia Pojęć", "facts": added_facts},
+                        add_to_working=False,
+                    )
+            self.save_state()
+            return {
+                "added_facts": added_facts,
+                "course_pairs": len(course_qa),
+                "parquet_replay": len(pq_replay),
+                "dmn_thoughts_made": dmn_thoughts_made,
+                "total_semantic": total_sem,
+                "train_result": train_res,
+            }
+        finally:
+            if not _from_nested:
+                with self.lock:
+                    self.study_state["active"] = False
+                    self.study_state["current_action"] = ""
+                    if self.state_mode == "STUDYING":
+                        self.state_mode = "AWAKE"
+                if not _op_acquired:
+                    self._release_op("study")
+
+    def start_concept_synthesis_course_async(self) -> dict[str, Any]:
+        self._acquire_op("study")
+        with self.lock:
+            self._study_stop_event.clear()
+            self.training_dialogue_feed.clear()
+            self.state_mode = "STUDYING"
+        try:
+            t = threading.Thread(
+                target=self.run_concept_synthesis_course,
+                kwargs={"consolidate": True, "_op_acquired": True, "_from_nested": False},
+                daemon=True,
+            )
+            t.start()
+        except Exception:
+            with self.lock:
+                self.state_mode = "AWAKE"
+            self._release_op("study")
+            raise
+        return {"started": True, "topic": "Kurs Wiedzy i Łączenia Pojęć"}
 
     def start_curriculum_async(self, deep_web: bool = False, max_topics: int = 12) -> dict[str, Any]:
         if not deep_web:
@@ -3110,6 +3402,9 @@ class SleepingBrain:
                                     )
                             _sync_stage(idx, pct, summary=f"{phase_lbl} {ep}/{tot} · loss {loss_s:.2f}→{loss_n:.2f}")
 
+                        pq_replay = self._sample_parquet_replay_pairs(
+                            limit=min(400, max(100, len(combined_pairs) // 2))
+                        )
                         res_dt = self.language_cortex.train_language_cortex(
                             extra_qa_pairs=combined_pairs or None,
                             epochs=dt_cfg["epochs"],
@@ -3122,6 +3417,7 @@ class SleepingBrain:
                             early_stop_loss=dt_cfg["target_loss"],
                             freeze_wernicke=eff_freeze,
                             train_recalled_columns=dt_cfg["train_recalled_columns"],
+                            parquet_replay_pairs=pq_replay,
                         )
                         self.language_cortex.ensure_familiarity_bank(force_rebuild=True)
                         stage_results["dialogue_train"] = res_dt
@@ -3139,7 +3435,13 @@ class SleepingBrain:
                             added_el = int(el_res.get("added_facts", 0))
                             added_total += added_el
                             parts_note.append(f"Szkoła +{added_el}")
-                            _sync_stage(idx, 35.0, summary=" · ".join(parts_note))
+                            _sync_stage(idx, 25.0, summary=" · ".join(parts_note))
+
+                        if kn_cfg.get("include_synthesis_course", True) and not self._study_stop_event.is_set():
+                            added_course = self._ingest_synthesis_course_facts()
+                            added_total += added_course
+                            parts_note.append(f"Kurs pojęć +{added_course}")
+                            _sync_stage(idx, 45.0, summary=" · ".join(parts_note))
 
                         if kn_cfg["include_bielik_facts"] and not self._study_stop_event.is_set():
                             t_pairs = load_teacher_dialogues(self.state_dir)
@@ -3158,7 +3460,7 @@ class SleepingBrain:
                                 added_f = int(ing_res.get("engrams_added", 0))
                                 added_total += added_f
                                 parts_note.append(f"Fakty Bielika +{added_f}")
-                            _sync_stage(idx, 65.0, summary=" · ".join(parts_note))
+                            _sync_stage(idx, 70.0, summary=" · ".join(parts_note))
 
                         if kn_cfg["turbo_topics"] > 0 and not self._study_stop_event.is_set():
                             tb_res = self.run_turbo_learn(
@@ -3444,22 +3746,31 @@ class SleepingBrain:
                 focus_recent=is_followup,
             )
 
-        # Apply PFC Working Memory SDR on contextual follow-ups and novel short replies so the brain
+        # Apply PFC Working Memory SDR on contextual follow-ups and conversation turns so the brain
         # genuinely carries conversation context without contaminating standalone factual questions.
-        if wm_sdr is not None and q_fam < 0.78 and (is_followup or len(msg) <= 24):
-            wm_weight = 0.28 if is_followup else 0.22
+        if wm_sdr is not None and q_fam < 0.82:
+            wm_weight = 0.28 if is_followup else 0.16
         else:
             wm_weight = 0.0
 
-        # Auto-sieć: encyclopedic/factual queries AND contextual follow-ups on the active topic
-        # (e.g. 'skąd się oni biorą?' right after 'co to jest gej?'), strictly using Polish Wikipedia
-        # + Wiktionary and learning into Hippocampus SDR + neural Broca weights via adapt_qa_online!
+        # Auto-sieć: encyclopedic/factual queries AND contextual follow-ups on a substantive active topic
+        # (never triggered on greetings, reciprocal small-talk, or meta-conversational messages!).
         auto_web_note = ""
         auto_web_adapted = False
+        is_factual_q = self._is_factual_web_query(msg)
+        is_smalltalk = self._is_smalltalk_or_greeting(msg)
         recent_topic = self._extract_recent_topic() if is_followup else ""
-        can_auto_web = self.auto_web and q_fam < 0.78 and not conv_pairs and (
-            self._is_factual_web_query(msg)
-            or (is_followup and bool(recent_topic) and len(msg.strip()) >= 5)
+        ctx_text = self._build_conversation_context_text(msg)
+        has_recent_chat = bool(ctx_text)
+        can_auto_web = (
+            self.auto_web
+            and q_fam < 0.78
+            and not conv_pairs
+            and not is_smalltalk
+            and (
+                is_factual_q
+                or (is_followup and bool(recent_topic) and len(msg.strip()) >= 5)
+            )
         )
         if can_auto_web:
             try:
@@ -3491,8 +3802,8 @@ class SleepingBrain:
 
                 if docs:
                     best_doc = next((d for d in docs if d.source.startswith("wikipedia_")), docs[0])
-                    raw_lead = extract_contextual_answer(best_doc, msg, max_chars=220) or extract_lead_definition(best_doc)
-                    lead = _short_answer_from_fact(raw_lead, max_chars=215) if raw_lead else ""
+                    raw_lead = extract_contextual_answer(best_doc, msg, max_chars=420) or extract_lead_definition(best_doc)
+                    lead = _short_answer_from_fact(raw_lead, max_chars=420) if raw_lead else ""
                     if lead and len(lead) >= 24 and not lead.endswith("?") and not is_web_boilerplate(lead):
                         self._ingest_sensory_texts(
                             [lead], category="nauka_z_sieci", importances=[4], topic=used_query, source_url=best_doc.url
@@ -3556,22 +3867,45 @@ class SleepingBrain:
             except Exception:
                 hippo_best_sim = 0.0
 
-        # Unknown / out-of-distribution gate (100% neural Broca decoding, zero hardcoded replies):
+        # Tiered uncertainty / OOD gate (100% neural Broca decoding):
+        # Allow open-ended, hypothetical, creative, and multi-turn conversational questions into System-2
+        # deliberation; block only hard gibberish, unknown factual queries, and unknown direct personal queries.
         ood_note = ""
         critique_notes: list[str] = []
         used_temp = temp
         has_fam_bank = self.language_cortex._known_q_sdrs.shape[0] > 0
         alpha_ratio = sum(1 for ch in msg if ch.isalpha()) / float(max(1, len(msg)))
-        looks_gibberish = (alpha_ratio < 0.45 and len(msg) >= 6) or (
+        low_q = f" {_strip_pl(msg.lower())} "
+        is_hard_gibberish = (alpha_ratio < 0.45 and len(msg) >= 6) or (
             has_fam_bank
-            and q_fam < 0.72
-            and hippo_best_sim < 0.70
+            and q_fam < 0.22
+            and hippo_best_sim < 0.28
+            and not conv_pairs
+            and not auto_web_adapted
+            and not has_recent_chat
+        )
+        direct_personal_cues = (
+            "jak mam na imie", "ile mam lat", "gdzie mieszkam", "co o mnie wiesz",
+            "kim jestem", "jaki jest moj", "jaka jest moja", "jakie jest moje",
+        )
+        is_direct_personal_q = (
+            any(cue in low_q for cue in direct_personal_cues)
+            and q_fam < 0.65
+            and hippo_best_sim < 0.62
+        )
+        is_unknown_fact = (
+            is_factual_q
+            and has_fam_bank
+            and q_fam < 0.62
+            and hippo_best_sim < 0.60
             and not conv_pairs
             and not auto_web_adapted
         )
+        looks_gibberish = is_hard_gibberish or is_unknown_fact or (
+            has_fam_bank and is_direct_personal_q and not conv_pairs
+        )
         if looks_gibberish:
-            low_q = f" {_strip_pl(msg.lower())} "
-            is_personal_q = any(
+            is_personal_q = is_direct_personal_q or any(
                 w in low_q for w in (" moj ", " moja ", " moje ", " mojego ", " mojej ", " moim ", " mnie ", " u mnie ")
             )
             ood_cue = "__nieznane_pytanie__"
@@ -3590,9 +3924,7 @@ class SleepingBrain:
             ood_note = f"Nowy temat (q_fam={q_fam:.2f}, hippo={hippo_best_sim:.2f}) → 100% neuronowa odpowiedź Broki ({ood_cue})"
         else:
             # System-2 batched parallel deliberation + Auditory Self-Hearing & Active Self-Correction
-            # Only inject PFC working-memory turn slots when wm_weight > 0 (follow-up queries),
-            # so standalone greetings/questions match their clean training Z_ctx distribution!
-            rehearsal_bytes = min(240, self.cfg.broca_max_new_bytes)
+            rehearsal_bytes = min(768, self.cfg.broca_max_new_bytes)
             eff_living_blend = 0.02 if q_fam >= 0.78 else 0.08
             delib = self.language_cortex.deliberate_and_critique(
                 user_message=msg,
@@ -3608,15 +3940,33 @@ class SleepingBrain:
                 living_blend=eff_living_blend,
                 neuromod=lb_neuromod,
                 living_telemetry=lb_tel,
-                working_memory_slots=wm_slots if wm_weight > 0.0 else None,
+                working_memory_slots=wm_slots if (wm_slots is not None and q_fam < 0.85) else None,
+                context_user_message=ctx_text if (ctx_text and q_fam < 0.82) else None,
             )
             w_out = delib["w_out"]
             thought = delib["thought"]
             used_temp = float(delib["temperature"])
             critique_notes = list(delib["critique_notes"])
 
-            # Neural self-critique safeguard: ONLY reject if Broca itself cannot form a coherent Polish sentence
-            if has_fam_bank and (delib["avg_nll"] > 1.45 or delib["score"] < 0.50) and q_fam < 0.78:
+            # Post-deliberation safeguard: reject off-topic / overconfident mashups when coherence is low
+            should_reject = False
+            align = float(delib.get("alignment", 0.0))
+            nll = float(delib.get("avg_nll", 5.0))
+            if has_fam_bank and q_fam < 0.72:
+                overconfident_offtopic = (
+                    (q_fam < 0.68 and align < 0.26 and nll < 0.45)
+                    or (q_fam < 0.62 and align < 0.22)
+                )
+                if is_factual_q:
+                    should_reject = (nll > 1.55) or (delib["score"] < 0.48) or overconfident_offtopic
+                else:
+                    should_reject = (
+                        (nll > 2.20)
+                        or (delib["quality"] < 0.50)
+                        or (delib["score"] < 0.35)
+                        or overconfident_offtopic
+                    )
+            if should_reject:
                 _, thought, stream_iter = self.language_cortex.think_and_stream(
                     user_message="__nieznane_pytanie__",
                     cortex=self.cortex,
@@ -3624,7 +3974,10 @@ class SleepingBrain:
                     temperature=min(temp, 0.55),
                     max_new_bytes=self.cfg.broca_max_new_bytes,
                 )
-                ood_note = f"Samokrytyka odrzuciła niespójny szkic (NLL={delib['avg_nll']:.2f}) → stan niepewności"
+                ood_note = (
+                    f"Samokrytyka odrzuciła niespójny szkic "
+                    f"(align={align:.2f}, NLL={nll:.2f}) → stan niepewności"
+                )
             else:
                 # Stream the exact self-heard & self-corrected reply (zero wasted 4th unverified pass!)
                 draft = delib["draft"]
@@ -4731,5 +5084,14 @@ class SleepingBrain:
                 "sleep_history": self.sleep_history[-15:],
                 "event_log": self.event_log[-35:],
                 "dmn_thoughts": self.dmn_thoughts[-25:],
+                "dmn_status": {
+                    "enabled": bool(getattr(self.cfg, "dmn_enabled", True)),
+                    "thinking_now": self._dmn_running.is_set(),
+                    "idle_seconds": round(max(0.0, time.monotonic() - self._last_user_activity_ts), 1),
+                    "idle_delay_sec": float(getattr(self.cfg, "idle_think_delay_sec", 25.0)),
+                    "interval_sec": float(getattr(self.cfg, "dmn_think_interval_sec", 25.0)),
+                    "semantic_count": len(self.hippocampus.semantic),
+                    "total_thoughts": len(self.dmn_thoughts),
+                },
                 "training_dialogue_feed": self.training_dialogue_feed[-80:],
             }

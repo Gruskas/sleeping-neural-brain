@@ -199,7 +199,7 @@ class SleepEngine:
                 for i in range(rem_cols.shape[0]):
                     gen = self.language_cortex.decode_columns(
                         rem_cols[i : i + 1],
-                        max_new_bytes=72,
+                        max_new_bytes=160,
                         temperature=min(0.92, max(0.78, self.cfg.broca_temperature + 0.05)),
                     )
                     decoded_rem_labels.append(gen["text"] or "REM-attractor")
