@@ -3217,6 +3217,15 @@ class SleepingBrain:
 
             self.cortex.import_state(weights["cortex"])
             self.language_cortex.import_state(weights["language_cortex"])
+            broca_rep = getattr(self.language_cortex._broca_raw, "last_import_report", None)
+            if broca_rep and (broca_rep.get("mismatched") or broca_rep.get("missing") or broca_rep.get("unexpected")):
+                self._log(
+                    "INIT",
+                    f"Migracja BrocaByteTransformer (MoE): wczytano {len(broca_rep['loaded'])} tensorów, "
+                    f"pominięto niezgodne kształty={len(broca_rep['mismatched'])}, "
+                    f"zainicjalizowano nowe={len(broca_rep['missing'])}, "
+                    f"pominięto stare={len(broca_rep['unexpected'])}.",
+                )
             self.hippocampus.import_state(weights["hippocampus_engrams"], meta.get("hippocampus_meta", {}))
             if "living_brain" in weights:
                 self.living_brain.import_state(weights["living_brain"])

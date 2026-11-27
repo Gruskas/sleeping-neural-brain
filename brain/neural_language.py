@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import codecs
+import logging
 import math
 from typing import Any, Iterator
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+_logger = logging.getLogger(__name__)
 
 from .config import BrainConfig
 from .sensory_wernicke import (
@@ -27,20 +30,229 @@ _precompute_rope = precompute_rope
 _apply_rope = apply_rope
 
 
+class _ContiguousGrad(torch.autograd.Function):
+    """Ensure upstream grad_output is contiguous before entering fused F.grouped_mm backward."""
+
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+        return grad_output.contiguous()
+
+
+def _grouped_mm_bf16(mat_a: torch.Tensor, mat_b: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
+    out = F.grouped_mm(mat_a.contiguous(), mat_b.contiguous(), offs=offs)
+    return _ContiguousGrad.apply(out)
+
+
+class SparseMoEFFN(nn.Module):
+    """
+    Sparse Mixture-of-Experts SwiGLU FFN (8 experts, top-2 router):
+      - Router (D -> E), softmax, top-k renormalization (sum=1.0), Switch Transformer load-balancing
+        aux_loss, and ST-MoE router z_loss execute strictly in float32 for numerical stability.
+      - Experts are E independent SwiGLU blocks stored as stacked 3D weight tensors
+        w_gate_up [E, D, 2*H] and w_down [E, H, D] running in native bfloat16 on CUDA.
+      - Zero CPU-GPU synchronization dispatch:
+          * Small-N inference fast path (T=1 in generate_stream / generate_batch when N*K < E):
+            gathers ONLY the selected active expert slices and executes batched bmm with zero sorting.
+          * Grouped GPU path (CUDA bfloat16): sorts token assignments on GPU via argsort, builds
+            exclusive/inclusive expert offsets via scatter_add_ + cumsum, runs fused F.grouped_mm
+            strictly on assigned tokens, and scatters router-weighted outputs via index_add_.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        expert_dim: int,
+        num_experts: int = 8,
+        top_k: int = 2,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        self.expert_dim = int(expert_dim)
+        self.num_experts = max(1, int(num_experts))
+        self.top_k = max(1, min(int(top_k), self.num_experts))
+
+        self.router = nn.Linear(self.dim, self.num_experts, bias=False)
+        self.w_gate_up = nn.Parameter(torch.empty(self.num_experts, self.dim, self.expert_dim * 2))
+        self.w_down = nn.Parameter(torch.empty(self.num_experts, self.expert_dim, self.dim))
+        self.dropout = nn.Dropout(dropout)
+
+        # Latest detached routing load stats (GPU tensors, zero CPU-GPU sync)
+        self.last_expert_fractions: torch.Tensor | None = None
+        self.last_expert_counts: torch.Tensor | None = None
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.router.weight, mean=0.0, std=0.02)
+        bound_in = 1.0 / math.sqrt(self.dim)
+        bound_hid = 1.0 / math.sqrt(self.expert_dim)
+        nn.init.uniform_(self.w_gate_up, -bound_in, bound_in)
+        nn.init.uniform_(self.w_down, -bound_hid, bound_hid)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_mask: torch.Tensor | None = None,
+        compute_aux: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        orig_shape = x.shape
+        orig_dtype = x.dtype
+        d = orig_shape[-1]
+        x_flat = x.reshape(-1, d)  # [N, D]
+        n_tokens = x_flat.shape[0]
+        device = x_flat.device
+        e_num = self.num_experts
+        k = self.top_k
+
+        if n_tokens == 0:
+            zero = torch.zeros((), device=device, dtype=torch.float32)
+            return x, zero, zero
+
+        # 1) Router strictly in float32 (even under bfloat16 autocast)
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            router_logits = F.linear(x_flat.float(), self.router.weight.float())  # [N, E]
+            router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float32)  # [N, E]
+            topk_probs, topk_idx = torch.topk(router_probs, k=k, dim=-1, sorted=False)  # [N, K]
+            topk_weights = topk_probs / topk_probs.sum(dim=-1, keepdim=True).clamp(min=1e-9)  # [N, K], sum=1.0
+
+            if compute_aux:
+                flat_idx = topk_idx.reshape(-1)  # [N * K]
+                if token_mask is not None:
+                    valid_tok = token_mask.reshape(-1).to(device=device, dtype=torch.float32)  # [N]
+                    valid_denom = valid_tok.sum().clamp(min=1.0)
+                    p_i = (router_probs * valid_tok.unsqueeze(-1)).sum(dim=0) / valid_denom
+                    slot_valid = valid_tok.unsqueeze(1).expand(-1, k).reshape(-1)
+                    counts_f = torch.zeros((e_num,), device=device, dtype=torch.float32)
+                    counts_f.scatter_add_(0, flat_idx, slot_valid)
+                    f_i = counts_f / (valid_denom * float(k))
+                    z_loss = (torch.logsumexp(router_logits, dim=-1).pow(2) * valid_tok).sum() / valid_denom
+                else:
+                    p_i = router_probs.mean(dim=0)
+                    counts_f = torch.zeros((e_num,), device=device, dtype=torch.float32)
+                    counts_f.scatter_add_(
+                        0,
+                        flat_idx,
+                        torch.ones((flat_idx.shape[0],), device=device, dtype=torch.float32),
+                    )
+                    f_i = counts_f / float(n_tokens * k)
+                    z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
+
+                # Standard Switch Transformer load-balancing loss: E * sum_i(f_i * P_i)
+                aux_loss = float(e_num) * torch.sum(f_i.detach() * p_i)
+                self.last_expert_fractions = f_i.detach()
+                self.last_expert_counts = counts_f.detach()
+            else:
+                aux_loss = torch.zeros((), device=device, dtype=torch.float32)
+                z_loss = torch.zeros((), device=device, dtype=torch.float32)
+
+        # 2) Expert execution in native bfloat16 on CUDA (or input dtype on CPU)
+        use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
+        work_dtype = torch.bfloat16 if use_bf16 else (orig_dtype if orig_dtype.is_floating_point else torch.float32)
+        x_work = x_flat if x_flat.dtype == work_dtype else x_flat.to(dtype=work_dtype)
+        flat_experts = topk_idx.reshape(-1)  # [M], M = N * K
+
+        # Fast path A: single-step / small-batch inference (N*K < E) -> zero sorting, touch only active experts
+        if (not self.training) and (n_tokens * k < e_num):
+            w_gu_sel = self.w_gate_up.index_select(0, flat_experts)
+            if w_gu_sel.dtype != work_dtype:
+                w_gu_sel = w_gu_sel.to(dtype=work_dtype)
+            w_dn_sel = self.w_down.index_select(0, flat_experts)
+            if w_dn_sel.dtype != work_dtype:
+                w_dn_sel = w_dn_sel.to(dtype=work_dtype)
+            x_exp = x_work.unsqueeze(1).expand(n_tokens, k, d).reshape(n_tokens * k, 1, d)
+            gu = torch.bmm(x_exp, w_gu_sel)  # [M, 1, 2*H]
+            gate, up = gu.chunk(2, dim=-1)
+            hid = F.silu(gate) * up
+            y_exp = torch.bmm(hid, w_dn_sel).view(n_tokens, k, d)
+            out_flat = (y_exp * topk_weights.to(dtype=work_dtype).unsqueeze(-1)).sum(dim=1)
+
+        # Fast path B: CUDA bfloat16 fused grouped GEMM (zero CPU-GPU sync, exact token grouping)
+        elif (
+            use_bf16
+            and hasattr(F, "grouped_mm")
+            and (self.dim % 8 == 0)
+            and (self.expert_dim % 8 == 0)
+        ):
+            order = torch.argsort(flat_experts, stable=False)
+            sorted_experts = flat_experts.index_select(0, order)
+            token_indices = torch.div(order, k, rounding_mode="floor")
+            sorted_x = x_work.index_select(0, token_indices).contiguous()
+
+            counts_i32 = torch.zeros((e_num,), device=device, dtype=torch.int32)
+            counts_i32.scatter_add_(
+                0,
+                sorted_experts,
+                torch.ones((sorted_experts.shape[0],), device=device, dtype=torch.int32),
+            )
+            offs = counts_i32.cumsum(dim=0, dtype=torch.int32)
+
+            w_gu = self.w_gate_up if self.w_gate_up.dtype == work_dtype else self.w_gate_up.to(dtype=work_dtype)
+            w_dn = self.w_down if self.w_down.dtype == work_dtype else self.w_down.to(dtype=work_dtype)
+
+            gu = _grouped_mm_bf16(sorted_x, w_gu, offs)
+            gate, up = gu.chunk(2, dim=-1)
+            hid = self.dropout(F.silu(gate) * up)
+            sorted_out = _grouped_mm_bf16(hid, w_dn, offs)
+
+            sorted_w = topk_weights.reshape(-1).index_select(0, order).to(dtype=work_dtype).unsqueeze(-1)
+            out_flat = torch.zeros((n_tokens, d), device=device, dtype=work_dtype)
+            out_flat.index_add_(0, token_indices, sorted_out * sorted_w)
+
+        # Fallback path C: CPU / non-bf16 / non-8-aligned dims (grouped by expert, no token loops)
+        else:
+            out_flat = torch.zeros((n_tokens, d), device=device, dtype=work_dtype)
+            flat_tok = torch.arange(n_tokens, device=device).unsqueeze(1).expand(-1, k).reshape(-1)
+            flat_w = topk_weights.reshape(-1).to(dtype=work_dtype)
+            w_gu = self.w_gate_up if self.w_gate_up.dtype == work_dtype else self.w_gate_up.to(dtype=work_dtype)
+            w_dn = self.w_down if self.w_down.dtype == work_dtype else self.w_down.to(dtype=work_dtype)
+            for e in range(e_num):
+                sel = (flat_experts == e).nonzero(as_tuple=False).squeeze(-1)
+                if sel.numel() == 0:
+                    continue
+                tok_e = flat_tok.index_select(0, sel)
+                xe = x_work.index_select(0, tok_e)
+                gu = xe @ w_gu[e]
+                gate, up = gu.chunk(2, dim=-1)
+                hid = self.dropout(F.silu(gate) * up)
+                ye = hid @ w_dn[e]
+                out_flat.index_add_(0, tok_e, ye * flat_w.index_select(0, sel).unsqueeze(-1))
+
+        out = out_flat.view(orig_shape)
+        if out.dtype != orig_dtype:
+            out = out.to(dtype=orig_dtype)
+        return out, aux_loss, z_loss
+
+
 class _BrocaDecoderBlock(nn.Module):
     """
     Parallel Byte-Patching Transformer Decoder Block:
       - RMSNorm + Causal Self-Attention (RoPE + F.scaled_dot_product_attention / FlashAttention)
       - RMSNorm + Cross-Attention EXCLUSIVELY over the 16 cortical columns Z* in R^{B x 16 x D}
-      - RMSNorm + SwiGLU FFN
+      - RMSNorm + SparseMoEFFN (8 experts, top-2) or dense SwiGLU FFN
       - Dropout = 0.2 anti-memorization regularization
     """
 
-    def __init__(self, dim: int, col_dim: int, n_heads: int, ff_dim: int, dropout: float = 0.2) -> None:
+    def __init__(
+        self,
+        dim: int,
+        col_dim: int,
+        n_heads: int,
+        ff_dim: int,
+        dropout: float = 0.2,
+        use_moe: bool = False,
+        num_experts: int = 8,
+        moe_top_k: int = 2,
+        moe_expert_dim: int = 1152,
+    ) -> None:
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
         self.dropout_p = dropout
+        self.use_moe = bool(use_moe)
 
         # 1) Causal Self-Attention
         self.norm1 = RMSNorm(dim)
@@ -59,9 +271,18 @@ class _BrocaDecoderBlock(nn.Module):
         self.film_proj = nn.Linear(col_dim, dim * 2, bias=True)
         nn.init.zeros_(self.film_proj.bias)
 
-        # 3) SwiGLU FFN
+        # 3) Sparse MoE FFN (or dense SwiGLU fallback when broca_use_moe=False)
         self.norm3 = RMSNorm(dim)
-        self.ff = SwiGLU(dim, ff_dim, dropout=dropout)
+        if self.use_moe:
+            self.ff: nn.Module = SparseMoEFFN(
+                dim=dim,
+                expert_dim=moe_expert_dim,
+                num_experts=num_experts,
+                top_k=moe_top_k,
+                dropout=dropout,
+            )
+        else:
+            self.ff = SwiGLU(dim, ff_dim, dropout=dropout)
         self.drop3 = nn.Dropout(dropout)
 
     def precompute_cross_kv(self, memory_columns: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -89,7 +310,9 @@ class _BrocaDecoderBlock(nn.Module):
         film_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         cache_pos: int | None = None,
         memory_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        token_mask: torch.Tensor | None = None,
+        compute_aux: bool = True,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
         b, t, d = x.shape
 
         # 1) Causal self-attention with RoPE + SDPA (supports zero-alloc static KV buffer when cache_pos is set)
@@ -164,9 +387,16 @@ class _BrocaDecoderBlock(nn.Module):
             scale, shift = self.precompute_film(z_summary)
         x = x * scale + shift
 
-        # 3) SwiGLU FFN
-        x = x + self.drop3(self.ff(self.norm3(x)))
-        return x, new_self_kv
+        # 3) Sparse MoE FFN (or dense SwiGLU)
+        h3 = self.norm3(x)
+        if self.use_moe:
+            ff_out, aux_loss, z_loss = self.ff(h3, token_mask=token_mask, compute_aux=compute_aux)
+        else:
+            ff_out = self.ff(h3)
+            aux_loss = torch.zeros((), device=x.device, dtype=torch.float32)
+            z_loss = torch.zeros((), device=x.device, dtype=torch.float32)
+        x = x + self.drop3(ff_out)
+        return x, new_self_kv, aux_loss, z_loss
 
 
 class BrocaByteTransformer(nn.Module):
@@ -204,6 +434,10 @@ class BrocaByteTransformer(nn.Module):
         # Direct cortical prefix projection injected at position 0 (<BOS>) & final readout bridge
         self.bos_z_proj = nn.Linear(self.col_dim, self.dim, bias=False)
         self.out_z_proj = nn.Linear(self.col_dim, self.dim, bias=False)
+        self.use_moe = bool(getattr(cfg, "broca_use_moe", False))
+        self.num_experts = int(getattr(cfg, "broca_num_experts", 8))
+        self.moe_top_k = int(getattr(cfg, "broca_moe_top_k", 2))
+        self.moe_expert_dim = int(getattr(cfg, "broca_moe_expert_dim", max(64, cfg.broca_ff_dim // 2)))
         self.blocks = nn.ModuleList(
             [
                 _BrocaDecoderBlock(
@@ -212,6 +446,10 @@ class BrocaByteTransformer(nn.Module):
                     n_heads=self.n_heads,
                     ff_dim=cfg.broca_ff_dim,
                     dropout=self.dropout_p,
+                    use_moe=self.use_moe,
+                    num_experts=self.num_experts,
+                    moe_top_k=self.moe_top_k,
+                    moe_expert_dim=self.moe_expert_dim,
                 )
                 for _ in range(cfg.broca_layers)
             ]
@@ -227,10 +465,13 @@ class BrocaByteTransformer(nn.Module):
         # Optional activation checkpointing for long sequences on 16 GB VRAM
         self.gradient_checkpointing: bool = bool(getattr(cfg, "broca_gradient_checkpointing", False))
 
-        # Training statistics
+        # Training statistics & MoE diagnostics (zero-sync GPU tensors)
         self.trained_steps: int = 0
         self.last_loss: float = 5.5
         self.fluency_score: float = 0.0
+        self.last_aux_loss: torch.Tensor | None = None
+        self.last_z_loss: torch.Tensor | None = None
+        self.last_import_report: dict[str, list[str]] | None = None
 
     def set_gradient_checkpointing(self, enabled: bool) -> None:
         self.gradient_checkpointing = bool(enabled)
@@ -242,6 +483,31 @@ class BrocaByteTransformer(nn.Module):
 
     def total_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    def active_parameters(self) -> int:
+        if not self.use_moe:
+            return self.total_parameters()
+        total = self.total_parameters()
+        inactive_frac = float(max(0, self.num_experts - self.moe_top_k)) / float(max(1, self.num_experts))
+        expert_params = sum(
+            blk.ff.w_gate_up.numel() + blk.ff.w_down.numel()
+            for blk in self.blocks
+            if isinstance(blk.ff, SparseMoEFFN)
+        )
+        return int(round(total - expert_params * inactive_frac))
+
+    def get_moe_expert_utilization(self) -> torch.Tensor | None:
+        """Return [num_layers, num_experts] tensor of latest per-layer expert load fractions."""
+        if not self.use_moe:
+            return None
+        fracs = [
+            blk.ff.last_expert_fractions
+            for blk in self.blocks
+            if isinstance(blk.ff, SparseMoEFFN) and blk.ff.last_expert_fractions is not None
+        ]
+        if not fracs:
+            return None
+        return torch.stack(fracs, dim=0)
 
     def _update_fluency(self, loss_val: float) -> None:
         self.last_loss = float(loss_val)
@@ -286,9 +552,20 @@ class BrocaByteTransformer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         memory_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        out, _ = blk(x, z_mem, z_summary=z_summary, rope_cos=cos, rope_sin=sin, memory_mask=memory_mask)
-        return out
+        token_mask: torch.Tensor | None,
+        compute_aux: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        out, _, aux_loss, z_loss = blk(
+            x,
+            z_mem,
+            z_summary=z_summary,
+            rope_cos=cos,
+            rope_sin=sin,
+            memory_mask=memory_mask,
+            token_mask=token_mask,
+            compute_aux=compute_aux,
+        )
+        return out, aux_loss, z_loss
 
     def forward(
         self,
@@ -296,15 +573,19 @@ class BrocaByteTransformer(nn.Module):
         memory_columns: torch.Tensor,
         clean_z: bool = False,
         memory_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        token_mask: torch.Tensor | None = None,
+        return_aux: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Parallel teacher-forced forward pass for training.
         Args:
           byte_ids: [B, T] int64 target-shifted bytes starting with <BOS>
           memory_columns: [B, M_total, D] composite cortical context Z_ctx
           memory_mask: optional [B, M_total] bool validity mask (True = valid slot)
+          token_mask: optional [B, T] bool validity mask for MoE load balancing (excludes PAD)
+          return_aux: if True, returns (logits, total_aux_loss, total_z_loss)
         Returns:
-          logits: [B, T, 260]
+          logits: [B, T, 260] (or tuple with accumulated MoE aux_loss and z_loss across all layers)
         """
         b, t = byte_ids.shape
         device = byte_ids.device
@@ -322,10 +603,13 @@ class BrocaByteTransformer(nn.Module):
 
         cos, sin = self._get_rope(t, device=device)
 
+        total_aux_loss = torch.zeros((), device=device, dtype=torch.float32)
+        total_z_loss = torch.zeros((), device=device, dtype=torch.float32)
+        want_aux = bool(self.use_moe and (return_aux or self.training))
         use_ckpt = self.training and self.gradient_checkpointing and x.requires_grad
         for blk in self.blocks:
             if use_ckpt:
-                x = torch.utils.checkpoint.checkpoint(
+                x, blk_aux, blk_z = torch.utils.checkpoint.checkpoint(
                     self._block_forward_no_cache,
                     blk,
                     x,
@@ -334,20 +618,34 @@ class BrocaByteTransformer(nn.Module):
                     cos,
                     sin,
                     memory_mask,
+                    token_mask,
+                    want_aux,
                     use_reentrant=False,
                 )
             else:
-                x, _ = blk(
+                x, _, blk_aux, blk_z = blk(
                     x,
                     z_mem,
                     z_summary=z_summary,
                     rope_cos=cos,
                     rope_sin=sin,
                     memory_mask=memory_mask,
+                    token_mask=token_mask,
+                    compute_aux=want_aux,
                 )
+            if want_aux:
+                total_aux_loss = total_aux_loss + blk_aux
+                total_z_loss = total_z_loss + blk_z
+
+        if want_aux:
+            self.last_aux_loss = total_aux_loss.detach()
+            self.last_z_loss = total_z_loss.detach()
 
         x = x + self.out_z_proj(z_summary).unsqueeze(1)
-        return self.lm_head(self.final_norm(x))
+        logits = self.lm_head(self.final_norm(x))
+        if return_aux:
+            return logits, total_aux_loss, total_z_loss
+        return logits
 
     def compute_loss(
         self,
@@ -357,11 +655,15 @@ class BrocaByteTransformer(nn.Module):
         decoder_byte_dropout: float | None = None,
         clean_z: bool = False,
         memory_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_components: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Compute next-byte cross-entropy loss conditioned strictly on Z_ctx.
+        Compute next-byte cross-entropy loss conditioned strictly on Z_ctx, plus Sparse MoE
+        load-balancing aux_loss and router z_loss (when broca_use_moe=True).
         Applies decoder input byte dropout (~15%) during teacher-forcing so Broca MUST read Z_ctx
         via Cross-Attention + FiLM + <BOS> prefix + output Z* bridge instead of collapsing.
+        When return_components=True, returns (ce_loss, aux_loss, z_loss) so training loops can
+        combine weighted MoE regularization while tracking pure CE for early stopping / fluency.
         """
         inp = target_byte_ids[:, :-1]
         tgt = target_byte_ids[:, 1:]
@@ -375,14 +677,29 @@ class BrocaByteTransformer(nn.Module):
             drop_mask = (torch.rand(inp.shape, device=inp.device) < drop_p) & maskable
             inp = torch.where(drop_mask, torch.full_like(inp, MASK_BYTE), inp)
 
-        logits = self.forward(inp, memory_columns, clean_z=clean_z, memory_mask=memory_mask)
+        token_mask = tgt != PAD_BYTE
+        logits, aux_loss, z_loss = self.forward(
+            inp,
+            memory_columns,
+            clean_z=clean_z,
+            memory_mask=memory_mask,
+            token_mask=token_mask,
+            return_aux=True,
+        )
         ls = float(self.cfg.broca_label_smoothing if label_smoothing is None else label_smoothing)
-        return F.cross_entropy(
+        ce_loss = F.cross_entropy(
             logits.reshape(-1, BYTE_VOCAB_SIZE),
             tgt.reshape(-1),
             ignore_index=PAD_BYTE,
             label_smoothing=ls,
         )
+        if return_components:
+            return ce_loss, aux_loss, z_loss
+        if self.use_moe:
+            aux_coef = float(getattr(self.cfg, "broca_moe_aux_loss_coef", 0.01))
+            z_coef = float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001))
+            return ce_loss + aux_coef * aux_loss + z_coef * z_loss
+        return ce_loss
 
     @torch.no_grad()
     def generate_stream(
@@ -469,7 +786,7 @@ class BrocaByteTransformer(nn.Module):
                     cos_s = cos_all[step : step + 1]
                     sin_s = sin_all[step : step + 1]
                     for i, blk in enumerate(self.blocks):
-                        x, self_kvs[i] = blk(
+                        x, self_kvs[i], _, _ = blk(
                             x,
                             z_mem,
                             z_summary=z_summary,
@@ -480,6 +797,7 @@ class BrocaByteTransformer(nn.Module):
                             film_cache=film_caches[i],
                             cache_pos=step,
                             memory_mask=mem_mask,
+                            compute_aux=False,
                         )
 
                     x = x + out_z_bias
@@ -618,7 +936,7 @@ class BrocaByteTransformer(nn.Module):
                     cos_s = cos_all[step : step + 1]
                     sin_s = sin_all[step : step + 1]
                     for i, blk in enumerate(self.blocks):
-                        x, self_kvs[i] = blk(
+                        x, self_kvs[i], _, _ = blk(
                             x,
                             z_mem,
                             z_summary=z_summary,
@@ -629,6 +947,7 @@ class BrocaByteTransformer(nn.Module):
                             film_cache=film_caches[i],
                             cache_pos=step,
                             memory_mask=mem_mask,
+                            compute_aux=False,
                         )
 
                     x = x + out_z_bias
@@ -831,25 +1150,55 @@ class BrocaByteTransformer(nn.Module):
             "fluency_score": self.fluency_score,
         }
 
-    def import_state(self, state: dict[str, Any], device: torch.device) -> None:
+    def import_state(self, state: dict[str, Any], device: torch.device) -> dict[str, list[str]]:
         saved = state.get("weights", {})
         cur = self.state_dict()
-        merged = {}
+        merged: dict[str, torch.Tensor] = {}
+        loaded_keys: list[str] = []
+        mismatched_keys: list[str] = []
+        missing_keys: list[str] = []
+        unexpected_keys = [k for k in saved.keys() if k not in cur]
+
         for k, v in cur.items():
             if k in saved:
                 sv = saved[k]
-                if sv.shape == v.shape:
+                if isinstance(sv, torch.Tensor) and sv.shape == v.shape:
                     merged[k] = sv.to(device=device, dtype=v.dtype)
-                elif sv.ndim == v.ndim and sv.ndim >= 2:
-                    dst = v.clone()
-                    slices = tuple(slice(0, min(a, b)) for a, b in zip(sv.shape, v.shape))
-                    dst[slices] = sv[slices].to(device=device, dtype=v.dtype)
-                    merged[k] = dst
+                    loaded_keys.append(k)
                 else:
+                    # Safely skip shape-mismatched tensors (e.g. dense FFN -> MoE migration) and keep fresh init
                     merged[k] = v
+                    sv_shape = tuple(sv.shape) if isinstance(sv, torch.Tensor) else type(sv).__name__
+                    mismatched_keys.append(f"{k} (ckpt={sv_shape}, model={tuple(v.shape)})")
             else:
                 merged[k] = v
-        self.load_state_dict(merged)
+                missing_keys.append(k)
+
+        self.load_state_dict(merged, strict=False)
         self.trained_steps = int(state.get("trained_steps", 0))
         self.last_loss = float(state.get("last_loss", 5.5))
         self.fluency_score = float(state.get("fluency_score", 0.0))
+
+        report = {
+            "loaded": loaded_keys,
+            "mismatched": mismatched_keys,
+            "missing": missing_keys,
+            "unexpected": unexpected_keys,
+        }
+        self.last_import_report = report
+        if mismatched_keys or missing_keys or unexpected_keys:
+            extra = ""
+            if mismatched_keys:
+                extra += f" | mismatch={mismatched_keys[:3]}"
+            if missing_keys:
+                extra += f" | new_init={missing_keys[:3]}"
+            _logger.warning(
+                "BrocaByteTransformer migracja checkpointu: wczytano=%d, pominięto_niezgodny_kształt=%d, "
+                "zainicjalizowano_nowe=%d, pominięto_stare_klucze=%d%s",
+                len(loaded_keys),
+                len(mismatched_keys),
+                len(missing_keys),
+                len(unexpected_keys),
+                extra,
+            )
+        return report

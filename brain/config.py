@@ -50,6 +50,14 @@ class BrainConfig:
     broca_layers: int = 10
     broca_heads: int = 12
     broca_ff_dim: int = 2304
+    # Sparse Mixture-of-Experts (MoE) in Broca decoder FFN:
+    # top_k=2 * 1152 = 2304 matches dense FFN active params; 8 experts -> 4x FFN capacity (1152 = 9*128 Tensor-Core optimal)
+    broca_use_moe: bool = True
+    broca_num_experts: int = 8
+    broca_moe_top_k: int = 2
+    broca_moe_expert_dim: int = 1152
+    broca_moe_aux_loss_coef: float = 0.01
+    broca_moe_z_loss_coef: float = 0.001
     broca_dropout: float = 0.2
     broca_max_seq_len: int = 1024
     broca_lr: float = 1.2e-3

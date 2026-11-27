@@ -992,7 +992,7 @@ class LanguageCortex:
                     continue
                 if any(k in name for k in cond_keys):
                     cond_params.append(p)
-                elif p.ndim < 2 or "norm" in name:
+                elif p.ndim < 2 or "norm" in name or "router" in name:
                     norm_params.append(p)
                 else:
                     decay_params.append(p)
@@ -1240,13 +1240,15 @@ class LanguageCortex:
         with self._op_lock:
             self._wernicke_raw.eval()
             self._broca_raw.train()
-            broca_decay, broca_cond = [], []
+            broca_decay, broca_no_decay, broca_cond = [], [], []
             cond_keys = ("cross_attn", "film", "bos_z_proj", "out_z_proj", "col_norm", "z_col_compress", "z_summary_proj")
             for name, p in self._broca_raw.named_parameters():
                 if not p.requires_grad:
                     continue
                 if any(k in name for k in cond_keys):
                     broca_cond.append(p)
+                elif p.ndim < 2 or "norm" in name or "router" in name:
+                    broca_no_decay.append(p)
                 else:
                     broca_decay.append(p)
             # Snapshot pre-update weights for EWC-style L2 anchor penalty (zero catastrophic forgetting)
@@ -1259,6 +1261,7 @@ class LanguageCortex:
             opt = torch.optim.AdamW(
                 [
                     {"params": broca_decay, "lr": 3.5e-4 * lr_scale, "weight_decay": 0.01},
+                    {"params": broca_no_decay, "lr": 3.5e-4 * lr_scale, "weight_decay": 0.0},
                     {"params": broca_cond, "lr": 1.8e-3 * lr_scale, "weight_decay": 0.0},
                 ],
                 **kwargs,
@@ -1309,33 +1312,39 @@ class LanguageCortex:
             ewc_weight = 0.012 if lightweight else 0.004
             last_new_loss = 5.0
             last_new_t = torch.tensor(5.0, device=self.device, dtype=torch.float32)
+            moe_aux_coef = float(getattr(self.cfg, "broca_moe_aux_loss_coef", 0.01)) if self._broca_raw.use_moe else 0.0
+            moe_z_coef = float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001)) if self._broca_raw.use_moe else 0.0
             try:
                 for step_i in range(max_steps):
                     opt.zero_grad(set_to_none=True)
                     with amp_autocast(self.device):
-                        loss_new = self._broca_raw.compute_loss(
+                        ce_new, aux_new, z_new = self._broca_raw.compute_loss(
                             tgt_bytes[:n_new_rows],
                             z_star[:n_new_rows],
                             label_smoothing=0.03,
                             decoder_byte_dropout=0.02,
                             clean_z=True,
                             memory_mask=z_mask[:n_new_rows] if z_mask is not None else None,
+                            return_components=True,
                         )
-                        loss_rep = self._broca_raw.compute_loss(
+                        ce_rep, aux_rep, z_rep = self._broca_raw.compute_loss(
                             tgt_bytes[n_new_rows:],
                             z_star[n_new_rows:],
                             label_smoothing=0.05,
                             decoder_byte_dropout=0.05,
                             clean_z=True,
                             memory_mask=z_mask[n_new_rows:] if z_mask is not None else None,
+                            return_components=True,
                         )
+                        loss_new = ce_new + moe_aux_coef * aux_new + moe_z_coef * z_new
+                        loss_rep = ce_rep + moe_aux_coef * aux_rep + moe_z_coef * z_rep
                         ewc_pen = sum((p - p0).pow(2).sum() for p, p0 in anchor_params)
                         loss = 0.65 * loss_new + 0.35 * loss_rep + ewc_weight * ewc_pen
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(broca_params, max_norm=1.0)
                     opt.step()
                     self._broca_raw.trained_steps += 1
-                    last_new_t = loss_new.detach().float()
+                    last_new_t = ce_new.detach().float()
                     if ((step_i + 1) % 4 == 0 or step_i + 1 == max_steps) and float(last_new_t.item()) <= 0.28:
                         break
                 last_new_loss = float(last_new_t.item())
@@ -1664,15 +1673,20 @@ class LanguageCortex:
                                 sensory_patch_mask=w_out.patch_mask if use_patches else None,
                                 recalled_columns=thought.recalled_columns,
                             )
-                            ce_loss = self._broca_raw.compute_loss(
+                            ce_loss, aux_loss, z_loss = self._broca_raw.compute_loss(
                                 tgt_bytes,
                                 z_ctx,
                                 label_smoothing=eff_ls,
                                 decoder_byte_dropout=eff_drop,
                                 clean_z=True,
                                 memory_mask=z_ctx_mask,
+                                return_components=True,
                             )
-                            loss = ce_loss + self._wernicke_bottleneck_loss(w_out, z_star)
+                            moe_reg = (
+                                float(getattr(self.cfg, "broca_moe_aux_loss_coef", 0.01)) * aux_loss
+                                + float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001)) * z_loss
+                            ) if self._broca_raw.use_moe else 0.0
+                            loss = ce_loss + moe_reg + self._wernicke_bottleneck_loss(w_out, z_star)
 
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
@@ -1792,15 +1806,20 @@ class LanguageCortex:
                                         sensory_patch_mask=w_out.patch_mask if use_patches else None,
                                         recalled_columns=thought.recalled_columns,
                                     )
-                                    ce_loss = self._broca_raw.compute_loss(
+                                    ce_loss, aux_loss, z_loss = self._broca_raw.compute_loss(
                                         tgt_bytes,
                                         z_ctx,
                                         label_smoothing=0.04,
                                         decoder_byte_dropout=0.04,
                                         clean_z=True,
                                         memory_mask=z_ctx_mask,
+                                        return_components=True,
                                     )
-                                    loss = ce_loss + self._wernicke_bottleneck_loss(w_out, z_star)
+                                    moe_reg = (
+                                        float(getattr(self.cfg, "broca_moe_aux_loss_coef", 0.01)) * aux_loss
+                                        + float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001)) * z_loss
+                                    ) if self._broca_raw.use_moe else 0.0
+                                    loss = ce_loss + moe_reg + self._wernicke_bottleneck_loss(w_out, z_star)
                                 loss.backward()
                                 torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
                                 opt_p.step()
@@ -2204,18 +2223,24 @@ class LanguageCortex:
                         else:
                             z_ctx = z_cols
                             z_ctx_mask = None
-                        loss = self._broca_raw.compute_loss(
+                        ce_loss, aux_loss, z_loss = self._broca_raw.compute_loss(
                             tgt_bytes,
                             z_ctx,
                             memory_mask=z_ctx_mask,
-                        ) + self._wernicke_bottleneck_loss(w_out, z_cols)
+                            return_components=True,
+                        )
+                        moe_reg = (
+                            float(getattr(self.cfg, "broca_moe_aux_loss_coef", 0.01)) * aux_loss
+                            + float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001)) * z_loss
+                        ) if self._broca_raw.use_moe else 0.0
+                        loss = ce_loss + moe_reg + self._wernicke_bottleneck_loss(w_out, z_cols)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
                     opt.step()
                     self._broca_raw.trained_steps += 1
-                    loss_window += loss.detach().float()
+                    loss_window += ce_loss.detach().float()
                     window_count += 1
-                del in_bytes, in_mask, tgt_bytes, w_out, z_cols, z_ctx, z_ctx_mask, loss
+                del in_bytes, in_mask, tgt_bytes, w_out, z_cols, z_ctx, z_ctx_mask, ce_loss, aux_loss, z_loss, moe_reg, loss
                 if is_cuda:
                     cuda_ev_ring[ev_slot].record()
                     ev_slot = (ev_slot + 1) % len(cuda_ev_ring)
