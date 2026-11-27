@@ -7,7 +7,16 @@ import os
 import re
 import urllib.request
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
+
+from .teacher_distill import (
+    build_reasoning_prompt_queue,
+    count_reasoning_dialogues,
+    generate_bielik_reasoning_dialogues,
+    is_ai_corporate_reply,
+    load_reasoning_dialogues,
+    load_teacher_dialogues,
+)
 
 
 PARQUET_CORPORA_CATALOG: dict[str, dict[str, str]] = {
@@ -639,6 +648,8 @@ def build_dialogue_qa_pairs(
         ans = (a or "").strip()
         if len(qs) < min_chars or len(ans) < min_chars:
             return
+        if is_ai_corporate_reply(ans):
+            return
         key = (qs.lower(), ans.lower())
         if key not in seen:
             seen.add(key)
@@ -656,9 +667,13 @@ def build_dialogue_qa_pairs(
         pass
 
     try:
-        from .teacher_distill import load_teacher_dialogues
-
         for q, a in load_teacher_dialogues():
+            _add(q, a)
+    except Exception:
+        pass
+
+    try:
+        for q, a in load_reasoning_dialogues():
             _add(q, a)
     except Exception:
         pass
@@ -1038,5 +1053,19 @@ def iter_parquet_polish_pairs(
         start_row_group=start_row_group,
         min_quality_score=min_quality_score,
         min_language_score=min_language_score,
+    )
+
+
+def train_reasoning_with_bielik(
+    brain: Any,
+    num_samples: int = 90,
+    train_epochs: int = 160,
+    skip_generation: bool = False,
+) -> dict[str, Any]:
+    """Convenience entry point delegating 3-category Bielik reasoning training to `SleepingBrain`."""
+    return brain.train_reasoning_with_bielik(
+        num_samples=num_samples,
+        train_epochs=train_epochs,
+        skip_generation=skip_generation,
     )
 

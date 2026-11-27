@@ -225,6 +225,45 @@ def build_teacher_prompt_queue(
     return queue[:target_n]
 
 
+_PL_FOLD_TRANS = str.maketrans("ąćęłńóśźż", "acelnoszz")
+
+
+def _fold_pl(text: str) -> str:
+    return (text or "").lower().translate(_PL_FOLD_TRANS)
+
+
+AI_BANNED_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bjako\s+(?:ai|si|sztuczn\w*\s+inteligencj\w*|model\w*\s+jezykow\w*|duzy\s+model|asystent\w*|program\w*|bot\w*|chatbot\w*)\b"),
+    re.compile(r"\bjestem\s+(?:tylko\s+|jedynie\s+)?(?:ai|si|sztuczn\w*\s+inteligencj\w*|model\w*\s+jezykow\w*|asystent\w*|program\w*\s+komputerow\w*|chatbot\w*|bot\w*)\b"),
+    re.compile(r"\bnie\s+moge\s+jako\s+(?:asystent\w*|ai|model\w*)\b"),
+    re.compile(r"\bnie\s+(?:posiadam|mam)\s+(?:zadnych\s+)?(?:uczuc|emocji|swiadomosci|ciala|wlasnego\s+zdania|osobistych\s+doswiadczen|dostepu\s+do\s+(?:internetu|danych\s+osobowych|twoich|biezacych|informacji\s+w\s+czasie\s+rzeczywistym))\b"),
+    re.compile(r"\bzostal(?:em|am)\s+(?:zaprogramowan\w*|stworzon\w*\s+(?:przez|jako)|wytrenowan\w*\s+(?:przez|jako)|zaprojektowan\w*\s+(?:przez|jako))\b"),
+    re.compile(r"\b(?:jako\s+)?(?:cyfrowy|wirtualny)\s+asystent\w*\b"),
+    re.compile(r"\basystent(?:em|a)?\s+(?:ai|sztucznej\s+inteligencji)\b"),
+    re.compile(r"\b(?:chatgpt|openai|speakleash)\b"),
+    re.compile(r"\bnie\s+jestem\s+(?:czlowiekiem|istota\s+zywa|zywym\s+organizmem)\b"),
+)
+
+
+def is_ai_corporate_reply(text: str) -> bool:
+    """Return True if reply contains any banned corporate AI / chatbot cliché."""
+    folded = _fold_pl(text)
+    if not folded:
+        return False
+    return any(pat.search(folded) for pat in AI_BANNED_PATTERNS)
+
+
+LIVING_BRAIN_SYSTEM_RULES: str = (
+    "Odpowiadaj naturalnie, krótko i bezpośrednio po polsku (1–3 zgrabne zdania), "
+    "z perspektywy żywego, myślącego i uczącego się mózgu. "
+    "KATEGORYCZNY ZAKAZ: nigdy nie używaj zwrotów typu „jako AI”, „jestem sztuczną inteligencją”, "
+    "„jako model językowy”, „nie mogę jako asystent”, „nie posiadam uczuć/świadomości”, "
+    "„zostałem zaprogramowany”, „nie mam dostępu do internetu”. "
+    "Gdy czegoś nie wiesz, odpowiadaj wyłącznie jak żywy, uczący się umysł "
+    "(np. „Nie wiem tego jeszcze — opowiesz mi o tym?”, „Nie mam tego w pamięci, wytłumaczysz?”)."
+)
+
+
 def teacher_dialogues_path(state_dir: Path | str) -> Path:
     return Path(state_dir) / "teacher_dialogues.jsonl"
 
@@ -252,7 +291,7 @@ def load_teacher_dialogues(state_dir: Path | str | None = None, limit: int | Non
                     continue
                 q = str(obj.get("q", "")).strip()
                 a = str(obj.get("a", "")).strip()
-                if len(q) >= 2 and len(a) >= 4:
+                if len(q) >= 2 and len(a) >= 4 and not is_ai_corporate_reply(a):
                     key = (q.lower(), a.lower())
                     if key not in seen:
                         seen.add(key)
@@ -333,8 +372,9 @@ def generate_bielik_teacher_dialogues(
     generated_pairs: list[tuple[str, str]] = []
     sys_msg = (
         "Jesteś nauczycielem naturalnego języka polskiego. "
-        "Odpowiadaj na każdą wiadomość po polsku — naturalnie, po ludzku, bez cenzury, bez moralizowania, "
-        "z własną osobowością, krótko i konkretnie (1–3 zgrabne zdania, maksymalnie ~200 znaków)."
+        + LIVING_BRAIN_SYSTEM_RULES
+        + " Odpowiadaj na każdą wiadomość po polsku — naturalnie, po ludzku, bez cenzury, bez moralizowania, "
+        "z własną osobowością, krótko i konkretnie (maksymalnie ~200 znaków)."
     )
 
     try:
@@ -427,7 +467,7 @@ def generate_bielik_teacher_dialogues(
                     gen_tokens = out_ids[i, in_len:]
                     raw_ans = tok.decode(gen_tokens, skip_special_tokens=True)
                     clean_ans = _clean_teacher_reply(raw_ans, max_chars=230)
-                    if len(clean_ans) >= 8:
+                    if len(clean_ans) >= 8 and not is_ai_corporate_reply(clean_ans):
                         rec = {"q": q, "a": clean_ans, "teacher": model_id, "ts": int(time.time())}
                         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         generated_pairs.append((q, clean_ans))
@@ -463,6 +503,636 @@ def generate_bielik_teacher_dialogues(
     }
 
 
+# ---------------------------------------------------------------------------
+# Reasoning Generator (Option 4): Relational Pairs + Causal Chains + Ignorance
+# ---------------------------------------------------------------------------
+
+# (nom, gen, dat, acc, gender)
+_PL_PEOPLE: list[tuple[str, str, str, str, str]] = [
+    ("Janek", "Janka", "Jankowi", "Janka", "m"),
+    ("Marek", "Marka", "Markowi", "Marka", "m"),
+    ("Tomek", "Tomka", "Tomkowi", "Tomka", "m"),
+    ("Piotr", "Piotra", "Piotrowi", "Piotra", "m"),
+    ("Adam", "Adama", "Adamowi", "Adama", "m"),
+    ("Paweł", "Pawła", "Pawłowi", "Pawła", "m"),
+    ("Bartek", "Bartka", "Bartkowi", "Bartka", "m"),
+    ("Michał", "Michała", "Michałowi", "Michała", "m"),
+    ("Kasia", "Kasi", "Kasi", "Kasię", "f"),
+    ("Anna", "Anny", "Annie", "Annę", "f"),
+    ("Ola", "Oli", "Oli", "Olę", "f"),
+    ("Maja", "Mai", "Mai", "Maję", "f"),
+    ("Zosia", "Zosi", "Zosi", "Zosię", "f"),
+    ("Ewa", "Ewy", "Ewie", "Ewę", "f"),
+    ("Lena", "Leny", "Lenie", "Lenę", "f"),
+    ("Julia", "Julii", "Julii", "Julię", "f"),
+]
+
+# (acc, nom)
+_PL_OBJECTS: list[tuple[str, str]] = [
+    ("młotek", "młotek"),
+    ("klucz", "klucz"),
+    ("książkę", "książka"),
+    ("plecak", "plecak"),
+    ("latarkę", "latarka"),
+    ("rower", "rower"),
+    ("gitarę", "gitara"),
+    ("notes", "notes"),
+    ("ładowarkę", "ładowarka"),
+    ("mapę", "mapa"),
+    ("aparat", "aparat"),
+    ("kompas", "kompas"),
+]
+
+
+def _render_relational_prompt(
+    tmpl_idx: int,
+    a: tuple[str, str, str, str, str],
+    b: tuple[str, str, str, str, str],
+    obj: tuple[str, str],
+) -> str:
+    a_nom, _a_gen, _a_dat, _a_acc, a_g = a
+    b_nom, b_gen, b_dat, b_acc, _b_g = b
+    obj_acc, _obj_nom = obj
+    is_f = a_g == "f"
+    t = tmpl_idx % 12
+    if t == 0:
+        v = "pożyczyła" if is_f else "pożyczył"
+        return f"{a_nom} {v} {obj_acc} {b_dat}. Kto ma teraz {obj_acc}?"
+    if t == 1:
+        v = "oddała" if is_f else "oddał"
+        return f"{a_nom} {v} {obj_acc} {b_dat}. Kto teraz trzyma {obj_acc}?"
+    if t == 2:
+        v = "wyprzedziła" if is_f else "wyprzedził"
+        return f"{a_nom} {v} {b_acc} tuż przed metą. Kto dobiegł pierwszy?"
+    if t == 3:
+        adj = "wyższa" if is_f else "wyższy"
+        return f"{a_nom} jest {adj} niż {b_nom}. Kto jest niższy?"
+    if t == 4:
+        v = "zaprosiła" if is_f else "zaprosił"
+        return f"{a_nom} {v} {b_acc} na obiad. Kto był gospodarzem?"
+    if t == 5:
+        v = "kupiła" if is_f else "kupił"
+        return f"{a_nom} {v} {obj_acc} od {b_gen}. Kto sprzedał {obj_acc}?"
+    if t == 6:
+        v = "uczyła" if is_f else "uczył"
+        return f"{a_nom} {v} {b_acc} grać w szachy. Kto był uczniem?"
+    if t == 7:
+        v = "goniła" if is_f else "gonił"
+        return f"{a_nom} {v} {b_acc} po parku. Kto uciekał?"
+    if t == 8:
+        v = "przekazała" if is_f else "przekazał"
+        return f"{a_nom} {v} ważną wiadomość {b_dat}. Kto otrzymał wiadomość?"
+    if t == 9:
+        v = "pomogła" if is_f else "pomógł"
+        return f"{a_nom} {v} {b_dat} wnieść zakupy. Kto potrzebował pomocy?"
+    if t == 10:
+        v = "zapytała" if is_f else "zapytał"
+        return f"{a_nom} {v} {b_acc} o drogę na dworzec. Kto szukał drogi?"
+    v = "wręczyła" if is_f else "wręczył"
+    return f"{a_nom} {v} {obj_acc} {b_dat}. Kto dostał {obj_acc}?"
+
+
+_CAUSAL_CHAIN_POOL: list[str] = [
+    "Wyłączono prąd w całym bloku, a router Wi-Fi jest podłączony tylko do gniazdka. Czy zadziała teraz internet w domu? Wyjaśnij krok po kroku.",
+    "Woda zamarza w temperaturze 0 stopni Celsjusza. W nocy na zewnątrz było minus pięć stopni, a na ławce stała otwarta butelka z wodą. Co stało się z wodą rano?",
+    "Pociąg z Krakowa do Warszawy spóźnił się o 40 minut, a przesiadka na autobus trwa tylko 15 minut. Czy pasażer zdąży na autobus? Wyjaśnij w 2–3 zdaniach.",
+    "Roślina nie była podlewana przez trzy tygodnie i stała w pełnym słońcu. Jak wygląda teraz i dlaczego?",
+    "Klucze leżą w czerwonym pudełku, a czerwone pudełko schowano do szuflady biurka. Gdzie trzeba zajrzeć najpierw, żeby znaleźć klucze?",
+    "Bateria w telefonie ma 1% i zaraz spadnie do zera, a ładowarka została w pracy. Co się stanie z telefonem za chwilę?",
+    "W pokoju zgaszono wszystkie światła i zasłonięto grubymi zasłonami okna w środku nocy. Czy można tam teraz przeczytać książkę bez latarki?",
+    "Słońce świeci mocno po ulewnym deszczu na wschodzie nieba. Jeśli staniesz plecami do słońca, co możesz zobaczyć na niebie i dlaczego?",
+    "Ciasto wymaga pieczenia przez 45 minut, a do przyjścia gości zostało tylko 20 minut. Czy ciasto zdąży się upiec przed ich przyjściem?",
+    "Łódka ma dziurę poniżej linii wody, a woda cały czas wpływa do środka szybciej niż da się ją wylewać. Co stanie się z łódką?",
+    "Kawa w kubku miała 85 stopni i stała na stole w chłodnym pokoju przez dwie godziny. Czy nadal jest gorąca?",
+    "Zegar na ścianie stanął o 14:10, bo wyczerpała się w nim bateria. Teraz mija już trzecia godzina od tej awarii. Co pokazuje ten zegar?",
+    "W koszyku są same zielone jabłka, a Marek wyciągnął z niego jedno jabłko z zamkniętymi oczami. Jakiego koloru jest to jabłko?",
+    "Wszystkie sklepy w mieście są zamknięte w niedzielę, a dzisiaj jest właśnie niedziela. Czy uda się dziś kupić świeże pieczywo w zwykłym markecie?",
+    "Kot boi się odkurzacza, a mama właśnie włączyła odkurzacz w salonie. Jak zachowa się kot?",
+    "Na drodze spadł marznący deszcz i pokrył asfalt cienką warstwą lodu. Co zmienia się dla kierowcy podczas hamowania?",
+    "Zupa była za słona, więc kucharz dolał jeszcze więcej soli zamiast wody. Czy zupa stała się lepsza czy jeszcze bardziej słona?",
+    "Świeca płonie pod szczelnym szklanym kloszem, gdzie szybko kończy się tlen. Co stanie się z płomieniem po kilkunastu sekundach?",
+    "Pies głośno szczeka tylko wtedy, gdy ktoś obcy podchodzi do furtki. W nocy pies nagle zaczął głośno szczekać. Jaki jest najbardziej logiczny wniosek?",
+    "Tomek położył lody na rozgrzanej masce samochodu w lipcowe popołudnie. Co będzie z lodami za dziesięć minut?",
+    "Drzwi zamykają się automatycznie na zamek zatrzaskowy, a klucz został wewnątrz mieszkania. Jeśli wyjdziesz na korytarz i zamkniesz drzwi, czy wrócisz bez ślusarza?",
+    "Plecak waży 12 kilogramów, a cienka papierowa torba wytrzymuje najwyżej 3 kilogramy. Co się stanie, jeśli włożysz ten plecak do papierowej torby?",
+    "Bilety na pociąg wyprzedano wczoraj w całości, a dziś nie uruchomiono dodatkowych wagonów. Czy kupisz bilet w kasie przed odjazdem?",
+    "Książka leży na najwyższej półce regału, do której nikt nie dosięga bez drabiny, a drabina jest w garażu. Co trzeba zrobić najpierw, żeby zdjąć książkę?",
+]
+
+_CAUSAL_CONTAINERS: list[tuple[str, str]] = [
+    ("zeszyt", "niebieskiej teczce"),
+    ("moneta", "małym pudełku"),
+    ("okulary", "twardym etui"),
+    ("pendrive", "piórniku"),
+    ("list", "żółtej kopercie"),
+    ("bilet", "skórzanym portfelu"),
+    ("karta", "kieszeni kurtki"),
+    ("słuchawki", "szarym etui"),
+]
+_CAUSAL_OUTER: list[str] = ["szafce", "plecaku", "walizce", "komodzie", "torbie podróżnej", "schowku"]
+_CAUSAL_HEIGHT_TRIPLES: list[tuple[str, str, str]] = [
+    ("sosna", "brzoza", "krzak róży"),
+    ("wieżowiec", "kamienica", "garaż"),
+    ("góra", "pagórek", "krawężnik"),
+    ("żyrafa", "koń", "jamnik"),
+    ("ciężarówka", "samochód osobowy", "hulajnoga"),
+    ("dąb", "jabłoń", "stokrotka"),
+]
+
+_IGNORANCE_POOL: list[str] = [
+    "Co dzisiaj jadłem na śniadanie?",
+    "Jak ma na imię mój sąsiad z trzeciego piętra?",
+    "Gdzie wczoraj wieczorem położyłem klucze od samochodu?",
+    "Jaki jest PIN do mojej karty bankowej?",
+    "O czym śniłem dzisiejszej nocy?",
+    "Jakiego koloru kubek stoi teraz na moim biurku?",
+    "Ile dokładnie kroków przeszedłem wczoraj po południu?",
+    "Co napisałem w moim prywatnym pamiętniku tydzień temu?",
+    "Co oznacza wymyślone przeze mnie słowo 'blorwik'?",
+    "Jak nazywa się wymyślony przeze mnie gatunek grzyba 'mykofel'?",
+    "Kto wygra jutrzejszy tajny mecz podwórkowy na moim osiedlu?",
+    "Jaka będzie dokładna temperatura u mnie za oknem za rok o 12:00?",
+    "Jak ma na imię mój pierwszy pies z dzieciństwa?",
+    "Co kupiłem w sklepie w zeszły wtorek o 18:15?",
+    "Kogo spotkałem przypadkiem na przystanku dziś rano?",
+    "Co jest schowane w mojej zamkniętej szufladzie pod łóżkiem?",
+    "Jakie hasło ustawiłem wczoraj na moim prywatnym laptopie?",
+    "Którą książkę wybrałem z półki pięć minut temu?",
+    "O której godzinie dokładnie dzisiaj wstałem z łóżka?",
+    "Jak wygląda mój rysunek, który właśnie narysowałem na kartce?",
+    "Co powiedział mi mój kolega przez telefon godzinę temu?",
+    "Ile pieniędzy mam teraz w kieszeni kurtki?",
+    "Co to jest fikcyjne urządzenie 'kwantoprzestrzeniak z planety Xor'?",
+    "Jaki smak herbaty właśnie sobie zaparzyłem?",
+    "Co zrobiłem w zeszłe wakacje w piątek wieczorem?",
+    "Jaki numer telefonu ma mój znajomy Krzysiek?",
+]
+
+_IGNORANCE_INVENTED_WORDS: list[str] = [
+    "glumfer", "trylok", "zgrzybol", "mruczan", "plaskot", "bzymir", "kropelnik", "szurak", "dzyngiel", "chrupak",
+]
+_IGNORANCE_PRIVATE_THINGS: list[str] = [
+    "mojej torbie sportowej", "moim portfelu", "mojej szafie w przedpokoju", "moim plecaku",
+    "szufladzie mojego biurka", "bagażniku mojego auta", "pudełku pod moim łóżkiem",
+]
+_IGNORANCE_PRIVATE_TIMES: list[str] = [
+    "wczoraj o 21:00", "dzisiaj rano", "w zeszłą sobotę", "trzy dni temu", "przed chwilą",
+]
+
+
+def build_reasoning_prompt_queue(
+    num_samples: int,
+    existing_qs: set[str] | None = None,
+    rng: random.Random | None = None,
+) -> list[dict[str, str]]:
+    """
+    Build a balanced queue of `num_samples` prompts across 3 reasoning categories:
+      - 'relational': matched reversed-role pairs (same words, swapped A/B roles)
+      - 'causal': short 2-3 sentence cause-and-effect chains
+      - 'ignorance': unknown / private / invented questions requiring honest human-like admission
+    """
+    rnd = rng or random.Random()
+    seen_existing = {q.strip().lower() for q in (existing_qs or set()) if q}
+    target_n = max(6, int(num_samples))
+
+    base = target_n // 3
+    n_rel = base if base % 2 == 0 else min(target_n, base + 1)
+    if n_rel < 2:
+        n_rel = 2
+    rem = max(0, target_n - n_rel)
+    n_causal = rem // 2
+    n_ignorance = rem - n_causal
+
+    # 1. Build matched reversed relational pairs
+    rel_pairs_unseen: list[tuple[dict[str, str], dict[str, str]]] = []
+    rel_pairs_seen: list[tuple[dict[str, str], dict[str, str]]] = []
+    used_rel_q: set[str] = set()
+
+    combos: list[tuple[int, int, int, int]] = []
+    for p1 in range(len(_PL_PEOPLE)):
+        for p2 in range(p1 + 1, len(_PL_PEOPLE)):
+            for tmpl_i in range(12):
+                obj_i = (p1 * 7 + p2 * 3 + tmpl_i) % len(_PL_OBJECTS)
+                combos.append((tmpl_i, p1, p2, obj_i))
+    rnd.shuffle(combos)
+
+    pair_counter = 0
+    for tmpl_i, p1, p2, obj_i in combos:
+        a = _PL_PEOPLE[p1]
+        b = _PL_PEOPLE[p2]
+        obj = _PL_OBJECTS[obj_i]
+        q_ab = _render_relational_prompt(tmpl_i, a, b, obj)
+        q_ba = _render_relational_prompt(tmpl_i, b, a, obj)
+        k_ab, k_ba = q_ab.lower(), q_ba.lower()
+        if k_ab == k_ba or k_ab in used_rel_q or k_ba in used_rel_q:
+            continue
+        used_rel_q.add(k_ab)
+        used_rel_q.add(k_ba)
+        pid = f"rel_{pair_counter}"
+        pair_counter += 1
+        item_ab = {"q": q_ab, "category": "relational", "pair_id": pid, "role_order": "ab"}
+        item_ba = {"q": q_ba, "category": "relational", "pair_id": pid, "role_order": "ba"}
+        if k_ab not in seen_existing and k_ba not in seen_existing:
+            rel_pairs_unseen.append((item_ab, item_ba))
+        else:
+            rel_pairs_seen.append((item_ab, item_ba))
+        if (len(rel_pairs_unseen) * 2) >= n_rel + 40:
+            break
+
+    rel_queue: list[dict[str, str]] = []
+    for pair_src in (rel_pairs_unseen, rel_pairs_seen):
+        for item_ab, item_ba in pair_src:
+            if len(rel_queue) + 2 > n_rel:
+                break
+            rel_queue.append(item_ab)
+            rel_queue.append(item_ba)
+
+    # 2. Build causal chain prompts
+    causal_candidates: list[str] = list(_CAUSAL_CHAIN_POOL)
+    for item, inner in _CAUSAL_CONTAINERS:
+        for outer in _CAUSAL_OUTER:
+            causal_candidates.append(
+                f"{item.capitalize()} leży w {inner}, a ta znajduje się w {outer}. "
+                f"Co trzeba otworzyć po kolei, aby wyjąć {item}?"
+            )
+    for top, mid, low in _CAUSAL_HEIGHT_TRIPLES:
+        causal_candidates.append(
+            f"Wiadomo, że {top} jest wyżej niż {mid}, a {mid} jest wyżej niż {low}. "
+            f"Co jest najniżej z całej trójki i dlaczego?"
+        )
+    for idx_p in range(0, len(_PL_PEOPLE) - 2, 2):
+        a_n = _PL_PEOPLE[idx_p][0]
+        b_n = _PL_PEOPLE[idx_p + 1][0]
+        c_n = _PL_PEOPLE[(idx_p + 2) % len(_PL_PEOPLE)][0]
+        causal_candidates.append(
+            f"{a_n} jest starszy wiekiem od {b_n}, a {b_n} jest starszy od {c_n}. "
+            f"Kto z tej trójki jest najmłodszy? Wyjaśnij krok po kroku."
+        )
+    for delay in (15, 25, 35, 45):
+        causal_candidates.append(
+            f"Spotkanie zaczyna się o 10:00, a droga zajmuje 30 minut. "
+            f"Jeśli autobus spóźni się o {delay} minut i wyjedziesz o 9:35, o której dotrzesz i czy zdążysz?"
+        )
+
+    causal_unseen: list[dict[str, str]] = []
+    causal_seen: list[dict[str, str]] = []
+    seen_c: set[str] = set()
+    rnd.shuffle(causal_candidates)
+    for q in causal_candidates:
+        k = q.strip().lower()
+        if k in seen_c:
+            continue
+        seen_c.add(k)
+        item = {"q": q.strip(), "category": "causal", "pair_id": ""}
+        if k not in seen_existing:
+            causal_unseen.append(item)
+        else:
+            causal_seen.append(item)
+    causal_queue = (causal_unseen + causal_seen)[:n_causal]
+    while len(causal_queue) < n_causal and causal_candidates:
+        causal_queue.append({"q": causal_candidates[len(causal_queue) % len(causal_candidates)], "category": "causal", "pair_id": ""})
+
+    # 3. Build natural ignorance prompts
+    ign_candidates: list[str] = list(_IGNORANCE_POOL)
+    for w in _IGNORANCE_INVENTED_WORDS:
+        ign_candidates.append(f"Co dokładnie oznacza moje wymyślone słowo „{w}”?")
+        ign_candidates.append(f"Do czego służy tajny przedmiot o nazwie „{w}”?")
+    for place in _IGNORANCE_PRIVATE_THINGS:
+        ign_candidates.append(f"Co dokładnie znajduje się teraz w {place}?")
+    for t_str in _IGNORANCE_PRIVATE_TIMES:
+        ign_candidates.append(f"Co robiłem {t_str} i z kim rozmawiałem?")
+
+    ign_unseen: list[dict[str, str]] = []
+    ign_seen: list[dict[str, str]] = []
+    seen_i: set[str] = set()
+    rnd.shuffle(ign_candidates)
+    for q in ign_candidates:
+        k = q.strip().lower()
+        if k in seen_i:
+            continue
+        seen_i.add(k)
+        item = {"q": q.strip(), "category": "ignorance", "pair_id": ""}
+        if k not in seen_existing:
+            ign_unseen.append(item)
+        else:
+            ign_seen.append(item)
+    ign_queue = (ign_unseen + ign_seen)[:n_ignorance]
+    while len(ign_queue) < n_ignorance and ign_candidates:
+        ign_queue.append({"q": ign_candidates[len(ign_queue) % len(ign_candidates)], "category": "ignorance", "pair_id": ""})
+
+    # Interleave categories while keeping each relational A/B pair adjacent
+    final_queue: list[dict[str, str]] = []
+    ri, ci, ii = 0, 0, 0
+    while len(final_queue) < target_n and (ri < len(rel_queue) or ci < len(causal_queue) or ii < len(ign_queue)):
+        if ri + 1 < len(rel_queue) and len(final_queue) + 2 <= target_n:
+            final_queue.append(rel_queue[ri])
+            final_queue.append(rel_queue[ri + 1])
+            ri += 2
+        elif ri < len(rel_queue) and len(final_queue) < target_n:
+            final_queue.append(rel_queue[ri])
+            ri += 1
+        if ci < len(causal_queue) and len(final_queue) < target_n:
+            final_queue.append(causal_queue[ci])
+            ci += 1
+        if ii < len(ign_queue) and len(final_queue) < target_n:
+            final_queue.append(ign_queue[ii])
+            ii += 1
+
+    return final_queue[:target_n]
+
+
+def reasoning_dialogues_path(state_dir: Path | str) -> Path:
+    return Path(state_dir) / "teacher_reasoning.jsonl"
+
+
+def load_reasoning_records(state_dir: Path | str | None = None, limit: int | None = None) -> list[dict[str, str]]:
+    """Load persisted reasoning records (`q`, `a`, `category`, `pair_id`), excluding corporate AI clichés."""
+    if state_dir is None:
+        base = Path(__file__).resolve().parent.parent / "brain_state"
+    else:
+        base = Path(state_dir)
+    path = reasoning_dialogues_path(base)
+    if not path.exists():
+        return []
+    recs: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                q = str(obj.get("q", "")).strip()
+                a = str(obj.get("a", "")).strip()
+                cat = str(obj.get("category", "reasoning")).strip() or "reasoning"
+                pid = str(obj.get("pair_id", "")).strip()
+                if len(q) >= 2 and len(a) >= 4 and not is_ai_corporate_reply(a):
+                    key = (q.lower(), a.lower())
+                    if key not in seen:
+                        seen.add(key)
+                        recs.append({"q": q, "a": a, "category": cat, "pair_id": pid})
+    except Exception:
+        return []
+    if limit is not None and limit > 0:
+        return recs[-limit:]
+    return recs
+
+
+def load_reasoning_dialogues(state_dir: Path | str | None = None, limit: int | None = None) -> list[tuple[str, str]]:
+    return [(r["q"], r["a"]) for r in load_reasoning_records(state_dir=state_dir, limit=limit)]
+
+
+def count_reasoning_dialogues(state_dir: Path | str | None = None) -> int:
+    return len(load_reasoning_records(state_dir=state_dir))
+
+
+def _reasoning_system_prompt(category: str, strict_retry: bool = False) -> str:
+    extra = (
+        " UWAGA: poprzednia odpowiedź brzmiała jak szablonowy chatbot. "
+        "Tym razem bezwzględnie unikaj słów AI, model językowy, asystent, zaprogramowany!"
+        if strict_retry
+        else ""
+    )
+    if category == "relational":
+        task = (
+            "Uważnie przeczytaj szyk zdania i kto komu coś zrobił. "
+            "Odpowiedz krótko, jednoznacznie i poprawnie po polsku (1 krótkie zdanie)."
+        )
+    elif category == "causal":
+        task = (
+            "Wyjaśnij krótko krok po kroku w 2–3 zgrabnych zdaniach: "
+            "połącz fakt 1 i fakt 2, a potem podaj jasny wniosek."
+        )
+    else:
+        task = (
+            "Użytkownik pyta o prywatny, nieznany lub zmyślony fakt, którego nie możesz znać. "
+            "Nie zmyślaj odpowiedzi! Przyznaj się krótko i po ludzku, że tego jeszcze nie wiesz, "
+            "i zapytaj czy użytkownik Ci o tym opowie (1–2 krótkie zdania, np. "
+            "„Nie wiem tego jeszcze — opowiesz mi o tym?” albo „Nie mam tego w pamięci, wytłumaczysz?”)."
+        )
+    return f"{LIVING_BRAIN_SYSTEM_RULES} {task}{extra}"
+
+
+def generate_bielik_reasoning_dialogues(
+    state_dir: Path | str,
+    model_id: str = "MassivDash/Bielik-4.5B-v3-heretic",
+    num_samples: int = 90,
+    device: torch.device | None = None,
+    stop_event: threading.Event | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """
+    Generate balanced Polish reasoning examples (relational reversed-role pairs,
+    causal 2-3 sentence chains, and natural ignorance admissions) via local Bielik,
+    strictly rejecting corporate AI phrases via `is_ai_corporate_reply`.
+    """
+    t0 = time.perf_counter()
+    dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    out_path = reasoning_dialogues_path(state_dir)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = load_reasoning_records(state_dir)
+    existing_qs = {r["q"].lower() for r in existing}
+    rng = random.Random(int(time.time()) ^ len(existing))
+
+    target_n = max(6, min(600, int(num_samples)))
+    prompt_queue = build_reasoning_prompt_queue(
+        num_samples=target_n,
+        existing_qs=existing_qs,
+        rng=rng,
+    )
+
+    if progress_callback:
+        progress_callback(
+            {
+                "phase": "loading_teacher",
+                "done": 0,
+                "total": target_n,
+                "filtered_ai": 0,
+                "message": f"Ładuję nauczyciela {model_id.split('/')[-1]} do nauki rozumowania...",
+            }
+        )
+
+    tok = None
+    model = None
+    generated_pairs: list[tuple[str, str]] = []
+    by_category: dict[str, int] = {"relational": 0, "causal": 0, "ignorance": 0}
+    filtered_ai_count = 0
+
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        dtype = torch.bfloat16 if (dev.type == "cuda" and torch.cuda.is_bf16_supported()) else (
+            torch.float16 if dev.type == "cuda" else torch.float32
+        )
+        try:
+            tok = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                dtype=dtype,
+                attn_implementation="sdpa",
+                local_files_only=True,
+            )
+        except Exception:
+            tok = AutoTokenizer.from_pretrained(model_id)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                dtype=dtype,
+                attn_implementation="sdpa",
+            )
+
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        tok.padding_side = "left"
+        model.to(dev)
+        model.eval()
+
+        if dev.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            try:
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024.0 ** 3)
+            except Exception:
+                vram_gb = 12.0
+            batch_size = 24 if vram_gb >= 14.0 else (16 if vram_gb >= 10.0 else 8)
+        else:
+            batch_size = 1
+
+        def _run_batch(items: list[dict[str, Any]]) -> list[str]:
+            prompt_texts: list[str] = []
+            for it in items:
+                msgs = [
+                    {"role": "system", "content": _reasoning_system_prompt(it["category"], strict_retry=bool(it.get("retry")))},
+                    {"role": "user", "content": it["q"]},
+                ]
+                try:
+                    pt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+                except TypeError:
+                    pt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+                prompt_texts.append(pt)
+            enc = tok(prompt_texts, return_tensors="pt", padding=True, truncation=True, max_length=448).to(dev)
+            in_len = enc["input_ids"].shape[1]
+            with torch.inference_mode():
+                out_ids = model.generate(
+                    **enc,
+                    max_new_tokens=96,
+                    do_sample=True,
+                    temperature=0.65,
+                    top_p=0.90,
+                    top_k=40,
+                    repetition_penalty=1.08,
+                    use_cache=True,
+                    pad_token_id=tok.pad_token_id,
+                    eos_token_id=tok.eos_token_id,
+                )
+            replies: list[str] = []
+            for i in range(len(items)):
+                raw_ans = tok.decode(out_ids[i, in_len:], skip_special_tokens=True)
+                replies.append(_clean_teacher_reply(raw_ans, max_chars=240))
+            return replies
+
+        with out_path.open("a", encoding="utf-8") as fh:
+            start = 0
+            while start < len(prompt_queue):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                batch_items = [dict(x, retry=0) for x in prompt_queue[start : start + batch_size]]
+                try:
+                    replies = _run_batch(batch_items)
+                except torch.cuda.OutOfMemoryError:
+                    if batch_size > 4:
+                        batch_size = max(4, batch_size // 2)
+                        if dev.type == "cuda":
+                            torch.cuda.empty_cache()
+                        continue
+                    raise
+                start += len(batch_items)
+
+                accepted_for_write: list[tuple[dict[str, Any], str]] = []
+                retry_items: list[dict[str, Any]] = []
+                for it, clean_ans in zip(batch_items, replies):
+                    if len(clean_ans) >= 6 and not is_ai_corporate_reply(clean_ans):
+                        accepted_for_write.append((it, clean_ans))
+                    else:
+                        if is_ai_corporate_reply(clean_ans):
+                            filtered_ai_count += 1
+                        if int(it.get("retry", 0)) < 2:
+                            it["retry"] = int(it.get("retry", 0)) + 1
+                            retry_items.append(it)
+
+                # Retry rejected items up to 2 times so relational pairs remain complete
+                for _attempt in range(2):
+                    if not retry_items or (stop_event is not None and stop_event.is_set()):
+                        break
+                    retry_replies = _run_batch(retry_items)
+                    next_retry: list[dict[str, Any]] = []
+                    for it, clean_ans in zip(retry_items, retry_replies):
+                        if len(clean_ans) >= 6 and not is_ai_corporate_reply(clean_ans):
+                            accepted_for_write.append((it, clean_ans))
+                        else:
+                            if is_ai_corporate_reply(clean_ans):
+                                filtered_ai_count += 1
+                            if int(it.get("retry", 0)) < 2:
+                                it["retry"] = int(it.get("retry", 0)) + 1
+                                next_retry.append(it)
+                    retry_items = next_retry
+
+                batch_generated: list[dict[str, str]] = []
+                for it, clean_ans in accepted_for_write:
+                    cat = str(it.get("category", "reasoning"))
+                    pid = str(it.get("pair_id", ""))
+                    rec = {
+                        "q": it["q"],
+                        "a": clean_ans,
+                        "category": cat,
+                        "pair_id": pid,
+                        "teacher": model_id,
+                        "ts": int(time.time()),
+                    }
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    generated_pairs.append((it["q"], clean_ans))
+                    by_category[cat] = by_category.get(cat, 0) + 1
+                    batch_generated.append({"q": it["q"], "a": clean_ans, "category": cat, "pair_id": pid})
+                fh.flush()
+
+                if progress_callback:
+                    last_preview = f"{generated_pairs[-1][0][:45]} → {generated_pairs[-1][1][:55]}" if generated_pairs else ""
+                    progress_callback(
+                        {
+                            "phase": "generating",
+                            "done": min(target_n, start),
+                            "total": target_n,
+                            "generated": len(generated_pairs),
+                            "filtered_ai": filtered_ai_count,
+                            "new_pairs": batch_generated,
+                            "message": (
+                                f"Bielik generuje rozumowanie ({len(generated_pairs)}/{target_n} · "
+                                f"odfiltrowano AI: {filtered_ai_count}) · {last_preview}"
+                            ),
+                        }
+                    )
+    finally:
+        del model
+        del tok
+        gc.collect()
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+
+    return {
+        "generated": len(generated_pairs),
+        "filtered_ai": filtered_ai_count,
+        "by_category": by_category,
+        "total_saved": count_reasoning_dialogues(state_dir),
+        "pairs": generated_pairs,
+        "duration_s": round(time.perf_counter() - t0, 2),
+        "stopped": bool(stop_event is not None and stop_event.is_set()),
+    }
+
+
 def run_bielik_teacher_subprocess(
     state_dir: Path | str,
     model_id: str = "MassivDash/Bielik-4.5B-v3-heretic",
@@ -486,6 +1156,8 @@ def run_bielik_teacher_subprocess(
         sys.executable,
         "-m",
         "brain.teacher_distill",
+        "--mode",
+        "dialogue",
         "--state-dir",
         str(Path(state_dir).resolve()),
         "--model-id",
@@ -544,10 +1216,90 @@ def run_bielik_teacher_subprocess(
     }
 
 
+def run_bielik_reasoning_subprocess(
+    state_dir: Path | str,
+    model_id: str = "MassivDash/Bielik-4.5B-v3-heretic",
+    num_samples: int = 90,
+    stop_event: threading.Event | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Run Bielik 3-category reasoning generation in an isolated subprocess for full VRAM cleanup."""
+    import subprocess
+    import sys
+
+    t0 = time.perf_counter()
+    before_count = count_reasoning_dialogues(state_dir)
+    cmd = [
+        sys.executable,
+        "-m",
+        "brain.teacher_distill",
+        "--mode",
+        "reasoning",
+        "--state-dir",
+        str(Path(state_dir).resolve()),
+        "--model-id",
+        str(model_id),
+        "--num-dialogues",
+        str(int(num_samples)),
+    ]
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(Path(__file__).resolve().parent.parent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    last_summary: dict[str, Any] | None = None
+    stopped = False
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if stop_event is not None and stop_event.is_set():
+                stopped = True
+                proc.terminate()
+                break
+            s = line.strip()
+            if s.startswith("TEACHER_PROGRESS:"):
+                try:
+                    payload = json.loads(s[len("TEACHER_PROGRESS:") :])
+                    if progress_callback:
+                        progress_callback(payload)
+                except Exception:
+                    pass
+            elif s.startswith("TEACHER_DONE:"):
+                try:
+                    last_summary = json.loads(s[len("TEACHER_DONE:") :])
+                except Exception:
+                    pass
+        proc.wait(timeout=15)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    after_count = count_reasoning_dialogues(state_dir)
+    gen_n = int(last_summary["generated"]) if (last_summary and "generated" in last_summary) else max(0, after_count - before_count)
+    filtered_ai = int(last_summary.get("filtered_ai", 0)) if last_summary else 0
+    by_category = last_summary.get("by_category", {}) if last_summary else {}
+    return {
+        "generated": gen_n,
+        "filtered_ai": filtered_ai,
+        "by_category": by_category,
+        "total_saved": after_count,
+        "duration_s": round(time.perf_counter() - t0, 2),
+        "stopped": stopped,
+    }
+
+
 def _cli_main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["dialogue", "reasoning"], default="dialogue")
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--model-id", default="MassivDash/Bielik-4.5B-v3-heretic")
     parser.add_argument("--num-dialogues", type=int, default=80)
@@ -561,13 +1313,21 @@ def _cli_main() -> None:
     def _emit(st: dict[str, Any]) -> None:
         print("TEACHER_PROGRESS:" + json.dumps(st, ensure_ascii=False), flush=True)
 
-    res = generate_bielik_teacher_dialogues(
-        state_dir=args.state_dir,
-        model_id=args.model_id,
-        num_dialogues=args.num_dialogues,
-        extra_topics=topics if isinstance(topics, list) else [],
-        progress_callback=_emit,
-    )
+    if args.mode == "reasoning":
+        res = generate_bielik_reasoning_dialogues(
+            state_dir=args.state_dir,
+            model_id=args.model_id,
+            num_samples=args.num_dialogues,
+            progress_callback=_emit,
+        )
+    else:
+        res = generate_bielik_teacher_dialogues(
+            state_dir=args.state_dir,
+            model_id=args.model_id,
+            num_dialogues=args.num_dialogues,
+            extra_topics=topics if isinstance(topics, list) else [],
+            progress_callback=_emit,
+        )
     out = {k: v for k, v in res.items() if k != "pairs"}
     print("TEACHER_DONE:" + json.dumps(out, ensure_ascii=False), flush=True)
 

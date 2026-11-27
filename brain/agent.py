@@ -15,8 +15,12 @@ import torch.nn.functional as F
 from .broca_llm import LocalPolishBrocaLLM
 from .living_brain import LivingBrainEngine, NeuromodulatorState, trim_process_ram
 from .teacher_distill import (
+    count_reasoning_dialogues,
     count_teacher_dialogues,
+    is_ai_corporate_reply,
+    load_reasoning_records,
     load_teacher_dialogues,
+    run_bielik_reasoning_subprocess,
     run_bielik_teacher_subprocess,
 )
 from .config import BrainConfig
@@ -2041,6 +2045,8 @@ class SleepingBrain:
         importances: list[int] = []
         seen_local: set[str] = set()
         for q, a in pairs:
+            if is_ai_corporate_reply(a):
+                continue
             if not self._is_substantive_teacher_knowledge(q, a):
                 continue
             lbl = a.strip()[:200]
@@ -2280,6 +2286,238 @@ class SleepingBrain:
             return {
                 "generated": generated_n,
                 "total_teacher_dialogues": len(all_teacher_pairs),
+                "short_term_engrams_added": st_ingest["engrams_added"],
+                "living_neurons_born": st_ingest["living_neurons_born"],
+                "train_result": train_res,
+            }
+        finally:
+            with self.lock:
+                self.study_state["active"] = False
+                self.study_state["current_action"] = ""
+                if self.state_mode == "STUDYING":
+                    self.state_mode = "AWAKE"
+            self._release_op("study")
+
+    def start_reasoning_bielik_async(
+        self,
+        num_samples: int = 90,
+        train_epochs: int = 160,
+        skip_generation: bool = False,
+    ) -> dict[str, Any]:
+        """Launch 3-category Bielik reasoning training (Relational + Causal + Ignorance) in background."""
+        n_samples = max(6, min(600, int(num_samples)))
+        n_ep = max(20, min(600, int(train_epochs)))
+        self._acquire_op("study")
+        with self.lock:
+            self._study_stop_event.clear()
+            self.state_mode = "STUDYING"
+            self.study_state = {
+                "active": True,
+                "topic": "🧠 Rozumowanie z Bielikiem (Relacje + Logika + Niewiedza)",
+                "round": 0,
+                "max_rounds": n_samples,
+                "mastery": 0.0,
+                "pages_read": 0,
+                "facts_learned": count_reasoning_dialogues(self.state_dir),
+                "current_action": "Przygotowuję trening rozumowania z Bielikiem (Relacje + Logika + Niewiedza)...",
+                "sources": [],
+                "summary": "",
+            }
+        try:
+            t = threading.Thread(
+                target=self.train_reasoning_with_bielik,
+                args=(n_samples, n_ep, bool(skip_generation), True),
+                daemon=True,
+            )
+            t.start()
+        except Exception:
+            with self.lock:
+                self.study_state["active"] = False
+                self.state_mode = "AWAKE"
+            self._release_op("study")
+            raise
+        return {
+            "started": True,
+            "num_samples": n_samples,
+            "train_epochs": n_ep,
+            "skip_generation": bool(skip_generation),
+            "existing_reasoning": count_reasoning_dialogues(self.state_dir),
+        }
+
+    def train_reasoning_with_bielik(
+        self,
+        num_samples: int = 90,
+        train_epochs: int = 160,
+        skip_generation: bool = False,
+        _op_acquired: bool = False,
+    ) -> dict[str, Any]:
+        if not _op_acquired:
+            self._acquire_op("study")
+        generated_n = 0
+        filtered_ai_n = 0
+        session_new_records: list[dict[str, str]] = []
+        session_new_pairs: list[tuple[str, str]] = []
+        cat_labels = {"relational": "Relacje", "causal": "Logika", "ignorance": "Niewiedza"}
+        with self.lock:
+            self.training_dialogue_feed.clear()
+        try:
+            if not skip_generation:
+                with self.lock:
+                    self._log("STUDY", f"Start nauki rozumowania z Bielikiem ({num_samples} przykładów: Relacje + Logika + Niewiedza)...")
+                    self._append_chat(
+                        "assistant",
+                        f"Rozpoczynam naukę rozumowania z lokalnym **Bielik-4.5B** ({num_samples} przykładów: "
+                        f"Relacje, Logika przyczynowa, Naturalna niewiedza). Formułki AI są blokowane.",
+                        meta={"kind": "study_start", "topic": "Rozumowanie z Bielikiem"},
+                        add_to_working=False,
+                    )
+
+                moved_to_cpu = False
+                if self.device.type == "cuda":
+                    with self.language_cortex._op_lock:
+                        self.language_cortex._wernicke_raw.to("cpu")
+                        self.language_cortex._broca_raw.to("cpu")
+                        self.cortex.to("cpu")
+                        moved_to_cpu = True
+                    torch.cuda.empty_cache()
+
+                gen_seen = 0
+
+                def _on_gen_progress(st: dict[str, Any]) -> None:
+                    nonlocal gen_seen
+                    done = int(st.get("done", 0))
+                    tot = max(1, int(st.get("total", num_samples)))
+                    pct = round(50.0 * done / tot, 1)
+                    new_pairs = st.get("new_pairs") or []
+                    with self.lock:
+                        self.study_state["round"] = done
+                        self.study_state["max_rounds"] = tot
+                        self.study_state["mastery"] = pct
+                        self.study_state["facts_learned"] = int(st.get("generated", done))
+                        self.study_state["current_action"] = str(st.get("message", "Generuję przykłady rozumowania..."))
+                        for pair in new_pairs:
+                            if not isinstance(pair, dict):
+                                continue
+                            pq = str(pair.get("q", ""))
+                            pa = str(pair.get("a", ""))
+                            pcat = str(pair.get("category", "reasoning"))
+                            if pq and pa and not is_ai_corporate_reply(pa):
+                                session_new_records.append({"q": pq, "a": pa, "category": pcat})
+                                session_new_pairs.append((pq, pa))
+                                gen_seen += 1
+                                c_lbl = cat_labels.get(pcat, pcat)
+                                self._push_training_dialogue(
+                                    mode="teacher_gen",
+                                    tag=f"Bielik · {c_lbl} #{gen_seen}/{tot}",
+                                    prompt_role="Pytanie",
+                                    prompt=pq,
+                                    teacher_role="Bielik (Nauczyciel)",
+                                    teacher_reply=pa,
+                                )
+
+                try:
+                    gen_res = run_bielik_reasoning_subprocess(
+                        state_dir=self.state_dir,
+                        model_id=self.cfg.teacher_model_id,
+                        num_samples=num_samples,
+                        stop_event=self._study_stop_event,
+                        progress_callback=_on_gen_progress,
+                    )
+                    generated_n = int(gen_res.get("generated", 0))
+                    filtered_ai_n = int(gen_res.get("filtered_ai", 0))
+                finally:
+                    if moved_to_cpu:
+                        with self.language_cortex._op_lock:
+                            self.language_cortex._wernicke_raw.to(self.device)
+                            self.language_cortex._broca_raw.to(self.device)
+                            self.cortex.to(self.device)
+                        if self.device.type == "cuda":
+                            torch.cuda.empty_cache()
+                    trim_process_ram()
+
+            all_reasoning_records = load_reasoning_records(self.state_dir)
+            all_reasoning_pairs = [(r["q"], r["a"]) for r in all_reasoning_records if not is_ai_corporate_reply(r["a"])]
+            base_pct = 50.0 if not skip_generation else 0.0
+            span_pct = 100.0 - base_pct
+            with self.lock:
+                self.study_state["round"] = 0
+                self.study_state["max_rounds"] = train_epochs
+                self.study_state["mastery"] = max(base_pct, 5.0)
+                self.study_state["facts_learned"] = len(all_reasoning_pairs)
+                self.study_state["current_action"] = (
+                    f"Bielik wyładowany z VRAM. Trenuję Wernicke + Broca na {len(all_reasoning_pairs)} przykładach "
+                    f"rozumowania + buforze polszczyzny ({train_epochs} epok)..."
+                )
+
+            def _on_brain_train_progress(st: dict[str, Any]) -> None:
+                ep = int(st.get("epoch", 0))
+                tot = max(1, int(st.get("total_epochs", train_epochs)))
+                phase = str(st.get("phase", "dialogue_train"))
+                loss_s = float(st.get("loss_start", 0.0))
+                loss_n = float(st.get("loss_now", 0.0))
+                flu = float(st.get("fluency", 0.0))
+                if phase == "dialogue_train":
+                    pct = round(base_pct + (span_pct * 0.85) * ep / tot, 1)
+                else:
+                    pct = round(base_pct + (span_pct * 0.85) + (span_pct * 0.10) * ep / tot, 1)
+                phase_lbl = "Szlifowanie rozumowania" if phase == "dialogue_polish" else "Trening rozumowania · epoka"
+                with self.lock:
+                    self.study_state["round"] = ep
+                    self.study_state["max_rounds"] = tot
+                    self.study_state["mastery"] = min(96.0, pct)
+                    self.study_state["current_action"] = (
+                        f"{phase_lbl} {ep}/{tot} · Loss: {loss_s:.2f}→{loss_n:.2f} · Płynność: {flu:.0f}%"
+                    )
+                    if st.get("fresh_probe") and st.get("sample_q"):
+                        self._push_training_dialogue(
+                            mode="dialogue_train",
+                            tag=f"{phase_lbl} {ep}/{tot} · loss {loss_n:.2f}",
+                            prompt_role="Pytanie",
+                            prompt=str(st["sample_q"]),
+                            teacher_role="Bielik (Wzorzec)",
+                            teacher_reply=str(st.get("sample_target", "")),
+                            brain_role="Twój mózg (na żywo)",
+                            brain_reply=str(st.get("sample_brain", "")) or "(jeszcze składa pierwsze słowa...)",
+                        )
+
+            probe_source = session_new_pairs if session_new_pairs else all_reasoning_pairs
+            train_res = self.language_cortex.train_language_cortex(
+                extra_qa_pairs=all_reasoning_pairs,
+                epochs=train_epochs,
+                include_curriculum=True,
+                cortex=self.cortex,
+                progress_callback=_on_brain_train_progress,
+                stop_event=self._study_stop_event,
+                priority_probe_pairs=probe_source,
+            )
+            self.language_cortex.ensure_familiarity_bank(force_rebuild=True)
+
+            # Only ingest substantive causal chains into Hippocampus (never ignorance/AI disclaimers)
+            causal_src = session_new_records if session_new_records else all_reasoning_records
+            causal_pairs = [(r["q"], r["a"]) for r in causal_src if r.get("category") == "causal"]
+            with self.lock:
+                self.study_state["mastery"] = 97.5
+                self.study_state["current_action"] = "Zapisuję łańcuchy przyczynowo-skutkowe do Hipokampu i Living Brain..."
+            st_ingest = self._ingest_teacher_pairs_to_short_term(
+                causal_pairs,
+                max_items=max(40, min(250, len(causal_pairs))),
+            ) if causal_pairs else {"engrams_added": 0, "living_steps": 0, "living_neurons_born": 0}
+            self.save_state()
+
+            msg_done = (
+                f"Trening rozumowania z Bielikiem zakończony! Nowe przykłady: **{generated_n}** "
+                f"(łącznie rozumowania: **{len(all_reasoning_pairs)}**, odrzucono formułek AI: **{filtered_ai_n}**). "
+                f"Loss: `{train_res['loss_start']} → {train_res['loss_end']}`, płynność: **{train_res['fluency']:.0f}%**."
+            )
+            with self.lock:
+                self.study_state["mastery"] = 100.0
+                self.study_state["current_action"] = msg_done
+                self._log("STUDY", msg_done)
+                self._append_chat("assistant", msg_done, meta={"kind": "study_done"}, add_to_working=False)
+            return {
+                "generated": generated_n,
+                "filtered_ai": filtered_ai_n,
+                "total_reasoning_dialogues": len(all_reasoning_pairs),
                 "short_term_engrams_added": st_ingest["engrams_added"],
                 "living_neurons_born": st_ingest["living_neurons_born"],
                 "train_result": train_res,
@@ -3630,6 +3868,7 @@ class SleepingBrain:
                 "teacher_distill": {
                     "teacher_model": self.cfg.teacher_model_id,
                     "saved_dialogues": count_teacher_dialogues(self.state_dir),
+                    "saved_reasoning": count_reasoning_dialogues(self.state_dir),
                 },
                 "self_correction_enabled": self.cfg.self_correction_enabled,
                 "study": dict(self.study_state),

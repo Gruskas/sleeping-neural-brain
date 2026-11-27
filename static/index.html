@@ -619,6 +619,16 @@
             <button id="teacherRetrainBtn" onclick="startBielikTeacher(true)" title="Wytrenuj własny mózg na już zapisanych dialogach bez ładowania Bielika">Trenuj na zebranych</button>
             <button id="teacherPreviewBtn" onclick="loadSavedTeacherDialogues()" title="Pokaż zapisane rozmowy wygenerowane przez Bielika">Podgląd dialogów</button>
           </div>
+          <div class="study-row">
+            <select id="reasoningSamplesCount" title="Ile przykładów rozumowania (po równo: Relacje, Logika, Niewiedza) ma wygenerować Bielik">
+              <option value="60">60 przykładów (3×20 · szybka)</option>
+              <option value="90" selected>90 przykładów (3×30 · zalecana)</option>
+              <option value="150">150 przykładów (3×50 · solidna)</option>
+              <option value="300">300 przykładów (3×100 · głęboka)</option>
+            </select>
+            <button id="teacherReasoningBtn" class="primary" onclick="startBielikReasoning(false)" style="flex:1">🧠 Ucz rozumowania z Bielikiem (Relacje + Logika + Niewiedza)</button>
+            <button id="teacherReasoningRetrainBtn" onclick="startBielikReasoning(true)" title="Wytrenuj mózg na już zapisanych przykładach rozumowania bez ładowania Bielika">Trenuj rozumowanie</button>
+          </div>
           <div class="sub" id="teacherInfo">Bielik generuje naturalne polskie dialogi na GPU, po czym zostaje wyładowany z VRAM, a Twój własny mózg uczy się z nich samodzielnie pisać.</div>
         </div>
 
@@ -1113,17 +1123,25 @@
 
       const tBtn = document.getElementById("teacherBtn");
       const tRetrainBtn = document.getElementById("teacherRetrainBtn");
+      const tReasBtn = document.getElementById("teacherReasoningBtn");
+      const tReasRetrainBtn = document.getElementById("teacherReasoningRetrainBtn");
       const tInfo = document.getElementById("teacherInfo");
       const td = s.teacher_distill || {};
       const savedDial = Number(td.saved_dialogues || 0);
+      const savedReas = Number(td.saved_reasoning || 0);
       if (tBtn) tBtn.disabled = !lc.ready || studying;
       if (tRetrainBtn) {
         tRetrainBtn.disabled = !lc.ready || studying || savedDial === 0;
         tRetrainBtn.textContent = savedDial > 0 ? `Trenuj na zebranych (${savedDial})` : "Trenuj na zebranych";
       }
+      if (tReasBtn) tReasBtn.disabled = !lc.ready || studying;
+      if (tReasRetrainBtn) {
+        tReasRetrainBtn.disabled = !lc.ready || studying || savedReas === 0;
+        tReasRetrainBtn.textContent = savedReas > 0 ? `Trenuj rozumowanie (${savedReas})` : "Trenuj rozumowanie";
+      }
       if (tInfo) {
-        tInfo.textContent = savedDial > 0
-          ? `Zapisanych dialogów od Bielika: ${savedDial} · Samokorekta słuchowa: WŁ (mózg sam słyszy i poprawia swoje odpowiedzi)`
+        tInfo.textContent = (savedDial > 0 || savedReas > 0)
+          ? `Zapisanych dialogów Bielika: ${savedDial} · Rozumowania (Relacje+Logika+Niewiedza): ${savedReas} · Samokorekta słuchowa: WŁ`
           : "Bielik wygeneruje naturalne polskie dialogi na GPU, zostanie wyładowany z VRAM, a Twój własny mózg nauczy się z nich pisać.";
       }
 
@@ -1740,6 +1758,20 @@
         skip_generation: Boolean(skipGen),
       });
       if (!res.ok) alert(res.error || "Nie udało się uruchomić nauki z Bielikiem.");
+      await poll();
+    }
+
+    async function startBielikReasoning(skipGen = false) {
+      savedDialoguesPreview = null;
+      trainingFeedCollapsed = false;
+      const sel = document.getElementById("reasoningSamplesCount");
+      const numSamples = Number(sel ? sel.value : 90);
+      const res = await api("/api/train_reasoning_bielik", {
+        num_samples: numSamples,
+        train_epochs: 160,
+        skip_generation: Boolean(skipGen),
+      });
+      if (!res.ok) alert(res.error || "Nie udało się uruchomić treningu rozumowania z Bielikiem.");
       await poll();
     }
 

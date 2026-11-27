@@ -27,6 +27,7 @@ from .sensory_wernicke import (
     encode_utf8_bytes,
     maybe_compile_module,
 )
+from .teacher_distill import is_ai_corporate_reply
 
 _PL_TRANS = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZZ")
 _CASUAL_FILLER_RE = re.compile(
@@ -1420,7 +1421,7 @@ class LanguageCortex:
         clean_new = [
             (q.strip(), a.strip()[:210])
             for q, a in pairs
-            if q and a and len(q.strip()) >= 2 and len(a.strip()) >= 6
+            if q and a and len(q.strip()) >= 2 and len(a.strip()) >= 6 and not is_ai_corporate_reply(a)
         ]
         if not clean_new:
             return None
@@ -1605,6 +1606,7 @@ class LanguageCortex:
         register_questions: bool = True,
         progress_callback: Any | None = None,
         stop_event: threading.Event | None = None,
+        priority_probe_pairs: list[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
         """
         Tokenless Dialogue + Q&A Fine-Tuning through the full cognitive pipeline:
@@ -1743,9 +1745,15 @@ class LanguageCortex:
             ep_loss_gpu = torch.zeros((), device=self.device, dtype=torch.float32)
 
             probe_pool = [
-                (q, a) for q, a in clean_pairs
-                if not q.startswith("__") and 2 <= len(q) <= 140 and len(a) >= 6
+                (q.strip(), a.strip())
+                for q, a in (priority_probe_pairs or [])
+                if q and a and not q.strip().startswith("__") and 2 <= len(q.strip()) <= 180 and len(a.strip()) >= 4
             ]
+            if not probe_pool:
+                probe_pool = [
+                    (q, a) for q, a in clean_pairs
+                    if not q.startswith("__") and 2 <= len(q) <= 140 and len(a) >= 6
+                ]
             if probe_pool:
                 random.shuffle(probe_pool)
             probe_idx = 0
@@ -2070,6 +2078,7 @@ class LanguageCortex:
         extra_qa_pairs: list[tuple[str, str]] | None = None,
         progress_callback: Any | None = None,
         stop_event: threading.Event | None = None,
+        priority_probe_pairs: list[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
         if cortex is not None:
             merged_extra = list(self._learned_qa_replay)
@@ -2091,6 +2100,7 @@ class LanguageCortex:
                 early_stop_loss=self.cfg.broca_dialogue_early_stop_loss,
                 progress_callback=progress_callback,
                 stop_event=stop_event,
+                priority_probe_pairs=priority_probe_pairs,
             )
         corpus = build_denoising_corpus(
             extra_texts=extra_texts,

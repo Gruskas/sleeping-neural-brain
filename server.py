@@ -203,6 +203,18 @@ class BrainServer:
                         self._send_json({"ok": True, **res})
                         return
 
+                    if parsed.path == "/api/train_reasoning_bielik":
+                        num_samples = int(body.get("num_samples", 90))
+                        train_epochs = int(body.get("train_epochs", 160))
+                        skip_generation = bool(body.get("skip_generation", False))
+                        res = brain.start_reasoning_bielik_async(
+                            num_samples=num_samples,
+                            train_epochs=train_epochs,
+                            skip_generation=skip_generation,
+                        )
+                        self._send_json({"ok": True, **res})
+                        return
+
                     if parsed.path == "/api/training_feed/clear":
                         brain.clear_training_dialogue_feed()
                         self._send_json({"ok": True})
