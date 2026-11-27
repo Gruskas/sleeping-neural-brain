@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import torch
+import torch.nn.functional as F
 
 from .broca_llm import LocalPolishBrocaLLM
 from .living_brain import LivingBrainEngine, NeuromodulatorState, trim_process_ram
