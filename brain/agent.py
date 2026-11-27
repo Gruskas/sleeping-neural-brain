@@ -47,6 +47,7 @@ from .sleep_engine import SleepEngine, SleepReport
 from .web_learner import (
     chunk_text,
     clean_search_query,
+    extract_contextual_answer,
     extract_lead_definition,
     fetch_random_wikipedia_titles,
     gather_web_sources,
@@ -80,6 +81,15 @@ class SleepingBrain:
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device.type == "cuda":
+            # Hard-cap per-process CUDA memory to 75% on <=18 GB GPUs so Windows WDDM
+            # NEVER silently spills VRAM into System RAM (leaves ~4 GB for OS + browser).
+            try:
+                total_gb = torch.cuda.get_device_properties(0).total_memory / (1024.0 ** 3)
+                if total_gb <= 18.0:
+                    torch.cuda.set_per_process_memory_fraction(0.75, 0)
+            except Exception:
+                pass
         self.lock = threading.RLock()
 
         # Core biological brain organs
@@ -551,10 +561,26 @@ class SleepingBrain:
             return False
         followup_cues = (
             "dlaczego", "czemu", "rozwin", "powiedz wiecej", "wiecej o tym", "a co", "a jak",
-            "a dlaczego", "i co", "co dalej", "podaj przyklad", "jak to", "dokladniej",
-            "o co chodzi", "serio", "no i", "wyjasnij prosciej", "prosciej", "krotko",
+            "a dlaczego", "a czemu", "a skad", "i co", "co dalej", "podaj przyklad", "jak to",
+            "dokladniej", "o co chodzi", "serio", "no i", "wyjasnij prosciej", "prosciej", "krotko",
+            "skad sie", "oni ", "one ", "o nich", "o nim", "o niej", "o tym", "na ten temat",
         )
-        return any(low.startswith(c) or c in low for c in followup_cues)
+        return any(low.startswith(c) or f" {c}" in f" {low} " for c in followup_cues)
+
+    def _extract_recent_topic(self) -> str:
+        """Extract the active subject/topic from the most recent turns in working_chat."""
+        with self.lock:
+            recent = list(self.working_chat[-4:])
+        for m in reversed(recent):
+            if m.get("role") != "user":
+                continue
+            raw = str(m.get("content", "")).strip()
+            if not raw or self._is_followup_query(raw):
+                continue
+            cand = clean_search_query(raw)
+            if 2 <= len(cand) <= 50 and len(cand.split()) <= 5:
+                return cand
+        return ""
 
     @staticmethod
     def _extract_conversational_qa_pairs(msg: str) -> list[tuple[str, str]]:
@@ -2711,19 +2737,22 @@ class SleepingBrain:
             "nie wiem", "wiem to", "juz to wiem", "znam to", "o co chodzi", "ty mi powiedz",
             "co tam", "jak tam", "co slychac", "jak sie masz", "co u ciebie", "a co jak",
             "dlaczego ty", "czemu ty", "co robisz", "co myslisz", "powiedz cos", "opowiedz cos",
+            "moj ", "moja ", "moje ", "mojego ", "mojej ", "moim ", "o mnie", "mam na imie",
         )
         if any(b in low for b in chatter_block):
             return False
         factual_prefixes = (
             "co to jest ", "co to sa ", "co to ", "co znaczy ", "co oznacza ",
             "kto to jest ", "kto to byl ", "kto to ", "kim jest ", "kim byl ", "kim byla ",
-            "kto wynalazl ", "kto napisal ", "kto stworzyl ",
-            "czym jest ", "czym sa ", "definicja ", "znaczenie ",
-            "kiedy byl ", "kiedy byla ", "gdzie lezy ", "gdzie jest ",
+            "kto wynalazl ", "kto napisal ", "kto stworzyl ", "kto odkryl ", "kto zalozyl ",
+            "kto wygral ", "kto zdobyl ", "czym jest ", "czym sa ", "definicja ", "znaczenie ",
+            "kiedy byl ", "kiedy byla ", "kiedy bylo ", "gdzie lezy ", "gdzie jest ",
+            "jak dziala ", "jak powstaj", "ile wynosi ", "ile ma ",
+            "skad sie ", "skad pochodz", "dlaczego ", "czemu ",
         )
         if any(low.startswith(p) for p in factual_prefixes) and len(low) >= 8:
             q_clean = clean_search_query(s)
-            return 2 <= len(q_clean) <= 48 and 1 <= len(q_clean.split()) <= 4
+            return 2 <= len(q_clean) <= 56 and 1 <= len(q_clean.split()) <= 5
         return False
 
     def _prepare_tensor_thought(
@@ -2773,35 +2802,59 @@ class SleepingBrain:
         else:
             wm_weight = 0.0
 
-        # Auto-sieć: ONLY for genuine encyclopedic/factual definition queries (NEVER conversational chatter!),
-        # and strictly using authoritative Polish Wiktionary + Polish Wikipedia (zero cookie-banner web spam!).
+        # Auto-sieć: encyclopedic/factual queries AND contextual follow-ups on the active topic
+        # (e.g. 'skąd się oni biorą?' right after 'co to jest gej?'), strictly using Polish Wikipedia
+        # + Wiktionary and learning into Hippocampus SDR + neural Broca weights via adapt_qa_online!
         auto_web_note = ""
         auto_web_adapted = False
-        if self.auto_web and self._is_factual_web_query(msg) and q_fam < 0.78 and not conv_pairs:
+        recent_topic = self._extract_recent_topic() if is_followup else ""
+        can_auto_web = self.auto_web and q_fam < 0.78 and not conv_pairs and (
+            self._is_factual_web_query(msg)
+            or (is_followup and bool(recent_topic) and len(msg.strip()) >= 5)
+        )
+        if can_auto_web:
             try:
                 q_clean = clean_search_query(msg)
-                docs = gather_web_sources(
-                    query=q_clean,
-                    seen_urls=set(),
-                    max_docs=1,
-                    timeout=6,
-                    max_workers=2,
-                    encyclopedic_only=True,
-                )
+                search_candidates: list[str] = []
+                if is_followup and recent_topic:
+                    # Prefer the active conversation topic so pronouns ('oni', 'to', 'czemu?') resolve cleanly!
+                    if q_clean and q_clean.lower() not in recent_topic.lower() and len(q_clean.split()) <= 3:
+                        search_candidates.append(f"{recent_topic} {q_clean}")
+                    search_candidates.append(recent_topic)
+                elif q_clean:
+                    search_candidates.append(q_clean)
+
+                docs = []
+                used_query = q_clean or recent_topic
+                for cand_q in search_candidates:
+                    docs = gather_web_sources(
+                        query=cand_q,
+                        seen_urls=set(),
+                        max_docs=2,
+                        timeout=6,
+                        max_workers=2,
+                        encyclopedic_only=True,
+                        prefer_wikipedia=True,
+                    )
+                    if docs:
+                        used_query = cand_q
+                        break
+
                 if docs:
-                    raw_lead = extract_lead_definition(docs[0])
-                    lead = _short_answer_from_fact(raw_lead, max_chars=185) if raw_lead else ""
+                    best_doc = next((d for d in docs if d.source.startswith("wikipedia_")), docs[0])
+                    raw_lead = extract_contextual_answer(best_doc, msg, max_chars=220) or extract_lead_definition(best_doc)
+                    lead = _short_answer_from_fact(raw_lead, max_chars=215) if raw_lead else ""
                     if lead and len(lead) >= 24 and not lead.endswith("?") and not is_web_boilerplate(lead):
                         self._ingest_sensory_texts(
-                            [lead], category="nauka_z_sieci", importances=[4], topic=q_clean, source_url=docs[0].url
+                            [lead], category="nauka_z_sieci", importances=[4], topic=used_query, source_url=best_doc.url
                         )
-                        new_loss = self.language_cortex.adapt_qa_online(msg, lead, cortex=self.cortex, steps=60)
+                        new_loss = self.language_cortex.adapt_qa_online(msg, lead, cortex=self.cortex, steps=40)
                         auto_web_adapted = True
                         with self.lock:
                             engram_bank = self.hippocampus.get_hopfield_bank()
                         w_out, q_fam, _ = self.language_cortex.perceive_for_chat(msg)
                         auto_web_note = (
-                            f"Auto-sieć sprawdziła „{docs[0].title}”, zakodowała do SDR i zaktualizowała Z* (loss={new_loss:.2f})"
+                            f"Auto-sieć sprawdziła „{best_doc.title}”, zakodowała do SDR i zaktualizowała Z* (loss={new_loss:.2f})"
                         )
                         self._log("WEB", auto_web_note)
             except Exception:
@@ -2839,26 +2892,53 @@ class SleepingBrain:
         except Exception:
             pass
 
-        # Let the brain ALWAYS think continuously via System-2 3-path cortical deliberation + Working Memory SDR
-        # instead of blocking novel Polish sentences behind a rigid OOD wall!
-        # Only pure gibberish (non-Polish / q_fam < 0.42 or failed neural self-critique NLL > 1.45) falls back to uncertainty.
+        # Check Hippocampus similarity too: if the brain DOES have a strong memory in Hippocampus,
+        # let System-2 deliberation answer instead of prematurely triggering uncertainty!
+        hippo_best_sim = 0.0
+        if engram_bank is not None and engram_bank.shape[0] > 0:
+            try:
+                with torch.no_grad():
+                    q_u = F.normalize(w_out.sdr[:1].float(), dim=-1, eps=1e-6)
+                    if hasattr(engram_bank, "matmul_right_t"):
+                        sims_h = engram_bank.matmul_right_t(q_u)
+                    else:
+                        sims_h = q_u @ F.normalize(engram_bank.float(), dim=-1, eps=1e-6).T
+                    hippo_best_sim = float(sims_h.max().item())
+            except Exception:
+                hippo_best_sim = 0.0
+
+        # Unknown / out-of-distribution gate (100% neural Broca decoding, zero hardcoded replies):
         ood_note = ""
         critique_notes: list[str] = []
         used_temp = temp
         has_fam_bank = self.language_cortex._known_q_sdrs.shape[0] > 0
         alpha_ratio = sum(1 for ch in msg if ch.isalpha()) / float(max(1, len(msg)))
         looks_gibberish = (alpha_ratio < 0.45 and len(msg) >= 6) or (
-            has_fam_bank and q_fam < 0.42 and not conv_pairs and wm_weight == 0.0
+            has_fam_bank
+            and q_fam < 0.72
+            and hippo_best_sim < 0.70
+            and not conv_pairs
+            and not auto_web_adapted
         )
         if looks_gibberish:
+            low_q = f" {_strip_pl(msg.lower())} "
+            is_personal_q = any(
+                w in low_q for w in (" moj ", " moja ", " moje ", " mojego ", " mojej ", " moim ", " mnie ", " u mnie ")
+            )
+            ood_cue = "__nieznane_pytanie__"
+            if is_personal_q:
+                _, pers_fam, _ = self.language_cortex.perceive_for_chat("__pytanie_osobiste__")
+                if pers_fam >= 0.90:
+                    ood_cue = "__pytanie_osobiste__"
             _, thought, stream_iter = self.language_cortex.think_and_stream(
-                user_message="__nieznane_pytanie__",
+                user_message=ood_cue,
                 cortex=self.cortex,
                 engram_bank=None,
-                temperature=min(temp, 0.55),
+                temperature=min(0.85, max(0.72, temp)),
                 max_new_bytes=self.cfg.broca_max_new_bytes,
+                noise_std=0.01,
             )
-            ood_note = f"Nierozpoznany bodziec (q_fam={q_fam:.2f}) → naturalna odpowiedź o braku wiedzy"
+            ood_note = f"Nowy temat (q_fam={q_fam:.2f}, hippo={hippo_best_sim:.2f}) → 100% neuronowa odpowiedź Broki ({ood_cue})"
         else:
             # System-2 batched parallel deliberation + Auditory Self-Hearing & Active Self-Correction
             # Only inject PFC working-memory turn slots when wm_weight > 0 (follow-up queries),
@@ -3566,6 +3646,9 @@ class SleepingBrain:
             self.save_state()
             return report
         finally:
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            trim_process_ram()
             if not _from_nested:
                 self._release_op("sleep")
 
@@ -3660,17 +3743,16 @@ class SleepingBrain:
             tmp_ckpt = self.state_dir / "brain_weights.pt.tmp"
             tmp_meta = self.state_dir / "brain_memory.json.tmp"
 
-            torch.save(
-                {
-                    "version": CHECKPOINT_VERSION,
-                    "cortex": self.cortex.export_state(),
-                    "language_cortex": self.language_cortex.export_state(),
-                    "hippocampus_engrams": self.hippocampus.export_sparse_tensors(),
-                    "living_brain": self.living_brain.export_state(),
-                    "working_memory_slots": self._wm_slot_buf[: self._wm_slot_count].detach().cpu().to(torch.bfloat16),
-                },
-                tmp_ckpt,
-            )
+            ckpt_payload = {
+                "version": CHECKPOINT_VERSION,
+                "cortex": self.cortex.export_state(),
+                "language_cortex": self.language_cortex.export_state(),
+                "hippocampus_engrams": self.hippocampus.export_sparse_tensors(),
+                "living_brain": self.living_brain.export_state(),
+                "working_memory_slots": self._wm_slot_buf[: self._wm_slot_count].detach().cpu().to(torch.bfloat16),
+            }
+            torch.save(ckpt_payload, tmp_ckpt)
+            del ckpt_payload
             os.replace(tmp_ckpt, ckpt_path)
 
             meta = {
@@ -3725,7 +3807,10 @@ class SleepingBrain:
                 self._backup_legacy_files([ckpt_path, meta_path], "stara wersja tokenowa JSON")
                 return False
 
-            weights = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            try:
+                weights = torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
+            except Exception:
+                weights = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             if not isinstance(weights, dict) or weights.get("version") != CHECKPOINT_VERSION:
                 self._backup_legacy_files([ckpt_path, meta_path], "stara wersja tokenowa PT")
                 return False
@@ -3756,9 +3841,9 @@ class SleepingBrain:
                     self._wm_slot_count = take
 
             del weights
-            gc.collect()
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
+            trim_process_ram()
 
             self.day = int(meta.get("day", 1))
             self.energy = self.cfg.max_energy

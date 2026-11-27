@@ -416,10 +416,15 @@ BASE_HUMAN_DIALOGUES: list[tuple[str, str]] = [
     ("do czego służy pamięć RAM?", "Pamięć RAM przechowuje dane tymczasowe aktualnie uruchomionych programów."),
     ("do czego służy dysk SSD?", "Dysk SSD służy do szybkiego i trwałego przechowywania systemu operacyjnego oraz plików."),
     ("co to jest internet?", "Internet to globalna sieć komputerowa łącząca urządzenia na całym świecie za pomocą protokołów TCP/IP."),
-    # ── 8. Stan niepewności dla nieznanych tematów (OOD attractor — naturalnie po ludzku) ──
-    ("__nieznane_pytanie__", "Szczerze mówiąc, nie wiem — nie kojarzę tego."),
-    ("nieznany temat brak wiedzy", "Nie wiem, pierwszy raz o tym słyszę."),
-    ("co to jest nieznane pojęcie", "Szczerze? Nie mam pojęcia, co to dokładnie jest."),
+    # ── 8. Stan niepewności i naturalnego dopytywania (OOD attractor — 100% dekodowane przez Brokę) ──
+    ("__nieznane_pytanie__", "Szczerze mówiąc, nie wiem — opowiesz mi krótko, o co chodzi?"),
+    ("__nieznane_pytanie__", "Ciekawe pytanie, ale tego jeszcze nie znam! Podpowiesz mi, to zapamiętam."),
+    ("__nieznane_pytanie__", "Nie mam tego jeszcze w pamięci — jak Ty na to patrzysz?"),
+    ("__nieznane_pytanie__", "Pierwszy raz trafiam na ten temat i nie chcę zmyślać — nauczysz mnie?"),
+    ("__pytanie_osobiste__", "Jeszcze mi o tym nie mówiłeś! Powiedz mi, a od razu to zapamiętam."),
+    ("__pytanie_osobiste__", "Nie zdradziłeś mi jeszcze tego — podpowiesz mi, żebym wiedział na przyszłość?"),
+    ("nieznany temat brak wiedzy", "Nie wiem, pierwszy raz o tym słyszę — wytłumaczysz mi krótko?"),
+    ("co to jest nieznane pojęcie", "Szczerze? Nie mam pojęcia, co to dokładnie jest — opowiesz mi?"),
 ]
 
 

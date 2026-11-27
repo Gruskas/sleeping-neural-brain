@@ -104,7 +104,7 @@ def clean_search_query(raw: str) -> str:
     patterns = [
         r"^(?:sam\s+si[eę]\s+naucz|naucz\s+si[eę]|dowiedz\s+si[eę]|zbadaj|sprawd[zź]|powiedz\s+mi|wyja[sś]nij|wyt[lł]umacz|poczytaj(?:\s+o)?)\s+",
         r"^(?:z\s+sieci|z\s+internetu|w\s+sieci|w\s+internecie)\s+",
-        r"^(?:co\s+to\s+(?:jest|s[aą])|kto\s+to\s+(?:jest|by[lł])|czym\s+(?:jest|s[aą])|o\s+tym\s+|o\s+|na\s+temat\s+)+",
+        r"^(?:co\s+to\s+(?:jest|s[aą])|kto\s+to\s+(?:jest|by[lł])|czym\s+(?:jest|s[aą])|kto\s+(?:wygra[lł]|zdoby[lł]|wynalaz[lł]|napisa[lł]|stworzy[lł]|odkry[lł]|za[lł]o[zż]y[lł])|kiedy\s+(?:by[lł][aoy]?|rozpocz[eę][lł][aoy]?|zako[nń]czy[lł][aoy]?)|gdzie\s+(?:le[zż]y|jest|znajduje\s+si[eę])|jak\s+(?:dzia[lł]a|powstaj[eą]?)|sk[aą]d\s+(?:si[eę]\s+)?(?:bior[aą]|bierze|pochodz[iiaą]|wzi[eę][lł][aoy]?)|dlaczego\s+(?:istniej[aąe]?|s[aą]|jest)?|czemu\s+|czy\s+|o\s+tym\s+|o\s+|na\s+temat\s+)+",
     ]
     for _ in range(4):
         prev = q
@@ -374,6 +374,75 @@ def extract_lead_definition(doc: WebDocument) -> str | None:
     return None
 
 
+def extract_contextual_answer(doc: WebDocument, question: str, max_chars: int = 230) -> str | None:
+    """
+    Extract the most question-relevant 1–2 factual Polish sentences from a Wikipedia/Wiktionary
+    document (e.g. winner/final for 'kto wygrał...', causes/origins for 'skąd się biorą/dlaczego...'),
+    falling back cleanly to `extract_lead_definition(doc)` when the lead is already best.
+    """
+    txt = (doc.text or "").strip()
+    if not txt:
+        return None
+    if doc.source.startswith("wiktionary_"):
+        return extract_lead_definition(doc)
+
+    q_low = _strip_pl((question or "").lower())
+    intent_roots: list[str] = []
+    if any(k in q_low for k in ("wygral", "zdobyl", "zwyciez", "mistrz")):
+        intent_roots.extend(["wygra", "zwyci", "mistrz", "fina", "pokona", "zdoby", "tytu"])
+    if any(k in q_low for k in ("skad", "biora", "bierze", "dlaczego", "czemu", "przyczyn", "powstaj")):
+        intent_roots.extend(["przyczyn", "pochodz", "biolog", "genety", "powsta", "wynika", "czynnik", "uwarunk", "wywol", "zjawisk", "hormon", "ewoluc"])
+    if any(k in q_low for k in ("kiedy", "ktorym roku")):
+        intent_roots.extend(["roku", "wieku", "odby", "rozpocz", "zakoncz", "urodz", "zmarl"])
+    if any(k in q_low for k in ("gdzie", "lezy")):
+        intent_roots.extend(["lezy", "znajduj", "polozon", "kontynen", "panstw", "region", "granicz"])
+
+    # Only run deeper sentence selection when the question asks a specific non-definitional intent
+    if not intent_roots:
+        return extract_lead_definition(doc)
+
+    q_words = [
+        _strip_pl(w.lower())[:6]
+        for w in re.findall(r"[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ0-9]{4,}", clean_search_query(question))
+        if _strip_pl(w.lower()) not in ("jest", "biora", "bierze", "dlaczego", "czemu", "kiedy", "gdzie", "skad")
+    ]
+    # Split first ~7500 chars into clean sentences (skipping wiki section headings == ... ==)
+    clean_body = re.sub(r"==+[^=]+==+", "\n", txt[:7500])
+    clean_body = re.sub(r"\[\d+\]", "", clean_body)
+    raw_sents = re.split(r"(?<=[.!?])\s+", re.sub(r"\s+", " ", clean_body).strip())
+
+    best_score = 0.0
+    best_idx = -1
+    for idx, sent in enumerate(raw_sents[:90]):
+        s = sent.strip()
+        if len(s) < 35 or len(s) > 320 or is_web_boilerplate(s):
+            continue
+        s_fold = _strip_pl(s.lower())
+        hits_intent = sum(1 for r in intent_roots if r in s_fold)
+        if hits_intent == 0:
+            continue
+        hits_kw = sum(1 for kw in q_words if kw in s_fold)
+        pos_bonus = 0.4 if idx < 8 else (0.15 if idx < 25 else 0.0)
+        score = hits_intent * 1.5 + hits_kw * 0.8 + pos_bonus
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    if best_idx >= 0 and best_score >= 1.5:
+        picked = raw_sents[best_idx].strip()
+        if len(picked) < max_chars - 60 and best_idx + 1 < len(raw_sents):
+            nxt = raw_sents[best_idx + 1].strip()
+            if 25 <= len(nxt) <= (max_chars - len(picked) - 2) and not is_web_boilerplate(nxt):
+                picked = f"{picked} {nxt}"
+        if len(picked) > max_chars:
+            cut = picked[:max_chars]
+            last_dot = cut.rfind(".")
+            picked = cut[: last_dot + 1] if last_dot > 80 else cut.rstrip(" ,;:") + "."
+        return picked
+
+    return extract_lead_definition(doc)
+
+
 def is_relevant_doc(doc: WebDocument, query: str, fallback_topic: str = "") -> bool:
     """Reject unrelated search hits (e.g. Kaposi's sarcoma for 'node.ks')."""
     if doc.source.startswith("wiktionary_"):
@@ -414,11 +483,12 @@ def gather_web_sources(
     timeout: int = 12,
     max_workers: int = 3,
     encyclopedic_only: bool = False,
+    prefer_wikipedia: bool = False,
 ) -> list[WebDocument]:
     """
     Gather high-signal, relevance-checked Polish & English web documents:
       0) Direct HTTP/HTTPS URL fetch when user passes a link directly
-      1) Polish Wiktionary (exact definitions & etymology for single terms like 'kunktator')
+      1) Polish Wiktionary (or Polish Wikipedia first when `prefer_wikipedia=True`)
       2) Polish Wikipedia (with automatic typo-suggestion retry & full multi-article fetch)
       3) English Wikipedia fallback (for technical topics like C++ pointers)
       4) General Web via DuckDuckGo Lite/HTML (fetched concurrently)
@@ -445,16 +515,25 @@ def gather_web_sources(
         collected.append(doc)
         return len(collected) >= max_docs
 
-    # 1) Polish Wiktionary for concise terms (1–2 words)
-    if len(clean.split()) <= 2:
-        for d in search_wiktionary(clean, lang="pl", timeout=timeout):
+    if prefer_wikipedia:
+        for d in search_wikipedia(clean, lang="pl", limit=max_docs, timeout=timeout):
             if add_doc(d):
                 return collected
+        if len(clean.split()) <= 2:
+            for d in search_wiktionary(clean, lang="pl", timeout=timeout):
+                if add_doc(d):
+                    return collected
+    else:
+        # 1) Polish Wiktionary for concise terms (1–2 words)
+        if len(clean.split()) <= 2:
+            for d in search_wiktionary(clean, lang="pl", timeout=timeout):
+                if add_doc(d):
+                    return collected
 
-    # 2) Polish Wikipedia (now fetches ALL top articles cleanly with typo retry!)
-    for d in search_wikipedia(clean, lang="pl", limit=max_docs, timeout=timeout):
-        if add_doc(d):
-            return collected
+        # 2) Polish Wikipedia (now fetches ALL top articles cleanly with typo retry!)
+        for d in search_wikipedia(clean, lang="pl", limit=max_docs, timeout=timeout):
+            if add_doc(d):
+                return collected
 
     # 3) English Wikipedia (great for programming/science/C++ topics; skipped in strict Polish live Auto-sieć)
     if not encyclopedic_only and len(collected) < max_docs:

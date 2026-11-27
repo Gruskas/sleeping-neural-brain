@@ -380,15 +380,15 @@ class _BrocaDecoderBlock(nn.Module):
         attn_cross = attn_cross.transpose(1, 2).contiguous().view(b, t, d)
         x = x + self.drop2(self.out_cross(attn_cross))
 
-        # 2b) FiLM modulation from Z* summary (cached once during decoding for ~20% faster generation!)
+        # 2b) AdaLN-FiLM modulation from Z* summary on normalized FFN input
+        # (prevents exponential 1.5^10 residual stream explosion across 10 layers!)
         if film_cache is not None:
             scale, shift = film_cache
         else:
             scale, shift = self.precompute_film(z_summary)
-        x = x * scale + shift
 
         # 3) Sparse MoE FFN (or dense SwiGLU)
-        h3 = self.norm3(x)
+        h3 = self.norm3(x) * scale + shift
         if self.use_moe:
             ff_out, aux_loss, z_loss = self.ff(h3, token_mask=token_mask, compute_aux=compute_aux)
         else:
@@ -543,29 +543,62 @@ class BrocaByteTransformer(nn.Module):
             return self.z_summary_norm(0.85 * primary_sum + 0.15 * extra_mean)
         return primary_sum
 
+    def _norm_z_proj(self, t: torch.Tensor) -> torch.Tensor:
+        """Keep bos_z_proj / out_z_proj at bounded unit-RMS scale matching byte_emb & final_norm."""
+        if hasattr(F, "rms_norm"):
+            return F.rms_norm(t, (self.dim,), eps=1e-6)
+        return t * torch.rsqrt(t.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+
     @torch.no_grad()
     def maybe_repair_collapsed_conditioning(self) -> bool:
         """
-        Detect & repair rank-1 conditioning collapse (e.g. after long raw-text Parquet pretraining
-        where `z_summary_proj` develops a huge constant bias direction with sv[0] >> sv[1] and maps
-        every question to the same z_summary / bos_z vector). Keeps all Polish LM weights intact!
+        Detect & repair two pathologies that can occur after heavy raw-text Parquet pretraining:
+          1. Rank-1 conditioning collapse in `z_summary_proj` (sv[0] >> sv[1]).
+          2. Exploded MoE / attention / RMSNorm weight scales that blow the residual stream up to
+             10,000–100,000 in bfloat16 and drown out Z_ctx cross-attention.
+        Rescaling is direction-preserving so learned Polish syntax stays intact!
         """
+        repaired = False
         w = self.z_summary_proj.weight.detach().float()
-        if w.ndim != 2 or min(w.shape) < 4:
-            return False
-        try:
-            svs = torch.linalg.svdvals(w)
-            sv0 = float(svs[0].item())
-            sv1 = float(svs[1].item()) if svs.numel() > 1 else 1.0
-        except Exception:
-            return False
-        if sv0 > 12.0 and (sv0 / max(sv1, 1e-6)) > 1.65:
-            nn.init.xavier_uniform_(self.z_col_compress.weight)
-            nn.init.xavier_uniform_(self.z_summary_proj.weight)
-            nn.init.xavier_uniform_(self.bos_z_proj.weight)
-            nn.init.xavier_uniform_(self.out_z_proj.weight)
-            return True
-        return False
+        if w.ndim == 2 and min(w.shape) >= 4:
+            try:
+                svs = torch.linalg.svdvals(w)
+                sv0 = float(svs[0].item())
+                sv1 = float(svs[1].item()) if svs.numel() > 1 else 1.0
+                if sv0 > 12.0 and (sv0 / max(sv1, 1e-6)) > 1.65:
+                    nn.init.xavier_uniform_(self.z_col_compress.weight)
+                    nn.init.xavier_uniform_(self.z_summary_proj.weight)
+                    nn.init.xavier_uniform_(self.bos_z_proj.weight)
+                    nn.init.xavier_uniform_(self.out_z_proj.weight)
+                    repaired = True
+            except Exception:
+                pass
+
+        # Direction-preserving spectral rescaling of exploded block weights
+        for blk in self.blocks:
+            for nm in (blk.norm1, blk.norm2, blk.norm3):
+                if float(nm.weight.detach().float().abs().max().item()) > 2.5:
+                    nm.weight.clamp_(-2.5, 2.5)
+                    repaired = True
+            if hasattr(blk.ff, "w_gate_up") and isinstance(blk.ff.w_gate_up, torch.Tensor):
+                e_n = blk.ff.w_gate_up.shape[0]
+                target_gu = 18.0 * math.sqrt(e_n)
+                cur_gu = float(blk.ff.w_gate_up.detach().float().norm().item())
+                if cur_gu > target_gu * 1.35:
+                    blk.ff.w_gate_up.mul_(target_gu / cur_gu)
+                    repaired = True
+                target_dn = 14.0 * math.sqrt(e_n)
+                cur_dn = float(blk.ff.w_down.detach().float().norm().item())
+                if cur_dn > target_dn * 1.35:
+                    blk.ff.w_down.mul_(target_dn / cur_dn)
+                    repaired = True
+            for lin in (blk.qkv, blk.out_self, blk.cross_q, blk.cross_kv, blk.out_cross):
+                target_w = 26.0
+                cur_w = float(lin.weight.detach().float().norm().item())
+                if cur_w > target_w * 1.35:
+                    lin.weight.mul_(target_w / cur_w)
+                    repaired = True
+        return repaired
 
     def conditioning_decorr_loss(
         self,
@@ -639,7 +672,7 @@ class BrocaByteTransformer(nn.Module):
         z_summary = self._pool_z_summary(z_mem, memory_mask=memory_mask)  # [B, col_dim]
 
         x = self.byte_emb(byte_ids)  # [B, T, D]
-        bos_prefix = self.bos_z_proj(z_summary).unsqueeze(1)  # [B, 1, D]
+        bos_prefix = self._norm_z_proj(self.bos_z_proj(z_summary)).unsqueeze(1)  # [B, 1, D]
         x = torch.cat([x[:, :1, :] + bos_prefix, x[:, 1:, :]], dim=1) if t > 1 else (x + bos_prefix)
 
         conv_in = F.pad(x.transpose(1, 2), (3, 0))
@@ -686,8 +719,8 @@ class BrocaByteTransformer(nn.Module):
             self.last_aux_loss = total_aux_loss.detach()
             self.last_z_loss = total_z_loss.detach()
 
-        x = x + self.out_z_proj(z_summary).unsqueeze(1)
-        logits = self.lm_head(self.final_norm(x))
+        x = self.final_norm(x) + 0.50 * self._norm_z_proj(self.out_z_proj(z_summary)).unsqueeze(1)
+        logits = self.lm_head(x)
         if return_aux:
             return logits, total_aux_loss, total_z_loss
         return logits
@@ -744,8 +777,13 @@ class BrocaByteTransformer(nn.Module):
             ).view(tgt.shape)
             valid = token_mask.to(dtype=per_tok.dtype)
             pos_w = torch.ones((1, tgt.shape[1]), device=tgt.device, dtype=per_tok.dtype)
-            k_pref = min(16, tgt.shape[1])
-            pos_w[:, :k_pref] = pw
+            # Concentrate answer-selection gradient on byte 0 (after <BOS>) and bytes 1..3,
+            # since bytes 4..150 are easily predicted by the unconditional Polish LM prior!
+            pos_w[:, 0] = pw * 8.0
+            if tgt.shape[1] > 1:
+                pos_w[:, 1 : min(4, tgt.shape[1])] = pw * 3.0
+            if tgt.shape[1] > 4:
+                pos_w[:, 4 : min(12, tgt.shape[1])] = pw
             w = valid * pos_w
             ce_loss = (per_tok * w).sum() / w.sum().clamp(min=1.0)
         else:
@@ -805,8 +843,8 @@ class BrocaByteTransformer(nn.Module):
                 z_summary = self._pool_z_summary(z_mem, memory_mask=mem_mask)
                 cross_kvs = [blk.precompute_cross_kv(z_mem) for blk in self.blocks]
                 film_caches = [blk.precompute_film(z_summary) for blk in self.blocks]
-                bos_prefix = self.bos_z_proj(z_summary).unsqueeze(1)  # [1, 1, D]
-                out_z_bias = self.out_z_proj(z_summary).unsqueeze(1)  # [1, 1, D]
+                bos_prefix = self._norm_z_proj(self.bos_z_proj(z_summary)).unsqueeze(1)  # [1, 1, D]
+                out_z_bias = 0.50 * self._norm_z_proj(self.out_z_proj(z_summary)).unsqueeze(1)  # [1, 1, D]
 
             # Static pre-allocated KV-cache buffers per layer (eliminates O(T^2) allocations!)
             self_kvs: list[tuple[torch.Tensor, torch.Tensor]] = [
@@ -862,8 +900,7 @@ class BrocaByteTransformer(nn.Module):
                             compute_aux=False,
                         )
 
-                    x = x + out_z_bias
-                    logits = self.lm_head(self.final_norm(x))[:, -1, :].float().squeeze(0)  # [260]
+                    logits = self.lm_head(self.final_norm(x) + out_z_bias)[:, -1, :].float().squeeze(0)  # [260]
 
                 logits.masked_fill_(static_ban, -1e9)
                 if step == 0:
@@ -955,8 +992,8 @@ class BrocaByteTransformer(nn.Module):
                 z_summary = self._pool_z_summary(z_mem, memory_mask=mem_mask)
                 cross_kvs = [blk.precompute_cross_kv(z_mem) for blk in self.blocks]
                 film_caches = [blk.precompute_film(z_summary) for blk in self.blocks]
-                bos_prefix = self.bos_z_proj(z_summary).unsqueeze(1)  # [B, 1, D]
-                out_z_bias = self.out_z_proj(z_summary).unsqueeze(1)  # [B, 1, D]
+                bos_prefix = self._norm_z_proj(self.bos_z_proj(z_summary)).unsqueeze(1)  # [B, 1, D]
+                out_z_bias = 0.50 * self._norm_z_proj(self.out_z_proj(z_summary)).unsqueeze(1)  # [B, 1, D]
 
             self_kvs: list[tuple[torch.Tensor, torch.Tensor]] = [
                 (
@@ -1012,8 +1049,7 @@ class BrocaByteTransformer(nn.Module):
                             compute_aux=False,
                         )
 
-                    x = x + out_z_bias
-                    logits = self.lm_head(self.final_norm(x))[:, -1, :].float()  # [B, 260]
+                    logits = self.lm_head(self.final_norm(x) + out_z_bias)[:, -1, :].float()  # [B, 260]
 
                 logits[:, static_ban] = -1e9
                 if step == 0:

@@ -1133,12 +1133,11 @@ class LivingBrainEngine:
 
             assoc_a = _to_assoc_sdr(vec_a)
             assoc_c = _to_assoc_sdr(vec_c)
-            w_before = self.W_assoc_rec.float().clone()
             eff_lr = max(1e-4, min(0.08, float(lr)))
             self._oja_hebb_update(self.W_assoc_rec, assoc_a, assoc_c, lr=eff_lr, decay=0.04, zero_diag=True)
             self._oja_hebb_update(self.W_assoc_rec, assoc_c, assoc_a, lr=eff_lr, decay=0.04, zero_diag=True)
             self.W_assoc_rec.fill_diagonal_(0.0)
-            delta_norm = float((self.W_assoc_rec.float() - w_before).norm().item())
+            delta_norm = float(eff_lr * (assoc_a.norm().item() * assoc_c.norm().item()))
 
             if thought_vec is not None:
                 s_th = self._project_sensory(thought_vec)
@@ -1289,6 +1288,8 @@ class LivingBrainEngine:
             self.fatigue_l3.zero_()
             self.fatigue_assoc.zero_()
             budget_res = self.enforce_memory_budget()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
             return {
                 "replayed_episodes": replayed,
                 "pruned_synapses": pruned_syn + budget_res["pruned_synapses"],
