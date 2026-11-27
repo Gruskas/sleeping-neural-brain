@@ -2337,7 +2337,7 @@ class LanguageCortex:
                                 tg_b, _ = encode_utf8_bytes(
                                     tgts,
                                     max_bytes=self.cfg.broca_max_seq_len,
-                                    patch_size=1,
+                                    patch_size=32,
                                     add_bos_eos=True,
                                     mask_prob=0.0,
                                     device=None,
@@ -2368,7 +2368,7 @@ class LanguageCortex:
                             tg_b, _ = encode_utf8_bytes(
                                 tgts,
                                 max_bytes=self.cfg.broca_max_seq_len,
-                                patch_size=1,
+                                patch_size=32,
                                 add_bos_eos=True,
                                 mask_prob=0.0,
                                 device=None,

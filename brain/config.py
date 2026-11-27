@@ -83,7 +83,7 @@ class BrainConfig:
     broca_batch_size: int = 24
     embed_batch_size: int = 32
     enable_torch_compile: bool = False
-    broca_gradient_checkpointing: bool = False
+    broca_gradient_checkpointing: bool = True
 
     # Informational Sleep & Creativity (no artificial fatigue)
     max_energy: float = 100.0

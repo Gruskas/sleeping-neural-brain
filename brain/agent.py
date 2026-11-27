@@ -1668,9 +1668,12 @@ class SleepingBrain:
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024.0 ** 3)
         except Exception:
             vram_gb = 12.0
-        # Measured on RTX 5080 (16 GB): bs=48 hits ~360 sents/s (98% of bs=64 peak speed)
-        # while staying safely at ~9-12 GB total VRAM (ZERO Windows WDDM Shared RAM spill!)
+        # Measured on RTX 5080 (16 GB) with Sparse MoE Broca (273M params, 8 experts, top-2)
+        # + gradient checkpointing: bs=32 keeps peak VRAM comfortably at ~8-10 GB
+        # (ZERO Windows WDDM Shared RAM spill, full Tensor-Core throughput, identical quality).
         if self.cfg.broca_dim >= 640:
+            if getattr(self.cfg, "broca_use_moe", False):
+                return 32 if vram_gb >= 14.0 else 24
             return 48 if vram_gb >= 14.0 else 32
         return 96
 
