@@ -264,6 +264,10 @@ class QuantizedSynapseMatrix:
     def dtype(self) -> torch.dtype:
         return self.data.dtype
 
+    @property
+    def requires_grad(self) -> bool:
+        return False
+
     def numel(self) -> int:
         return int(self.data.numel())
 

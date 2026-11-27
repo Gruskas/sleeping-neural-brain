@@ -1321,11 +1321,14 @@ class LanguageCortex:
                 if loss_end <= early_stop_loss:
                     break
         finally:
+            opt.zero_grad(set_to_none=True)
+            del opt
             self._wernicke_raw.eval()
             self._broca_raw.eval()
+            if is_cuda:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
 
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
         self._refresh_status()
         return {
             "trained": True,
@@ -1551,7 +1554,11 @@ class LanguageCortex:
                         break
                 last_new_loss = float(last_new_t.item())
             finally:
+                opt.zero_grad(set_to_none=True)
+                del opt, anchor_params
                 self._broca_raw.eval()
+                if is_cuda:
+                    torch.cuda.empty_cache()
 
             self._register_known_questions([q for q, _ in clean_new], replace=False)
             if pinned:
@@ -1738,6 +1745,7 @@ class LanguageCortex:
             self._broca_raw.train()
             cond_mult = 2.0
             opt = self._build_optimizer(lr=eff_lr, cond_lr_mult=cond_mult)
+            opt_p: torch.optim.Optimizer | None = None
 
             loss_start: float | None = None
             loss_end: float = self._broca_raw.last_loss
@@ -2047,6 +2055,10 @@ class LanguageCortex:
                             if hit_p_stop:
                                 break
             finally:
+                opt.zero_grad(set_to_none=True)
+                if opt_p is not None:
+                    opt_p.zero_grad(set_to_none=True)
+                del opt, opt_p
                 self._wernicke_raw.eval()
                 self._broca_raw.eval()
                 if is_cuda:
@@ -2228,11 +2240,14 @@ class LanguageCortex:
                         if loss_end <= stop_loss:
                             break
             finally:
+                opt.zero_grad(set_to_none=True)
+                del opt
                 self._wernicke_raw.eval()
                 self._broca_raw.eval()
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
 
-            if self.device.type == "cuda":
-                torch.cuda.synchronize()
             if total_batches > 0:
                 self.lora_updates_count += 1
             self._refresh_status()
@@ -2559,15 +2574,17 @@ class LanguageCortex:
                 self._broca_raw._update_fluency(ema_loss)
 
             with self._op_lock:
+                opt.zero_grad(set_to_none=True)
+                del opt
                 self._wernicke_raw.eval()
                 self._broca_raw.eval()
                 if steps_done > 0:
                     self.lora_updates_count += 1
                 self._refresh_status()
+            if is_cuda:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
 
-        if is_cuda:
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
         return {
             "trained": steps_done > 0,
             "steps": steps_done,

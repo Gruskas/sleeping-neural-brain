@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import re
@@ -1518,17 +1519,25 @@ class SleepingBrain:
                 self._release_op("study")
 
     # ── Streaming Polish Grammar & Fluency Training from Local Parquet(s) ────
+    def _approved_parquet_paths(self) -> list[Path]:
+        return [
+            self.base_dir / name
+            for name in PARQUET_CORPORA_CATALOG
+            if (self.base_dir / name).is_file()
+        ]
+
     def _resolve_parquet_paths(self, filename: str = "__ALL__") -> list[Path]:
         raw = (filename or "__ALL__").strip()
         if raw in ("__ALL__", "all", "*"):
-            return sorted(p for p in self.base_dir.glob("*.parquet") if p.is_file())
+            return self._approved_parquet_paths()
         cand = Path(raw)
-        if cand.is_absolute():
-            return [cand] if cand.exists() else []
-        p = self.base_dir / cand
-        if p.exists():
-            return [p]
-        found = sorted(x for x in self.base_dir.glob("*.parquet") if x.is_file())
+        if cand.name in PARQUET_CORPORA_CATALOG:
+            if cand.is_absolute():
+                return [cand] if cand.is_file() else []
+            p = self.base_dir / cand.name
+            if p.is_file():
+                return [p]
+        found = self._approved_parquet_paths()
         return [found[0]] if found else []
 
     def _resolve_parquet_path(self, filename: str = "train-00000-of-00006.parquet") -> Path:
@@ -1538,8 +1547,8 @@ class SleepingBrain:
         return self.base_dir / filename
 
     def get_parquet_corpus_info(self, filename: str = "__ALL__") -> dict[str, Any]:
-        """Discover all *.parquet corpora in the root folder with lightweight mtime caching."""
-        found = sorted(p for p in self.base_dir.glob("*.parquet") if p.is_file())
+        """Discover only the approved Polish Parquet corpora in the root folder with lightweight mtime caching."""
+        found = self._approved_parquet_paths()
         sig = tuple((p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in found)
         cached = getattr(self, "_parquet_info_cache", None)
         if cached is not None and cached.get("_sig") == sig:
@@ -3699,7 +3708,7 @@ class SleepingBrain:
                 self._backup_legacy_files([ckpt_path, meta_path], "stara wersja tokenowa JSON")
                 return False
 
-            weights = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+            weights = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             if not isinstance(weights, dict) or weights.get("version") != CHECKPOINT_VERSION:
                 self._backup_legacy_files([ckpt_path, meta_path], "stara wersja tokenowa PT")
                 return False
@@ -3728,6 +3737,11 @@ class SleepingBrain:
                         saved_wm[-take:].to(device=self.device, dtype=self._wm_slot_buf.dtype)
                     )
                     self._wm_slot_count = take
+
+            del weights
+            gc.collect()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
             self.day = int(meta.get("day", 1))
             self.energy = self.cfg.max_energy

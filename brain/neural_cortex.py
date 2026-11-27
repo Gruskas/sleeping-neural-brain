@@ -78,6 +78,9 @@ class BiologicalAssociativeCortex(nn.Module):
             device=device,
         )
         self.W_rec.fill_diagonal_(0.0)
+        del w_in, w_rec, sparse_mask
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         self.register_buffer("threshold", torch.zeros(self.num_neurons, device=device, dtype=torch.float32))
         self.register_buffer(
@@ -143,6 +146,9 @@ class BiologicalAssociativeCortex(nn.Module):
         w_rec.fill_diagonal_(0.0)
         self.W_rec.copy_(w_rec)
         self.W_rec.fill_diagonal_(0.0)
+        del w_in, w_rec, sparse_mask
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
         self.threshold.zero_()
         self.avg_activity.fill_(self.target_sparsity)
         self.last_active_sdr.zero_()
