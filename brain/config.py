@@ -59,6 +59,14 @@ class BrainConfig:
     broca_moe_expert_dim: int = 1152
     broca_moe_aux_loss_coef: float = 0.01
     broca_moe_z_loss_coef: float = 0.001
+    # FFN architecture mode: "moe" (default SparseMoEFFN), "peer" (Product-Key Micro-Experts), or "dense" (SwiGLU)
+    broca_ffn_mode: str = "moe"
+    peer_grid_size: int = 256
+    peer_num_heads: int = 8
+    peer_top_k: int = 8
+    peer_cache_slots: int = 4096
+    peer_lr: float = 3e-3
+    peer_weight_decay: float = 1e-4
     broca_dropout: float = 0.2
     broca_max_seq_len: int = 1024
     broca_lr: float = 4.0e-4

@@ -12,6 +12,7 @@ import torch.nn.functional as F
 _logger = logging.getLogger(__name__)
 
 from .config import BrainConfig
+from .peer_memory import PEERMicroExpertFFN
 from .sensory_wernicke import (
     BOS_BYTE,
     BYTE_VOCAB_SIZE,
@@ -247,12 +248,25 @@ class _BrocaDecoderBlock(nn.Module):
         num_experts: int = 8,
         moe_top_k: int = 2,
         moe_expert_dim: int = 1152,
+        ffn_mode: str | None = None,
+        peer_grid_size: int = 256,
+        peer_num_heads: int = 8,
+        peer_top_k: int = 8,
+        peer_cache_slots: int = 4096,
+        peer_lr: float = 3e-3,
+        peer_weight_decay: float = 1e-4,
     ) -> None:
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
         self.dropout_p = dropout
-        self.use_moe = bool(use_moe)
+        mode = str(ffn_mode).strip().lower() if ffn_mode is not None else ("moe" if use_moe else "dense")
+        if mode not in ("moe", "peer", "dense"):
+            raise ValueError(f"Unsupported Broca ffn_mode={mode!r}; expected 'moe', 'peer', or 'dense'.")
+        self.ffn_mode = mode
+        self.use_moe = mode == "moe"
+        self.use_peer = mode == "peer"
+        self.has_sparse_ffn = mode in ("moe", "peer")
 
         # 1) Causal Self-Attention
         self.norm1 = RMSNorm(dim)
@@ -271,10 +285,21 @@ class _BrocaDecoderBlock(nn.Module):
         self.film_proj = nn.Linear(col_dim, dim * 2, bias=True)
         nn.init.zeros_(self.film_proj.bias)
 
-        # 3) Sparse MoE FFN (or dense SwiGLU fallback when broca_use_moe=False)
+        # 3) Sparse MoE, PEER Micro-Experts, or dense SwiGLU FFN
         self.norm3 = RMSNorm(dim)
-        if self.use_moe:
-            self.ff: nn.Module = SparseMoEFFN(
+        if mode == "peer":
+            self.ff: nn.Module = PEERMicroExpertFFN(
+                dim=dim,
+                grid_size=peer_grid_size,
+                num_heads=peer_num_heads,
+                top_k=peer_top_k,
+                cache_slots=peer_cache_slots,
+                peer_lr=peer_lr,
+                weight_decay=peer_weight_decay,
+                dropout=dropout,
+            )
+        elif mode == "moe":
+            self.ff = SparseMoEFFN(
                 dim=dim,
                 expert_dim=moe_expert_dim,
                 num_experts=num_experts,
@@ -387,9 +412,9 @@ class _BrocaDecoderBlock(nn.Module):
         else:
             scale, shift = self.precompute_film(z_summary)
 
-        # 3) Sparse MoE FFN (or dense SwiGLU)
+        # 3) Sparse MoE / PEER / dense SwiGLU FFN
         h3 = self.norm3(x) * scale + shift
-        if self.use_moe:
+        if self.has_sparse_ffn:
             ff_out, aux_loss, z_loss = self.ff(h3, token_mask=token_mask, compute_aux=compute_aux)
         else:
             ff_out = self.ff(h3)
@@ -434,10 +459,27 @@ class BrocaByteTransformer(nn.Module):
         # Direct cortical prefix projection injected at position 0 (<BOS>) & final readout bridge
         self.bos_z_proj = nn.Linear(self.col_dim, self.dim, bias=False)
         self.out_z_proj = nn.Linear(self.col_dim, self.dim, bias=False)
-        self.use_moe = bool(getattr(cfg, "broca_use_moe", False))
+        raw_ffn_mode = str(getattr(cfg, "broca_ffn_mode", "moe")).strip().lower()
+        cfg_use_moe = bool(getattr(cfg, "broca_use_moe", False))
+        if raw_ffn_mode == "peer":
+            self.ffn_mode = "peer"
+        elif raw_ffn_mode == "dense" or not cfg_use_moe:
+            self.ffn_mode = "dense"
+        else:
+            self.ffn_mode = "moe"
+        self.use_moe = self.ffn_mode == "moe"
+        self.use_peer = self.ffn_mode == "peer"
+        self.has_sparse_router = self.ffn_mode in ("moe", "peer")
+
         self.num_experts = int(getattr(cfg, "broca_num_experts", 8))
         self.moe_top_k = int(getattr(cfg, "broca_moe_top_k", 2))
         self.moe_expert_dim = int(getattr(cfg, "broca_moe_expert_dim", max(64, cfg.broca_ff_dim // 2)))
+        self.peer_grid_size = int(getattr(cfg, "peer_grid_size", 256))
+        self.peer_num_heads = int(getattr(cfg, "peer_num_heads", 8))
+        self.peer_top_k = int(getattr(cfg, "peer_top_k", 8))
+        self.peer_cache_slots = int(getattr(cfg, "peer_cache_slots", 4096))
+        self.peer_lr = float(getattr(cfg, "peer_lr", 3e-3))
+        self.peer_weight_decay = float(getattr(cfg, "peer_weight_decay", 1e-4))
         self.blocks = nn.ModuleList(
             [
                 _BrocaDecoderBlock(
@@ -450,6 +492,13 @@ class BrocaByteTransformer(nn.Module):
                     num_experts=self.num_experts,
                     moe_top_k=self.moe_top_k,
                     moe_expert_dim=self.moe_expert_dim,
+                    ffn_mode=self.ffn_mode,
+                    peer_grid_size=self.peer_grid_size,
+                    peer_num_heads=self.peer_num_heads,
+                    peer_top_k=self.peer_top_k,
+                    peer_cache_slots=self.peer_cache_slots,
+                    peer_lr=self.peer_lr,
+                    peer_weight_decay=self.peer_weight_decay,
                 )
                 for _ in range(cfg.broca_layers)
             ]
@@ -465,7 +514,7 @@ class BrocaByteTransformer(nn.Module):
         # Optional activation checkpointing for long sequences on 16 GB VRAM
         self.gradient_checkpointing: bool = bool(getattr(cfg, "broca_gradient_checkpointing", False))
 
-        # Training statistics & MoE diagnostics (zero-sync GPU tensors)
+        # Training statistics & MoE/PEER diagnostics (zero-sync GPU tensors)
         self.trained_steps: int = 0
         self.last_loss: float = 5.5
         self.fluency_score: float = 0.0
@@ -482,19 +531,72 @@ class BrocaByteTransformer(nn.Module):
         return precompute_rope(seq_len, self.head_dim, device=device)
 
     def total_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters())
+        param_total = sum(p.numel() for p in self.parameters())
+        peer_bank_total = sum(
+            blk.ff.bank_parameters() for blk in self.blocks if isinstance(blk.ff, PEERMicroExpertFFN)
+        )
+        return param_total + peer_bank_total
 
     def active_parameters(self) -> int:
+        param_total = sum(p.numel() for p in self.parameters())
+        if self.use_peer:
+            peer_active = sum(
+                blk.ff.active_bank_parameters() for blk in self.blocks if isinstance(blk.ff, PEERMicroExpertFFN)
+            )
+            return param_total + peer_active
         if not self.use_moe:
-            return self.total_parameters()
-        total = self.total_parameters()
+            return param_total
         inactive_frac = float(max(0, self.num_experts - self.moe_top_k)) / float(max(1, self.num_experts))
         expert_params = sum(
             blk.ff.w_gate_up.numel() + blk.ff.w_down.numel()
             for blk in self.blocks
             if isinstance(blk.ff, SparseMoEFFN)
         )
-        return int(round(total - expert_params * inactive_frac))
+        return int(round(param_total - expert_params * inactive_frac))
+
+    def set_peer_lr(self, lr: float | None = None, scale: float = 1.0) -> None:
+        base_lr = float(self.peer_lr if lr is None else lr)
+        eff = max(0.0, base_lr * float(scale))
+        for blk in self.blocks:
+            if isinstance(blk.ff, PEERMicroExpertFFN):
+                blk.ff.peer_lr = eff
+
+    def flush_peer_caches(self) -> int:
+        flushed = 0
+        for blk in self.blocks:
+            if isinstance(blk.ff, PEERMicroExpertFFN):
+                flushed += blk.ff.flush_dirty_to_ram()
+        return flushed
+
+    def get_peer_cache_stats(self) -> dict[str, Any]:
+        peers = [blk.ff for blk in self.blocks if isinstance(blk.ff, PEERMicroExpertFFN)]
+        if not peers:
+            return {
+                "hit_rate_pct": 0.0,
+                "vram_cache_mb": 0.0,
+                "ram_bank_mb": 0.0,
+                "total_experts": 0,
+                "active_experts_per_token": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "num_peer_layers": 0,
+            }
+        hits = sum(p.cache_hits for p in peers)
+        misses = sum(p.cache_misses for p in peers)
+        total_lookups = hits + misses
+        hit_rate = (100.0 * float(hits) / float(total_lookups)) if total_lookups > 0 else 0.0
+        vram_mb = sum(p.vram_cache_bytes() for p in peers) / (1024.0 * 1024.0)
+        ram_mb = sum(p.ram_bank_bytes() for p in peers) / (1024.0 * 1024.0)
+        return {
+            "hit_rate_pct": round(hit_rate, 2),
+            "vram_cache_mb": round(vram_mb, 2),
+            "ram_bank_mb": round(ram_mb, 2),
+            "total_experts": sum(p.num_experts for p in peers),
+            "active_experts_per_token": peers[0].k_tot,
+            "cache_hits": hits,
+            "cache_misses": misses,
+            "num_peer_layers": len(peers),
+        }
 
     def get_moe_expert_utilization(self) -> torch.Tensor | None:
         """Return [num_layers, num_experts] tensor of latest per-layer expert load fractions."""
@@ -683,7 +785,7 @@ class BrocaByteTransformer(nn.Module):
 
         total_aux_loss = torch.zeros((), device=device, dtype=torch.float32)
         total_z_loss = torch.zeros((), device=device, dtype=torch.float32)
-        want_aux = bool(self.use_moe and (return_aux or self.training))
+        want_aux = bool(self.has_sparse_router and (return_aux or self.training))
         use_ckpt = self.training and self.gradient_checkpointing and x.requires_grad
         for blk in self.blocks:
             if use_ckpt:
@@ -795,7 +897,7 @@ class BrocaByteTransformer(nn.Module):
             )
         if return_components:
             return ce_loss, aux_loss, z_loss
-        if self.use_moe:
+        if self.has_sparse_router:
             aux_coef = float(getattr(self.cfg, "broca_moe_aux_loss_coef", 0.01))
             z_coef = float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001))
             return ce_loss + aux_coef * aux_loss + z_coef * z_loss
@@ -1241,12 +1343,22 @@ class BrocaByteTransformer(nn.Module):
                 self.train()
 
     def export_state(self) -> dict[str, Any]:
-        return {
+        if self.use_peer:
+            self.flush_peer_caches()
+        out: dict[str, Any] = {
             "weights": {k: v.detach().cpu().to(torch.bfloat16) for k, v in self.state_dict().items()},
             "trained_steps": self.trained_steps,
             "last_loss": self.last_loss,
             "fluency_score": self.fluency_score,
+            "ffn_mode": self.ffn_mode,
         }
+        if self.use_peer:
+            out["peer_banks"] = {
+                str(idx): blk.ff.export_bank_state()
+                for idx, blk in enumerate(self.blocks)
+                if isinstance(blk.ff, PEERMicroExpertFFN)
+            }
+        return out
 
     def import_state(self, state: dict[str, Any], device: torch.device) -> dict[str, list[str]]:
         saved = state.get("weights", {})
@@ -1273,6 +1385,16 @@ class BrocaByteTransformer(nn.Module):
                 missing_keys.append(k)
 
         self.load_state_dict(merged, strict=False)
+        if self.use_peer:
+            saved_banks = state.get("peer_banks", {})
+            if isinstance(saved_banks, dict):
+                for idx, blk in enumerate(self.blocks):
+                    if isinstance(blk.ff, PEERMicroExpertFFN):
+                        b_state = saved_banks.get(str(idx))
+                        if b_state is None:
+                            b_state = saved_banks.get(idx)
+                        if isinstance(b_state, dict):
+                            blk.ff.import_bank_state(b_state)
         self.trained_steps = int(state.get("trained_steps", 0))
         self.last_loss = float(state.get("last_loss", 5.5))
         self.fluency_score = float(state.get("fluency_score", 0.0))

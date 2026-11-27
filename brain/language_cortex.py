@@ -1207,7 +1207,7 @@ class LanguageCortex:
                     continue
                 if any(k in name for k in cond_keys):
                     cond_params.append(p)
-                elif p.ndim < 2 or "norm" in name or "router" in name:
+                elif p.ndim < 2 or "norm" in name or "router" in name or "keys_1" in name or "keys_2" in name or "query_proj" in name:
                     norm_params.append(p)
                 else:
                     decay_params.append(p)
@@ -1491,7 +1491,7 @@ class LanguageCortex:
                     continue
                 if any(k in name for k in cond_keys):
                     broca_cond.append(p)
-                elif p.ndim < 2 or "norm" in name or "router" in name:
+                elif p.ndim < 2 or "norm" in name or "router" in name or "keys_1" in name or "keys_2" in name or "query_proj" in name:
                     broca_no_decay.append(p)
                 else:
                     broca_decay.append(p)
@@ -1503,6 +1503,7 @@ class LanguageCortex:
             if self.device.type == "cuda":
                 kwargs["fused"] = True
             lr_scale = 0.45 if lightweight else 1.0
+            self._broca_raw.set_peer_lr(scale=lr_scale)
             opt = torch.optim.AdamW(
                 [
                     {"params": broca_decay, "lr": 2.5e-4 * lr_scale, "weight_decay": 0.01},
@@ -1560,8 +1561,8 @@ class LanguageCortex:
             ewc_weight = 0.012 if lightweight else 0.004
             last_new_loss = 5.0
             last_new_t = torch.tensor(5.0, device=self.device, dtype=torch.float32)
-            moe_aux_coef = float(getattr(self.cfg, "broca_moe_aux_loss_coef", 0.01)) if self._broca_raw.use_moe else 0.0
-            moe_z_coef = float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001)) if self._broca_raw.use_moe else 0.0
+            moe_aux_coef = float(getattr(self.cfg, "broca_moe_aux_loss_coef", 0.01)) if self._broca_raw.has_sparse_router else 0.0
+            moe_z_coef = float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001)) if self._broca_raw.has_sparse_router else 0.0
             try:
                 for step_i in range(max_steps):
                     rep_slice = random.sample(replay, k=min(replay_step_bs, len(replay)))
@@ -1602,6 +1603,7 @@ class LanguageCortex:
                         break
                 last_new_loss = float(last_new_t.item())
             finally:
+                self._broca_raw.set_peer_lr(scale=1.0)
                 opt.zero_grad(set_to_none=True)
                 for p in frozen_moe_params:
                     p.requires_grad_(True)
@@ -1901,6 +1903,7 @@ class LanguageCortex:
                     opt.param_groups[0]["lr"] = eff_lr * scale
                     opt.param_groups[1]["lr"] = eff_lr * scale
                     opt.param_groups[2]["lr"] = eff_lr * cond_mult * scale
+                    self._broca_raw.set_peer_lr(scale=scale)
 
                     # Length-bucketed mini-batches cut wasted padding FLOPs by ~40% while shuffling batch order!
                     order_idx = sorted(all_indices, key=lambda idx: pre_ans_lens[idx] + random.randint(-8, 8))
@@ -1954,7 +1957,7 @@ class LanguageCortex:
                             moe_reg = (
                                 float(getattr(self.cfg, "broca_moe_aux_loss_coef", 0.01)) * aux_loss
                                 + float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001)) * z_loss
-                            ) if self._broca_raw.use_moe else 0.0
+                            ) if self._broca_raw.has_sparse_router else 0.0
                             cond_dec = self._broca_raw.conditioning_decorr_loss(z_ctx, z_ctx_mask)
                             loss = ce_loss + moe_reg + cond_dec + self._wernicke_bottleneck_loss(w_out, z_star)
 
@@ -2037,6 +2040,7 @@ class LanguageCortex:
                     if hard_indices:
                         self._wernicke_raw.train()
                         self._broca_raw.train()
+                        self._broca_raw.set_peer_lr(scale=0.65)
                         opt_p = self._build_optimizer(lr=eff_lr * 0.65, cond_lr_mult=2.0)
                         p_loss_gpu = torch.zeros((), device=self.device, dtype=torch.float32)
                         max_p_epochs = 60
@@ -2093,7 +2097,7 @@ class LanguageCortex:
                                     moe_reg = (
                                         float(getattr(self.cfg, "broca_moe_aux_loss_coef", 0.01)) * aux_loss
                                         + float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001)) * z_loss
-                                    ) if self._broca_raw.use_moe else 0.0
+                                    ) if self._broca_raw.has_sparse_router else 0.0
                                     cond_dec = self._broca_raw.conditioning_decorr_loss(z_ctx, z_ctx_mask)
                                     loss = ce_loss + moe_reg + cond_dec + self._wernicke_bottleneck_loss(w_out, z_star)
                                 loss.backward()
@@ -2114,6 +2118,7 @@ class LanguageCortex:
                             if hit_p_stop:
                                 break
             finally:
+                self._broca_raw.set_peer_lr(scale=1.0)
                 opt.zero_grad(set_to_none=True)
                 if opt_p is not None:
                     opt_p.zero_grad(set_to_none=True)
@@ -2463,12 +2468,14 @@ class LanguageCortex:
 
         def _set_lr(step_i: int) -> float:
             if step_i < warmup_steps:
-                cur_lr = base_lr * float(step_i + 1) / float(max(1, warmup_steps))
+                lr_scale = float(step_i + 1) / float(max(1, warmup_steps))
             else:
                 prog = min(1.0, float(step_i - warmup_steps) / float(max(1, steps_cap - warmup_steps)))
-                cur_lr = base_lr * (0.12 + 0.88 * 0.5 * (1.0 + math.cos(math.pi * prog)))
+                lr_scale = 0.12 + 0.88 * 0.5 * (1.0 + math.cos(math.pi * prog))
+            cur_lr = base_lr * lr_scale
             for pg in opt.param_groups:
                 pg["lr"] = cur_lr
+            self._broca_raw.set_peer_lr(scale=lr_scale)
             return cur_lr
 
         try:
@@ -2517,7 +2524,7 @@ class LanguageCortex:
                         moe_reg = (
                             float(getattr(self.cfg, "broca_moe_aux_loss_coef", 0.01)) * aux_loss
                             + float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001)) * z_loss
-                        ) if self._broca_raw.use_moe else 0.0
+                        ) if self._broca_raw.has_sparse_router else 0.0
                         loss = ce_loss + moe_reg + self._wernicke_bottleneck_loss(w_out, z_cols)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
@@ -2633,6 +2640,7 @@ class LanguageCortex:
                 self._broca_raw._update_fluency(ema_loss)
 
             with self._op_lock:
+                self._broca_raw.set_peer_lr(scale=1.0)
                 opt.zero_grad(set_to_none=True)
                 del opt
                 self._wernicke_raw.eval()
