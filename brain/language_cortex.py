@@ -296,11 +296,8 @@ class LanguageCortex:
     @torch.no_grad()
     def match_known_attractor(self, query_sdr: torch.Tensor) -> tuple[float, torch.Tensor | None]:
         """
-        Continuous Modern Hopfield attention over the GPU bfloat16 SDR attractor bank:
-          - If max cosine similarity >= 0.78: returns the crisp matched canonical SDR attractor.
-          - If 0.45 <= max_sim < 0.78 (novel phrasings, typos like 'SUEPR to co robimy', or casual
-            follow-ups): returns a soft top-3 Modern Continuous Hopfield energy-weighted SDR blend
-            so the brain thinks continuously in SDR space instead of hitting a rigid OOD wall!
+        Compute continuous familiarity score against the GPU bfloat16 SDR bank WITHOUT
+        overwriting/replacing the input SDR (so novel syntax & word order are always preserved).
         """
         if self._known_q_sdrs.shape[0] == 0:
             return 1.0, None
@@ -308,19 +305,8 @@ class LanguageCortex:
             torch.bfloat16
         )
         sims = torch.mv(self._known_q_sdrs, q).float()
-        best_val, best_idx = sims.max(dim=0)
+        best_val = sims.max(dim=0).values
         sim_f = round(float(best_val.item()), 4)
-        if self._canonical_q_sdrs.shape[0] != self._known_q_sdrs.shape[0]:
-            return sim_f, None
-        if sim_f >= 0.84:
-            return sim_f, self._canonical_q_sdrs[int(best_idx.item())]
-        if sim_f >= 0.72:
-            k_top = min(3, int(sims.shape[0]))
-            top_vals, top_idxs = torch.topk(sims, k=k_top)
-            weights = F.softmax(16.0 * top_vals, dim=-1).to(dtype=torch.float32)
-            blended = (weights.unsqueeze(-1) * self._canonical_q_sdrs[top_idxs].float()).sum(dim=0)
-            blended = F.normalize(blended, dim=-1, eps=1e-6).to(dtype=torch.bfloat16)
-            return sim_f, blended
         return sim_f, None
 
     @torch.no_grad()
@@ -332,32 +318,28 @@ class LanguageCortex:
     @torch.no_grad()
     def perceive_for_chat(self, user_message: str) -> tuple[WernickeOutput, float, torch.Tensor | None]:
         """
-        Case- & casual-punctuation-tolerant UTF-8 Wernicke perception on GPU:
-        encodes up to 4 lightweight surface normalizations (raw, lowercase, stripped punctuation/filler)
-        in ONE GPU batch (~0.8 ms) and picks the highest-familiarity SDR so 'Siema', 'SIEMA',
-        'Co to jest kot', and 'CO TAM KURWA' NEVER falsely fail OOD!
+        Case- & punctuation-tolerant familiarity scoring on GPU while preserving the REAL
+        input structure (`w_batch[0]`, including sequential `patch_columns` and `patch_mask`).
         """
         variants = _chat_perception_variants(user_message)
         with self._op_lock:
             w_batch = self._wernicke_raw.encode_texts(variants, device=self.device, batch_size=len(variants))
-            best_idx = 0
             best_sim = -1.0
-            best_canon: torch.Tensor | None = None
             for i in range(len(variants)):
-                sim_i, canon_i = self.match_known_attractor(w_batch.sdr[i])
+                sim_i, _ = self.match_known_attractor(w_batch.sdr[i])
                 if sim_i > best_sim:
                     best_sim = sim_i
-                    best_idx = i
-                    best_canon = canon_i
             single_out = WernickeOutput(
-                columns=w_batch.columns[best_idx : best_idx + 1],
-                sdr=w_batch.sdr[best_idx : best_idx + 1],
-                reconstructed_columns=w_batch.reconstructed_columns[best_idx : best_idx + 1],
-                active_indices=w_batch.active_indices[best_idx : best_idx + 1],
-                active_values=w_batch.active_values[best_idx : best_idx + 1],
+                columns=w_batch.columns[:1],
+                sdr=w_batch.sdr[:1],
+                reconstructed_columns=w_batch.reconstructed_columns[:1],
+                active_indices=w_batch.active_indices[:1],
+                active_values=w_batch.active_values[:1],
                 sparsity_pct=w_batch.sparsity_pct,
+                patch_columns=w_batch.patch_columns[:1] if w_batch.patch_columns is not None else None,
+                patch_mask=w_batch.patch_mask[:1] if w_batch.patch_mask is not None else None,
             )
-            return single_out, best_sim, best_canon
+            return single_out, best_sim, None
 
     # ── Sensory Perception (Wernicke: UTF-8 bytes -> 16 columns S + k-WTA SDR) ──
     @torch.no_grad()
@@ -376,13 +358,14 @@ class LanguageCortex:
     def perceive_one(self, text: str) -> WernickeOutput:
         return self.perceive_texts([text or " "])
 
-    # ── Isolated Broca Decoding (STRICTLY from Z* in R^{1 x 16 x D}) ─────────
+    # ── Isolated Broca Decoding (STRICTLY from Z* / Z_ctx) ─────────────────
     @torch.no_grad()
     def decode_columns(
         self,
         columns_star: torch.Tensor,
         max_new_bytes: int | None = None,
         temperature: float | None = None,
+        memory_mask: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         with self._op_lock:
             return self._broca_raw.generate(
@@ -391,6 +374,7 @@ class LanguageCortex:
                 temperature=temperature,
                 top_p=self.cfg.broca_top_p,
                 repetition_penalty=self.cfg.broca_repetition_penalty,
+                memory_mask=memory_mask,
             )
 
     @staticmethod
@@ -475,8 +459,13 @@ class LanguageCortex:
                 fb_out = self._wernicke_raw.encode_texts([s], device=self.device, batch_size=1)
             heard_sdr = fb_out.sdr[0]
         if conf_info is None:
+            ctx_cols = thought.context_columns if thought.context_columns is not None else thought.columns_star
             with self._op_lock:
-                conf_info = self._broca_raw.score_text_confidence(s, thought.columns_star)
+                conf_info = self._broca_raw.score_text_confidence(
+                    s,
+                    ctx_cols,
+                    memory_mask=thought.context_mask,
+                )
 
         align = float(
             F.cosine_similarity(
@@ -553,21 +542,21 @@ class LanguageCortex:
         living_blend: float = 0.08,
         neuromod: Any | None = None,
         living_telemetry: Any | None = None,
+        working_memory_slots: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """
-        System-2 Batched Parallel Cortical Thinking + Auditory Self-Hearing & Active Self-Correction,
-        steered live by LivingBrainEngine neuromodulators (NA, DA, ACh) and M4 intrinsic curiosity:
-          1. High NA / PE extends attractor deliberation (3 -> 6 steps) and lowers sampling temperature.
-          2. High intrinsic_curiosity or boredom_exploration elevates temperature and weight of the
-             'Kreatywna' path during candidate self-critique.
-          3. Directly projects LivingBrainEngine's growing associative state + top-3 M2 traces into Z*.
+        Sequential System-2 Latent Chain-of-Thought + Arcuate Fasciculus Self-Hearing & Active Self-Correction:
+          - Step 1 (Precyzyjna): Grounded associative perception over real Wernicke patches + PFC slots.
+          - Step 2 (Kontekstowa): Appends Step-1 latent thought summary as a cortical slot & runs 2nd Hopfield hop.
+          - Step 3 (Kreatywna): Appends Step-2 latent thought summary as another slot for exploratory synthesis.
+          - Evaluates all chain states in ONE batched Broca decode + Arcuate Fasciculus auditory critique.
         """
         base_t = float(base_temperature if base_temperature is not None else self.cfg.broca_temperature)
-        k_cand = max(1, min(3, int(num_candidates or self.cfg.self_critique_candidates)))
+        default_steps = int(getattr(self.cfg, "system2_reasoning_steps", self.cfg.self_critique_candidates))
+        k_cand = max(1, min(3, int(num_candidates or default_steps)))
         cre = max(0.0, min(1.0, float(creativity_level)))
         max_b = int(max_new_bytes or self.cfg.broca_max_new_bytes)
 
-        # Read LivingBrain neuromodulators & M4 curiosity telemetry (if supplied)
         na_val = 0.35
         pe_val = 0.0
         cur_val = 0.0
@@ -598,103 +587,151 @@ class LanguageCortex:
             else 0.0
         )
 
-        # High Noradrenaline / PE: deeper attractor convergence (3 -> 6) & sharper (lower) temperature
         eff_steps = max(self.cfg.attractor_steps, min(6, 3 + int(round(3.0 * na_arousal)))) if has_nm else self.cfg.attractor_steps
         eff_base_t = max(0.38, base_t - 0.14 * na_arousal) if has_nm else base_t
         cre_temp = max(eff_base_t, min(0.95, eff_base_t + 0.14 * cre + 0.16 * cur_boost))
         cre_noise = 0.010 * cre + 0.008 * cur_boost
 
-        w_out, q_sim, canon_sdr = self.perceive_for_chat(user_message)
-
-        if canon_sdr is not None and q_sim >= 0.72:
-            snap_sdr = canon_sdr.to(device=self.device, dtype=w_out.sdr.dtype).unsqueeze(0)
-        else:
-            snap_sdr = w_out.sdr
-
-        path_specs: list[tuple[str, float, bool, float, float, int, float, bool]] = [
-            ("Precyzyjna", max(0.36, eff_base_t - 0.08), False, 0.92, 0.0, eff_steps, 0.0, q_sim >= 0.84),
-            ("Kontekstowa", eff_base_t, True, 0.85, working_memory_weight, min(6, eff_steps + 1), 0.0, q_sim >= 0.84),
-            ("Kreatywna", cre_temp, False, 0.90, working_memory_weight * 0.5, eff_steps, cre_noise, q_sim >= 0.88),
-        ][:k_cand]
+        w_out, q_sim, _ = self.perceive_for_chat(user_message)
 
         thoughts: list[CortexThought] = []
         temps: list[float] = []
         labels: list[str] = []
-        two_hop_note = ""
-        for label, cand_t, use_bank, hop_min, cand_wm_w, cand_steps, cand_noise, use_snap in path_specs:
-            thought = cortex.perceive_and_think(
-                sensory_columns=w_out.columns,
-                sensory_sdr=snap_sdr if use_snap else w_out.sdr,
-                engram_bank=engram_bank if use_bank else None,
+        latent_slots: list[torch.Tensor] = []
+        chain_notes: list[str] = []
+
+        # Step 1: Precyzyjna (grounded perception over actual Wernicke patch_columns + SDR + PFC slots)
+        th0 = cortex.perceive_and_think(
+            sensory_columns=w_out.columns,
+            sensory_sdr=w_out.sdr,
+            engram_bank=engram_bank,
+            sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
+            steps=eff_steps,
+            noise_std=0.0,
+            update_last_active=False,
+            hopfield_min_sim=0.85,
+            working_memory_sdr=working_memory_sdr if working_memory_weight > 0.0 else None,
+            working_memory_weight=working_memory_weight * 0.5,
+            living_assoc_vec=living_assoc_vec,
+            living_blend=living_blend,
+            neuromod=neuromod,
+            living_telemetry=living_telemetry,
+            sensory_patch_columns=w_out.patch_columns,
+            sensory_patch_mask=w_out.patch_mask,
+            working_memory_slots=working_memory_slots,
+        )
+        thoughts.append(th0)
+        temps.append(round(max(0.36, eff_base_t - 0.08), 3))
+        labels.append("Precyzyjna")
+        latent_slots.append(F.normalize(th0.columns_star.mean(dim=1, keepdim=True), dim=-1, eps=1e-6))
+
+        # Step 2: Kontekstowa (feeds Step-1 latent thought slot + Z*_0 back into Associative Cortex & Hopfield)
+        if k_cand >= 2:
+            thought_cat_1 = torch.cat(latent_slots, dim=1)
+            th1 = cortex.perceive_and_think(
+                sensory_columns=th0.columns_star,
+                sensory_sdr=th0.z_star,
+                engram_bank=engram_bank,
                 sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
-                steps=cand_steps,
-                noise_std=cand_noise,
+                steps=min(6, eff_steps + 1),
+                noise_std=0.0,
                 update_last_active=False,
-                hopfield_min_sim=hop_min,
-                working_memory_sdr=working_memory_sdr if cand_wm_w > 0.0 else None,
-                working_memory_weight=cand_wm_w,
+                hopfield_min_sim=0.72,
+                working_memory_sdr=working_memory_sdr if working_memory_weight > 0.0 else None,
+                working_memory_weight=working_memory_weight,
                 living_assoc_vec=living_assoc_vec,
                 living_blend=living_blend,
                 neuromod=neuromod,
                 living_telemetry=living_telemetry,
+                sensory_patch_columns=w_out.patch_columns,
+                sensory_patch_mask=w_out.patch_mask,
+                working_memory_slots=working_memory_slots,
+                thought_slots=thought_cat_1,
             )
-            # Multi-step associative chain (Hippocampus <-> Z*): on the contextual path,
-            # when Hop 1 recalls a strong memory, feed Z*_1 back into Hippocampus for a 2nd associative hop!
-            if (
-                label == "Kontekstowa"
-                and use_bank
-                and engram_bank is not None
-                and engram_bank.shape[0] >= 2
-                and thought.max_hopfield_sim >= 0.65
-            ):
-                hop2 = cortex.perceive_and_think(
-                    sensory_columns=thought.columns_star,
-                    sensory_sdr=thought.z_star,
-                    engram_bank=engram_bank,
-                    sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
-                    steps=3,
-                    noise_std=0.0,
-                    update_last_active=False,
-                    hopfield_min_sim=0.72,
-                    working_memory_sdr=working_memory_sdr if cand_wm_w > 0.0 else None,
-                    working_memory_weight=cand_wm_w * 0.5,
-                    living_assoc_vec=living_assoc_vec,
-                    living_blend=living_blend,
-                    neuromod=neuromod,
-                    living_telemetry=living_telemetry,
+            if th1.recalled_columns is None and th0.recalled_columns is not None:
+                th1.recalled_columns = th0.recalled_columns
+                th1.context_columns, th1.context_mask = cortex.build_context_columns(
+                    columns_star=th1.columns_star,
+                    sensory_patch_columns=w_out.patch_columns,
+                    sensory_patch_mask=w_out.patch_mask,
+                    recalled_columns=th1.recalled_columns,
+                    working_memory_slots=working_memory_slots,
+                    thought_slots=thought_cat_1,
                 )
-                # Preserve Hop 1 recalled columns if Hop 2 didn't attach stronger ones
-                if hop2.recalled_columns is None and thought.recalled_columns is not None:
-                    hop2.recalled_columns = thought.recalled_columns
-                two_hop_note = (
-                    f"Pętla skojarzeń 2-hop (Hipokamp ↔ Z*): hop1_sim={thought.max_hopfield_sim:.2f} → "
-                    f"hop2_sim={hop2.max_hopfield_sim:.2f}"
-                )
-                thought = hop2
-            thoughts.append(thought)
-            temps.append(round(cand_t, 3))
-            labels.append(label)
+            thoughts.append(th1)
+            temps.append(round(eff_base_t, 3))
+            labels.append("Kontekstowa")
+            latent_slots.append(F.normalize(th1.columns_star.mean(dim=1, keepdim=True), dim=-1, eps=1e-6))
+            chain_notes.append(
+                f"Łańcuch System-2 (krok 1→2): hop1_sim={th0.max_hopfield_sim:.2f} → hop2_sim={th1.max_hopfield_sim:.2f}"
+            )
 
-        # Parallel batched generation + single-pass batched neural confidence scoring on GPU!
-        # When any candidate strongly recalled Hippocampus columns, concatenate them as extra
-        # Cross-Attention memory columns [K, 32, D] so Broca directly reads recalled memory!
+        # Step 3: Kreatywna (feeds accumulated latent thought chain [h_0, h_1] for broader synthesis)
+        if k_cand >= 3:
+            prev_th = thoughts[-1]
+            thought_cat_2 = torch.cat(latent_slots, dim=1)
+            th2 = cortex.perceive_and_think(
+                sensory_columns=prev_th.columns_star,
+                sensory_sdr=prev_th.z_star,
+                engram_bank=engram_bank,
+                sdr_to_columns_fn=self._wernicke_raw.sdr_to_columns,
+                steps=eff_steps,
+                noise_std=cre_noise,
+                update_last_active=False,
+                hopfield_min_sim=0.80,
+                working_memory_sdr=working_memory_sdr if working_memory_weight > 0.0 else None,
+                working_memory_weight=working_memory_weight * 0.5,
+                living_assoc_vec=living_assoc_vec,
+                living_blend=living_blend,
+                neuromod=neuromod,
+                living_telemetry=living_telemetry,
+                sensory_patch_columns=w_out.patch_columns,
+                sensory_patch_mask=w_out.patch_mask,
+                working_memory_slots=working_memory_slots,
+                thought_slots=thought_cat_2,
+            )
+            if th2.recalled_columns is None and prev_th.recalled_columns is not None:
+                th2.recalled_columns = prev_th.recalled_columns
+                th2.context_columns, th2.context_mask = cortex.build_context_columns(
+                    columns_star=th2.columns_star,
+                    sensory_patch_columns=w_out.patch_columns,
+                    sensory_patch_mask=w_out.patch_mask,
+                    recalled_columns=th2.recalled_columns,
+                    working_memory_slots=working_memory_slots,
+                    thought_slots=thought_cat_2,
+                )
+            thoughts.append(th2)
+            temps.append(round(cre_temp, 3))
+            labels.append("Kreatywna")
+            latent_slots.append(F.normalize(th2.columns_star.mean(dim=1, keepdim=True), dim=-1, eps=1e-6))
+
+        # Assemble padded Z_ctx batch [K, M_max, D] + memory_mask [K, M_max] for ONE batched GPU decode!
+        ctx_list = [
+            (th.context_columns[:1] if th.context_columns is not None else th.columns_star[:1])
+            for th in thoughts
+        ]
+        mask_list = [
+            (
+                th.context_mask[:1]
+                if th.context_mask is not None
+                else torch.ones((1, c.shape[1]), dtype=torch.bool, device=c.device)
+            )
+            for th, c in zip(thoughts, ctx_list)
+        ]
+        m_max = max(c.shape[1] for c in ctx_list)
+        padded_ctx: list[torch.Tensor] = []
+        padded_masks: list[torch.Tensor] = []
+        for c, m in zip(ctx_list, mask_list):
+            pad_m = m_max - c.shape[1]
+            if pad_m > 0:
+                c = F.pad(c, (0, 0, 0, pad_m), value=0.0)
+                m = F.pad(m, (0, pad_m), value=False)
+            padded_ctx.append(c)
+            padded_masks.append(m)
+        mem_batch = torch.cat(padded_ctx, dim=0)
+        mask_batch = torch.cat(padded_masks, dim=0)
         has_recalled_mem = any(th.recalled_columns is not None for th in thoughts)
-        if has_recalled_mem:
-            mem_batch = torch.cat(
-                [
-                    torch.cat(
-                        [
-                            th.columns_star[:1],
-                            th.recalled_columns[:1] if th.recalled_columns is not None else th.columns_star[:1],
-                        ],
-                        dim=1,
-                    )
-                    for th in thoughts
-                ],
-                dim=0,
-            )  # [K, 32, D]
-        else:
-            mem_batch = torch.cat([th.columns_star[:1] for th in thoughts], dim=0)  # [K, 16, D]
+
         with self._op_lock:
             gen_batch = self._broca_raw.generate_batch(
                 memory_columns_batch=mem_batch,
@@ -702,10 +739,12 @@ class LanguageCortex:
                 max_new_bytes=max_b,
                 top_p=self.cfg.broca_top_p,
                 repetition_penalty=self.cfg.broca_repetition_penalty,
+                memory_mask=mask_batch,
             )
             conf_list = self._broca_raw.score_texts_confidence_batch(
                 [g["text"] for g in gen_batch],
                 mem_batch,
+                memory_mask=mask_batch,
             )
 
         draft_texts = [g["text"] if g["text"] else " " for g in gen_batch]
@@ -723,8 +762,12 @@ class LanguageCortex:
                 f"Neuromodulacja inferencji: NA={na_val:.2f} (kroki={eff_steps}, T_baz={eff_base_t:.2f}) · "
                 f"Ciekawość M4={cur_val:.2f}{'+eksploracja' if boredom_exp else ''} (T_kreat={cre_temp:.2f})"
             )
-        if two_hop_note:
-            critique_notes.append(two_hop_note + (" · Cross-Attention Broki z kolumnami Hipokampu" if has_recalled_mem else ""))
+        if chain_notes:
+            critique_notes.append(
+                chain_notes[-1]
+                + f" · Z_ctx={m_max} slotów"
+                + (" (z kolumnami Hipokampu)" if has_recalled_mem else "")
+            )
         p1_conf = float(conf_list[0]["confidence"])
 
         for idx in range(len(thoughts)):
@@ -757,6 +800,12 @@ class LanguageCortex:
                 "issues": list(diag["issues"]),
                 "needs_correction": bool(diag["needs_correction"]),
                 "heard_sdr": fb_batch.sdr[idx],
+                "thought_slots": idx,
+                "context_slots": int(
+                    thoughts[idx].context_columns.shape[1]
+                    if thoughts[idx].context_columns is not None
+                    else thoughts[idx].columns_star.shape[1]
+                ),
             }
             candidates.append(cand)
             critique_notes.append(
@@ -790,16 +839,22 @@ class LanguageCortex:
                 living_blend=living_blend,
                 neuromod=neuromod,
                 living_telemetry=living_telemetry,
+                sensory_patch_columns=w_out.patch_columns,
+                sensory_patch_mask=w_out.patch_mask,
+                working_memory_slots=working_memory_slots,
+                thought_slots=torch.cat(latent_slots, dim=1) if latent_slots else None,
             )
             corr_temp = max(0.36, round(winner["temperature"] - 0.10, 3))
             corr_rep = round(self.cfg.broca_repetition_penalty + 0.10, 2)
+            corr_ctx = corr_thought.context_columns if corr_thought.context_columns is not None else corr_thought.columns_star
             with self._op_lock:
                 rev_gen = self._broca_raw.generate(
-                    memory_columns=corr_thought.columns_star,
+                    memory_columns=corr_ctx,
                     max_new_bytes=max_b,
                     temperature=corr_temp,
                     top_p=max(0.75, self.cfg.broca_top_p - 0.05),
                     repetition_penalty=corr_rep,
+                    memory_mask=corr_thought.context_mask,
                 )
             rev_diag = self.analyze_self_heard_draft(
                 draft_text=rev_gen["text"],
@@ -839,7 +894,7 @@ class LanguageCortex:
         cortex.last_attractor_steps = winner["thought"].attractor_steps
 
         critique_notes.append(
-            f"Samokrytyka wybrała ścieżkę „{winner['label']}” ({winner['score']*100:.0f}%, pewność={winner['confidence']*100:.0f}%) z {len(candidates)} myśli."
+            f"Samokrytyka wybrała ścieżkę „{winner['label']}” ({winner['score']*100:.0f}%, pewność={winner['confidence']*100:.0f}%) z {len(candidates)} kroków."
         )
 
         return {
@@ -854,6 +909,7 @@ class LanguageCortex:
             "needs_correction": bool(winner["needs_correction"]),
             "label": winner["label"],
             "self_corrected": self_corrected,
+            "reasoning_steps": len(thoughts),
             "critique_notes": critique_notes,
             "candidates": [
                 {
@@ -864,6 +920,8 @@ class LanguageCortex:
                     "quality": c["quality"],
                     "alignment": c["alignment"],
                     "temperature": c["temperature"],
+                    "thought_slots": c["thought_slots"],
+                    "context_slots": c["context_slots"],
                 }
                 for c in candidates
             ],
@@ -879,11 +937,11 @@ class LanguageCortex:
         max_new_bytes: int | None = None,
         working_memory_sdr: torch.Tensor | None = None,
         working_memory_weight: float = 0.0,
+        working_memory_slots: torch.Tensor | None = None,
     ) -> tuple[WernickeOutput, CortexThought, Iterator[str]]:
         """
         Full zero-token cognitive pathway:
-          UTF-8 bytes -> Wernicke (S, u_sdr) -> BiologicalAssociativeCortex (z*, Z*) -> Broca stream(Z*).
-        Hard isolation: Broca receives ONLY Z* and NEVER sees user_message or any memory text.
+          UTF-8 bytes -> Wernicke (patch_columns, S, u_sdr) -> BiologicalAssociativeCortex (Z_ctx) -> Broca stream(Z_ctx).
         """
         with self._op_lock:
             w_out = self._wernicke_raw.encode_texts([user_message], device=self.device, batch_size=1)
@@ -897,25 +955,34 @@ class LanguageCortex:
                 update_last_active=True,
                 working_memory_sdr=working_memory_sdr,
                 working_memory_weight=working_memory_weight,
+                sensory_patch_columns=w_out.patch_columns,
+                sensory_patch_mask=w_out.patch_mask,
+                working_memory_slots=working_memory_slots,
             )
+
+        ctx_cols = thought.context_columns if thought.context_columns is not None else thought.columns_star
 
         def _stream_gen() -> Iterator[str]:
             with self._op_lock:
                 yield from self._broca_raw.generate_stream(
-                    memory_columns=thought.columns_star,
+                    memory_columns=ctx_cols,
                     max_new_bytes=max_new_bytes or self.cfg.broca_max_new_bytes,
                     temperature=temperature,
                     top_p=self.cfg.broca_top_p,
                     repetition_penalty=self.cfg.broca_repetition_penalty,
+                    memory_mask=thought.context_mask,
                 )
 
         return w_out, thought, _stream_gen()
 
     # ── Denoising Autoencoder Training through k-WTA SDR Bottleneck ──────────
     def _build_optimizer(self, lr: float, cond_lr_mult: float = 1.0) -> torch.optim.Optimizer:
-        # Keep zero weight decay on Z* conditioning pathways (cross-attn, FiLM, BOS/out projections)
-        # so AdamW NEVER decays Z* conditioning weights toward zero (prevents Cross-Attention collapse).
-        cond_keys = ("cross_", "film_", "bos_z_", "out_z_", "z_col_", "z_summary_", "sdr_expand_")
+        # Keep zero weight decay on Z* conditioning & Wernicke bottleneck pathways
+        # so AdamW NEVER decays Z* conditioning or column/SDR projections toward zero.
+        cond_keys = (
+            "cross_", "film_", "bos_z_", "out_z_", "z_col_", "z_summary_", "sdr_expand_",
+            "col_queries", "col_q_proj", "col_kv_proj", "col_out_proj", "col_compress", "to_sdr",
+        )
         decay_params: list[torch.nn.Parameter] = []
         norm_params: list[torch.nn.Parameter] = []
         cond_params: list[torch.nn.Parameter] = []
@@ -952,6 +1019,14 @@ class LanguageCortex:
         off = sim.masked_fill(eye, 0.0)
         return 0.65 * (off - 0.20).clamp(min=0.0).pow(2).mean()
 
+    def _wernicke_bottleneck_loss(self, w_out: WernickeOutput, z_star: torch.Tensor) -> torch.Tensor:
+        """Preserve sharp k-WTA SDR & column diversity even when patch_columns is present in Z_ctx."""
+        dec_z = self._z_decorrelation_loss(z_star)
+        dec_cols = self._z_decorrelation_loss(w_out.columns)
+        dec_sdr = self._z_decorrelation_loss(w_out.sdr)
+        align_recon = 0.25 * F.mse_loss(w_out.reconstructed_columns.float(), w_out.columns.detach().float())
+        return dec_z + dec_cols + 0.5 * dec_sdr + align_recon
+
     def _train_denoising_epochs_unlocked(
         self,
         texts: list[str],
@@ -982,13 +1057,15 @@ class LanguageCortex:
         loss_end: float = self._broca_raw.last_loss
         epochs_run = 0
         bs = max(1, int(batch_size))
+        is_cuda = self.device.type == "cuda"
+        ep_loss_gpu = torch.zeros((), device=self.device, dtype=torch.float32)
 
         try:
             for _ in range(max(1, int(epochs))):
                 epochs_run += 1
                 order = list(clean_texts)
                 random.shuffle(order)
-                ep_loss_sum = 0.0
+                ep_loss_gpu.zero_()
                 ep_batches = 0
 
                 for i in range(0, len(order), bs):
@@ -1000,6 +1077,7 @@ class LanguageCortex:
                         add_bos_eos=False,
                         mask_prob=mask_prob,
                         device=self.device,
+                        pin_memory=is_cuda,
                     )
                     tgt_bytes, _ = encode_utf8_bytes(
                         batch,
@@ -1008,12 +1086,20 @@ class LanguageCortex:
                         add_bos_eos=True,
                         mask_prob=0.0,
                         device=self.device,
+                        pin_memory=is_cuda,
                     )
                     opt.zero_grad(set_to_none=True)
                     with amp_autocast(self.device):
                         w_out = self.wernicke(in_bytes, in_mask)
                         z_cols = self._normalize_z_columns(w_out.reconstructed_columns)
-                        loss = self._broca_raw.compute_loss(tgt_bytes, z_cols)
+                        if w_out.patch_columns is not None and w_out.patch_mask is not None:
+                            z_ctx = self._normalize_z_columns(torch.cat([z_cols, w_out.patch_columns], dim=1))
+                            prim_m = torch.ones((z_cols.shape[0], z_cols.shape[1]), dtype=torch.bool, device=self.device)
+                            z_ctx_mask = torch.cat([prim_m, w_out.patch_mask], dim=1)
+                        else:
+                            z_ctx = z_cols
+                            z_ctx_mask = None
+                        loss = self._broca_raw.compute_loss(tgt_bytes, z_ctx, memory_mask=z_ctx_mask) + self._wernicke_bottleneck_loss(w_out, z_cols)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(
                         list(self._wernicke_raw.parameters()) + list(self._broca_raw.parameters()),
@@ -1021,14 +1107,13 @@ class LanguageCortex:
                     )
                     opt.step()
 
-                    val = float(loss.detach().item())
-                    if loss_start is None:
-                        loss_start = val
-                    ep_loss_sum += val
+                    ep_loss_gpu += loss.detach().float()
                     ep_batches += 1
                     self._broca_raw.trained_steps += 1
 
-                loss_end = ep_loss_sum / max(1, ep_batches)
+                loss_end = float((ep_loss_gpu / float(max(1, ep_batches))).item())
+                if loss_start is None:
+                    loss_start = loss_end
                 self._broca_raw._update_fluency(loss_end)
                 # Early stopping around 0.85-1.0 to avoid 1:1 memorization
                 if loss_end <= early_stop_loss:
@@ -1182,6 +1267,7 @@ class LanguageCortex:
             qs = [x[0] for x in batch_pairs]
             ans = [x[1] for x in batch_pairs]
             n_new_rows = len(clean_new) * repeat_mult
+            is_cuda = self.device.type == "cuda"
             in_bytes, in_mask = encode_utf8_bytes(
                 qs,
                 max_bytes=self.cfg.max_input_bytes,
@@ -1189,6 +1275,7 @@ class LanguageCortex:
                 add_bos_eos=False,
                 mask_prob=0.0,
                 device=self.device,
+                pin_memory=is_cuda,
             )
             tgt_bytes, _ = encode_utf8_bytes(
                 ans,
@@ -1197,6 +1284,7 @@ class LanguageCortex:
                 add_bos_eos=True,
                 mask_prob=0.0,
                 device=self.device,
+                pin_memory=is_cuda,
             )
 
             with torch.no_grad():
@@ -1209,26 +1297,29 @@ class LanguageCortex:
                     steps=self.cfg.attractor_steps,
                     noise_std=0.0,
                     update_last_active=False,
+                    sensory_patch_columns=w_out.patch_columns,
+                    sensory_patch_mask=w_out.patch_mask,
                 )
-                z_star = thought.columns_star.detach()
+                z_star = (thought.context_columns if thought.context_columns is not None else thought.columns_star).detach()
+                z_mask = thought.context_mask.detach() if thought.context_mask is not None else None
 
             broca_params = list(self._broca_raw.parameters())
             min_steps = 4 if lightweight else 16
             max_steps = max(min_steps, min(64, int(steps)))
             ewc_weight = 0.012 if lightweight else 0.004
             last_new_loss = 5.0
+            last_new_t = torch.tensor(5.0, device=self.device, dtype=torch.float32)
             try:
-                for _ in range(max_steps):
+                for step_i in range(max_steps):
                     opt.zero_grad(set_to_none=True)
                     with amp_autocast(self.device):
-                        # Separate new-pair loss & replay loss so Broca crisply absorbs new Wikipedia/personal facts
-                        # while EWC + 60+ replay pairs preserve all prior Q&A knowledge!
                         loss_new = self._broca_raw.compute_loss(
                             tgt_bytes[:n_new_rows],
                             z_star[:n_new_rows],
                             label_smoothing=0.03,
                             decoder_byte_dropout=0.02,
                             clean_z=True,
+                            memory_mask=z_mask[:n_new_rows] if z_mask is not None else None,
                         )
                         loss_rep = self._broca_raw.compute_loss(
                             tgt_bytes[n_new_rows:],
@@ -1236,6 +1327,7 @@ class LanguageCortex:
                             label_smoothing=0.05,
                             decoder_byte_dropout=0.05,
                             clean_z=True,
+                            memory_mask=z_mask[n_new_rows:] if z_mask is not None else None,
                         )
                         ewc_pen = sum((p - p0).pow(2).sum() for p, p0 in anchor_params)
                         loss = 0.65 * loss_new + 0.35 * loss_rep + ewc_weight * ewc_pen
@@ -1243,9 +1335,10 @@ class LanguageCortex:
                     torch.nn.utils.clip_grad_norm_(broca_params, max_norm=1.0)
                     opt.step()
                     self._broca_raw.trained_steps += 1
-                    last_new_loss = float(loss_new.detach().item())
-                    if last_new_loss <= 0.28:
+                    last_new_t = loss_new.detach().float()
+                    if ((step_i + 1) % 4 == 0 or step_i + 1 == max_steps) and float(last_new_t.item()) <= 0.28:
                         break
+                last_new_loss = float(last_new_t.item())
             finally:
                 self._broca_raw.eval()
 
@@ -1480,11 +1573,14 @@ class LanguageCortex:
                                 steps=self.cfg.attractor_steps,
                                 noise_std=0.0,
                                 update_last_active=False,
+                                sensory_patch_columns=w_p.patch_columns,
+                                sensory_patch_mask=w_p.patch_mask,
                             )
                             gen_p = self.decode_columns(
-                                t_p.columns_star,
+                                t_p.context_columns if t_p.context_columns is not None else t_p.columns_star,
                                 max_new_bytes=min(96, self.cfg.broca_max_seq_len),
                                 temperature=0.55,
+                                memory_mask=t_p.context_mask,
                             )
                             sample_brain = str(gen_p.get("text", "")).strip()
                     except Exception:
@@ -1555,18 +1651,28 @@ class LanguageCortex:
                                     steps=self.cfg.attractor_steps,
                                     noise_std=cortex_noise_std,
                                     update_last_active=False,
+                                    sensory_patch_columns=w_out.patch_columns.detach() if w_out.patch_columns is not None else None,
+                                    sensory_patch_mask=w_out.patch_mask.detach() if w_out.patch_mask is not None else None,
                                 )
                                 z_cortex = thought.columns_star.to(dtype=z_wernicke.dtype)
 
                             z_star = self._normalize_z_columns(z_wernicke + (z_cortex - z_wernicke.detach()))
+                            use_patches = random.random() >= 0.30
+                            z_ctx, z_ctx_mask = cortex.build_context_columns(
+                                columns_star=z_star,
+                                sensory_patch_columns=w_out.patch_columns if use_patches else None,
+                                sensory_patch_mask=w_out.patch_mask if use_patches else None,
+                                recalled_columns=thought.recalled_columns,
+                            )
                             ce_loss = self._broca_raw.compute_loss(
                                 tgt_bytes,
-                                z_star,
+                                z_ctx,
                                 label_smoothing=eff_ls,
                                 decoder_byte_dropout=eff_drop,
                                 clean_z=True,
+                                memory_mask=z_ctx_mask,
                             )
-                            loss = ce_loss + self._z_decorrelation_loss(z_star)
+                            loss = ce_loss + self._wernicke_bottleneck_loss(w_out, z_star)
 
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
@@ -1617,8 +1723,16 @@ class LanguageCortex:
                                     steps=self.cfg.attractor_steps,
                                     noise_std=0.0,
                                     update_last_active=False,
+                                    sensory_patch_columns=w_c.patch_columns,
+                                    sensory_patch_mask=w_c.patch_mask,
                                 )
-                                logits = self._broca_raw.forward(tgt_b[:, :-1], t_c.columns_star, clean_z=True)
+                                eval_ctx = t_c.context_columns if t_c.context_columns is not None else t_c.columns_star
+                                logits = self._broca_raw.forward(
+                                    tgt_b[:, :-1],
+                                    eval_ctx,
+                                    clean_z=True,
+                                    memory_mask=t_c.context_mask,
+                                )
                             tgt_next = tgt_b[:, 1:]
                             per_tok = F.cross_entropy(
                                 logits.float().reshape(-1, BYTE_VOCAB_SIZE),
@@ -1666,17 +1780,27 @@ class LanguageCortex:
                                             steps=self.cfg.attractor_steps,
                                             noise_std=0.005,
                                             update_last_active=False,
+                                            sensory_patch_columns=w_out.patch_columns.detach() if w_out.patch_columns is not None else None,
+                                            sensory_patch_mask=w_out.patch_mask.detach() if w_out.patch_mask is not None else None,
                                         )
                                         z_cortex = thought.columns_star.to(dtype=z_wernicke.dtype)
                                     z_star = self._normalize_z_columns(z_wernicke + (z_cortex - z_wernicke.detach()))
+                                    use_patches = random.random() >= 0.30
+                                    z_ctx, z_ctx_mask = cortex.build_context_columns(
+                                        columns_star=z_star,
+                                        sensory_patch_columns=w_out.patch_columns if use_patches else None,
+                                        sensory_patch_mask=w_out.patch_mask if use_patches else None,
+                                        recalled_columns=thought.recalled_columns,
+                                    )
                                     ce_loss = self._broca_raw.compute_loss(
                                         tgt_bytes,
-                                        z_star,
+                                        z_ctx,
                                         label_smoothing=0.04,
                                         decoder_byte_dropout=0.04,
                                         clean_z=True,
+                                        memory_mask=z_ctx_mask,
                                     )
-                                    loss = ce_loss + self._z_decorrelation_loss(z_star)
+                                    loss = ce_loss + self._wernicke_bottleneck_loss(w_out, z_star)
                                 loss.backward()
                                 torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
                                 opt_p.step()
@@ -1805,6 +1929,8 @@ class LanguageCortex:
                     ep_batches = 0
                     batch_buf: list[str] = []
 
+                    is_cuda = self.device.type == "cuda"
+
                     def _flush_batch(items: list[str]) -> float:
                         nonlocal loss_start, total_samples, total_batches
                         in_bytes, in_mask = encode_utf8_bytes(
@@ -1814,6 +1940,7 @@ class LanguageCortex:
                             add_bos_eos=False,
                             mask_prob=mask_prob,
                             device=self.device,
+                            pin_memory=is_cuda,
                         )
                         tgt_bytes, _ = encode_utf8_bytes(
                             items,
@@ -1822,11 +1949,20 @@ class LanguageCortex:
                             add_bos_eos=True,
                             mask_prob=0.0,
                             device=self.device,
+                            pin_memory=is_cuda,
                         )
                         opt.zero_grad(set_to_none=True)
                         with amp_autocast(self.device):
                             w_out = self.wernicke(in_bytes, in_mask)
-                            loss = self._broca_raw.compute_loss(tgt_bytes, w_out.reconstructed_columns)
+                            z_cols = self._normalize_z_columns(w_out.reconstructed_columns)
+                            if w_out.patch_columns is not None and w_out.patch_mask is not None:
+                                z_ctx = self._normalize_z_columns(torch.cat([z_cols, w_out.patch_columns], dim=1))
+                                prim_m = torch.ones((z_cols.shape[0], z_cols.shape[1]), dtype=torch.bool, device=self.device)
+                                z_ctx_mask = torch.cat([prim_m, w_out.patch_mask], dim=1)
+                            else:
+                                z_ctx = z_cols
+                                z_ctx_mask = None
+                            loss = self._broca_raw.compute_loss(tgt_bytes, z_ctx, memory_mask=z_ctx_mask)
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(
                             list(self._wernicke_raw.parameters()) + list(self._broca_raw.parameters()),
@@ -2061,14 +2197,25 @@ class LanguageCortex:
                     with amp_autocast(self.device):
                         w_out = self.wernicke(in_bytes, in_mask)
                         z_cols = self._normalize_z_columns(w_out.reconstructed_columns)
-                        loss = self._broca_raw.compute_loss(tgt_bytes, z_cols) + self._z_decorrelation_loss(z_cols)
+                        if w_out.patch_columns is not None and w_out.patch_mask is not None:
+                            z_ctx = self._normalize_z_columns(torch.cat([z_cols, w_out.patch_columns], dim=1))
+                            prim_m = torch.ones((z_cols.shape[0], z_cols.shape[1]), dtype=torch.bool, device=self.device)
+                            z_ctx_mask = torch.cat([prim_m, w_out.patch_mask], dim=1)
+                        else:
+                            z_ctx = z_cols
+                            z_ctx_mask = None
+                        loss = self._broca_raw.compute_loss(
+                            tgt_bytes,
+                            z_ctx,
+                            memory_mask=z_ctx_mask,
+                        ) + self._wernicke_bottleneck_loss(w_out, z_cols)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
                     opt.step()
                     self._broca_raw.trained_steps += 1
                     loss_window += loss.detach().float()
                     window_count += 1
-                del in_bytes, in_mask, tgt_bytes, w_out, z_cols, loss
+                del in_bytes, in_mask, tgt_bytes, w_out, z_cols, z_ctx, z_ctx_mask, loss
                 if is_cuda:
                     cuda_ev_ring[ev_slot].record()
                     ev_slot = (ev_slot + 1) % len(cuda_ev_ring)
@@ -2106,10 +2253,24 @@ class LanguageCortex:
                             self._broca_raw.eval()
                         try:
                             probe_out = self.perceive_one(probe_src)
+                            p_cols = probe_out.reconstructed_columns
+                            p_mask = None
+                            if probe_out.patch_columns is not None and probe_out.patch_mask is not None:
+                                p_cols = self._normalize_z_columns(
+                                    torch.cat([p_cols.to(self.device), probe_out.patch_columns.to(self.device)], dim=1)
+                                )
+                                p_mask = torch.cat(
+                                    [
+                                        torch.ones((1, probe_out.reconstructed_columns.shape[1]), dtype=torch.bool, device=self.device),
+                                        probe_out.patch_mask.to(self.device),
+                                    ],
+                                    dim=1,
+                                )
                             gen = self.decode_columns(
-                                probe_out.reconstructed_columns,
+                                p_cols,
                                 max_new_bytes=90,
                                 temperature=0.72,
+                                memory_mask=p_mask,
                             )
                             last_sample_text = gen["text"]
                             last_probe_prompt = probe_src

@@ -16,18 +16,23 @@ class BrainConfig:
     byte_embed_dim: int = 64
     max_input_bytes: int = 4096
 
-    # Shared Cortical Columns S, Z* in R^{16 x D} (Self-Sufficient ~490M Brain on RTX 5080)
+    # Shared Cortical Columns S, Z* in R^{16 x D} + Sequential Patch Columns [B, P_active, D]
     num_columns: int = 16
     column_dim: int = 768
     wernicke_layers: int = 6
     wernicke_heads: int = 12
     wernicke_ff_dim: int = 2304
+    wernicke_max_patch_slots: int = 64
+    wernicke_rf_anchor_weight: float = 0.12
 
     # Biological Associative Cortex (Modern Continuous Hopfield + k-WTA SDR + Local Plasticity)
     num_neurons: int = 12288
     sdr_k: int = 492  # ~4.00% sparsity (within 3-5% biological k-WTA range)
     hopfield_beta: float = 12.0
     attractor_steps: int = 4  # 3-6 iterations
+    cortex_rec_weight: float = 0.25
+    cortex_pc_col_weight: float = 0.20
+    cortex_hopfield_weight: float = 0.35
     pc_lr: float = 0.035
     hebb_lr: float = 0.018
     hebb_decay: float = 0.004
@@ -69,6 +74,7 @@ class BrainConfig:
     broca_batch_size: int = 24
     embed_batch_size: int = 32
     enable_torch_compile: bool = False
+    broca_gradient_checkpointing: bool = False
 
     # Informational Sleep & Creativity (no artificial fatigue)
     max_energy: float = 100.0
@@ -80,10 +86,12 @@ class BrainConfig:
     max_semantic_memories: int = 200000
     max_rem_reflections: int = 2000
     working_sdr_capacity: int = 64
+    working_memory_slots: int = 8
     working_chat_window: int = 128
     working_chat_buffer: int = 256
     chat_log_limit: int = 2000
     self_critique_candidates: int = 3
+    system2_reasoning_steps: int = 3
     self_correction_enabled: bool = True
     self_correction_threshold: float = 0.78
 

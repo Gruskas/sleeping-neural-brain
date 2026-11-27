@@ -22,6 +22,8 @@ class CortexThought:
     sparsity_pct: float
     max_hopfield_sim: float = 0.0
     recalled_columns: torch.Tensor | None = None  # [B, 16, D] recalled Hippocampus columns for Broca Cross-Attention
+    context_columns: torch.Tensor | None = None  # [B, M_total, D] composite cortical context Z_ctx
+    context_mask: torch.Tensor | None = None  # [B, M_total] bool validity mask (True = valid)
 
 
 class BiologicalAssociativeCortex(nn.Module):
@@ -95,6 +97,12 @@ class BiologicalAssociativeCortex(nn.Module):
             (torch.rand(self.column_dim, generator=gen, dtype=torch.float32) * 6.2831853).to(device),
         )
 
+        # Deterministic segment embeddings for composite Z_ctx slots:
+        # 0 = sensory patch columns, 1 = cortical/recalled columns, 2 = PFC working memory slots, 3 = System-2 thought slots
+        seg_gen = torch.Generator(device="cpu").manual_seed(20261127)
+        seg_emb = F.normalize(torch.randn(4, self.column_dim, generator=seg_gen, dtype=torch.float32), dim=-1) * 0.15
+        self.register_buffer("segment_embeddings", seg_emb.to(device))
+
         self.last_sparsity_pct: float = round(100.0 * self.target_sparsity, 2)
         self.last_attractor_steps: int = cfg.attractor_steps
         self.last_prediction_error: float = 0.0
@@ -155,6 +163,91 @@ class BiologicalAssociativeCortex(nn.Module):
             return F.rms_norm(cols, (self.column_dim,), eps=1e-6)
         return cols * torch.rsqrt(cols.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
 
+    def build_context_columns(
+        self,
+        columns_star: torch.Tensor,
+        sensory_patch_columns: torch.Tensor | None = None,
+        sensory_patch_mask: torch.Tensor | None = None,
+        recalled_columns: torch.Tensor | None = None,
+        working_memory_slots: torch.Tensor | None = None,
+        thought_slots: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Assemble composite cortical context Z_ctx [B, M_total, D] with segment embeddings:
+          [0..15]      primary attractor columns Z* (+ seg[1]) so Broca summary stays checkpoint-compatible
+          [sensory]    active Wernicke patch columns preserving syntactic order & binding (+ seg[0])
+          [recalled]   Modern Hopfield / Hippocampus recalled columns (+ seg[1])
+          [wm_slots]   discrete Prefrontal Working Memory slots from recent turns (+ seg[2])
+          [thoughts]   System-2 sequential latent reasoning chain slots (+ seg[3])
+        """
+        b = columns_star.shape[0]
+        dev = columns_star.device
+        dt = columns_star.dtype
+        seg = self.segment_embeddings.to(device=dev, dtype=dt)
+
+        parts: list[torch.Tensor] = [columns_star + seg[1].view(1, 1, -1)]
+        masks: list[torch.Tensor] = [torch.ones((b, columns_star.shape[1]), dtype=torch.bool, device=dev)]
+
+        if sensory_patch_columns is not None and sensory_patch_columns.numel() > 0:
+            p_cols = sensory_patch_columns.to(device=dev, dtype=dt)
+            if p_cols.ndim == 2:
+                p_cols = p_cols.unsqueeze(0)
+            if p_cols.shape[0] == 1 and b > 1:
+                p_cols = p_cols.expand(b, -1, -1)
+            if sensory_patch_mask is not None:
+                p_mask = sensory_patch_mask.to(device=dev, dtype=torch.bool).clone()
+                if p_mask.ndim == 1:
+                    p_mask = p_mask.unsqueeze(0)
+                if p_mask.shape[0] == 1 and b > 1:
+                    p_mask = p_mask.expand(b, -1)
+                p_mask[:, 0] = True
+            else:
+                p_mask = torch.ones((b, p_cols.shape[1]), dtype=torch.bool, device=dev)
+            parts.append(p_cols + seg[0].view(1, 1, -1))
+            masks.append(p_mask)
+
+        if recalled_columns is not None and recalled_columns.numel() > 0:
+            r_cols = recalled_columns.to(device=dev, dtype=dt)
+            if r_cols.ndim == 2:
+                r_cols = r_cols.unsqueeze(0)
+            if r_cols.shape[0] == 1 and b > 1:
+                r_cols = r_cols.expand(b, -1, -1)
+            parts.append(r_cols + seg[1].view(1, 1, -1))
+            masks.append(torch.ones((b, r_cols.shape[1]), dtype=torch.bool, device=dev))
+
+        if working_memory_slots is not None and working_memory_slots.numel() > 0:
+            wm = working_memory_slots.to(device=dev, dtype=dt)
+            if wm.ndim == 2:
+                wm = wm.unsqueeze(0)
+            if wm.shape[0] == 1 and b > 1:
+                wm = wm.expand(b, -1, -1)
+            wm = F.rms_norm(wm, (self.column_dim,), eps=1e-6) if hasattr(F, "rms_norm") else (
+                wm * torch.rsqrt(wm.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+            )
+            parts.append(wm + seg[2].view(1, 1, -1))
+            masks.append(torch.ones((b, wm.shape[1]), dtype=torch.bool, device=dev))
+
+        if thought_slots is not None and thought_slots.numel() > 0:
+            th = thought_slots.to(device=dev, dtype=dt)
+            if th.ndim == 2:
+                th = th.unsqueeze(0)
+            if th.shape[0] == 1 and b > 1:
+                th = th.expand(b, -1, -1)
+            th = F.rms_norm(th, (self.column_dim,), eps=1e-6) if hasattr(F, "rms_norm") else (
+                th * torch.rsqrt(th.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+            )
+            parts.append(th + seg[3].view(1, 1, -1))
+            masks.append(torch.ones((b, th.shape[1]), dtype=torch.bool, device=dev))
+
+        z_ctx = torch.cat(parts, dim=1)
+        ctx_mask = torch.cat(masks, dim=1)
+        if hasattr(F, "rms_norm"):
+            z_ctx = F.rms_norm(z_ctx, (self.column_dim,), eps=1e-6)
+        else:
+            z_ctx = z_ctx * torch.rsqrt(z_ctx.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        z_ctx = z_ctx * ctx_mask.unsqueeze(-1).to(dtype=z_ctx.dtype)
+        return z_ctx, ctx_mask
+
     @torch.no_grad()
     def perceive_and_think(
         self,
@@ -173,19 +266,19 @@ class BiologicalAssociativeCortex(nn.Module):
         living_blend: float = 0.08,
         neuromod: Any | None = None,
         living_telemetry: Any | None = None,
+        sensory_patch_columns: torch.Tensor | None = None,
+        sensory_patch_mask: torch.Tensor | None = None,
+        working_memory_slots: torch.Tensor | None = None,
+        thought_slots: torch.Tensor | None = None,
     ) -> CortexThought:
         """
         Execute 3-6 attractor iterations combining:
-          - Modern Continuous Hopfield Network retrieval over engram bank E [M, N], gated
-            proportionally to match confidence (>= 0.62) so weak/unrelated memories NEVER hijack
-            the user's question (unless force_hopfield=True during REM dreaming).
-          - Prefrontal Working Memory SDR trace (tokenless short-term conversation context)
+          - Modern Continuous Hopfield Network retrieval over engram bank E [M, N]
+          - Prefrontal Working Memory SDR trace & discrete turn slots
           - Local recurrent cortical synapses W_rec (zero diagonal) & homeostatic thresholds
           - Lateral inhibition k-WTA
           - Direct adaptive projection from LivingBrainEngine's growing associative state + top-3 M2 traces
-          - Neuromodulatory control (high NA / PE extends attractor deliberation from 3 up to 6 steps)
-        Returns stable attractor z* [B, N] and RMS-normalized 16 cortical columns Z* [B, 16, D]
-        with identical scale/distribution to Wernicke.sdr_to_columns().
+          - Composite Z_ctx [B, M_total, D] assembly for Broca Cross-Attention
         """
         n_steps = max(3, min(6, int(steps if steps is not None else self.cfg.attractor_steps)))
         na_val = 0.35
@@ -225,10 +318,15 @@ class BiologicalAssociativeCortex(nn.Module):
                 eps=1e-6,
             ).expand(b, -1)
 
+        rec_w = max(0.05, min(0.40, float(getattr(self.cfg, "cortex_rec_weight", 0.25))))
+        pc_col_w = max(0.05, min(0.40, float(getattr(self.cfg, "cortex_pc_col_weight", 0.20))))
+        hop_max_w = max(0.15, min(0.50, float(getattr(self.cfg, "cortex_hopfield_weight", 0.35))))
+        base_u_w = max(0.20, 1.0 - rec_w - wm_w)
+
         # Bottom-up sensory drive via local W_in in native weight_dtype (bfloat16 Tensor Cores on GPU!)
         w_dt = self.W_in.dtype
         drive_in = F.normalize((s_flat.to(dtype=w_dt) @ self.W_in.T).float(), dim=-1, eps=1e-6)
-        init_act = (0.90 - wm_w) * u + 0.10 * drive_in - self.threshold.unsqueeze(0)
+        init_act = base_u_w * u + rec_w * drive_in - self.threshold.unsqueeze(0)
         if wm_vec is not None:
             init_act = init_act + wm_w * wm_vec
         z, _, _ = k_wta(init_act, k=self.sdr_k, normalize=True)
@@ -265,15 +363,15 @@ class BiologicalAssociativeCortex(nn.Module):
 
                 if force_hopfield:
                     hop_gate = torch.ones((b, 1), device=self.device, dtype=torch.float32)
-                    w_hop = 0.45 * hop_gate
+                    w_hop = max(hop_max_w, 0.45) * hop_gate
                 else:
                     hop_gate = torch.clamp((max_sim - hopfield_min_sim) / 0.16, min=0.0, max=1.0)
-                    w_hop = 0.22 * hop_gate
+                    w_hop = hop_max_w * hop_gate
 
-                w_u = (0.90 - wm_w) - w_hop
-                pre_act = w_u * u + w_hop * h_hop + 0.10 * h_rec - self.threshold.unsqueeze(0)
+                w_u = torch.clamp((1.0 - rec_w - wm_w) - w_hop, min=0.20)
+                pre_act = w_u * u + w_hop * h_hop + rec_w * h_rec - self.threshold.unsqueeze(0)
             else:
-                pre_act = (0.90 - wm_w) * u + 0.10 * h_rec - self.threshold.unsqueeze(0)
+                pre_act = base_u_w * u + rec_w * h_rec - self.threshold.unsqueeze(0)
 
             if wm_vec is not None:
                 pre_act = pre_act + wm_w * wm_vec
@@ -299,22 +397,23 @@ class BiologicalAssociativeCortex(nn.Module):
         )
         if sdr_to_columns_fn is not None:
             z_aligned = sdr_to_columns_fn(z.to(dtype=next_param_dtype(sdr_to_columns_fn, torch.float32))).float()
-            raw_cols = z_aligned + 0.05 * z_pc_cols
+            raw_cols = z_aligned + pc_col_w * z_pc_cols
         else:
             raw_cols = z_pc_cols
 
-        # Direct adaptive projection from LivingBrainEngine (state_assoc + top-3 M2 traces) into Z*
+        # Direct adaptive projection from LivingBrainEngine (state_assoc + top-3 M2 traces) into Z* (zero .item() sync!)
         if living_assoc_vec is not None and living_assoc_vec.numel() > 0 and living_blend > 0.0:
-            if float(living_assoc_vec.detach().float().norm().item()) > 1e-6:
-                living_cols = self.project_living_to_columns(living_assoc_vec, batch_size=b)
-                # Smooth, strictly bounded mixing factor so BrocaByteTransformer stays stable
-                eff_blend = float(living_blend) * (1.0 + 0.25 * min(1.0, cur_val))
-                eff_blend = max(0.0, min(0.22, eff_blend))
-                if hasattr(F, "rms_norm"):
-                    raw_normed = F.rms_norm(raw_cols, (self.column_dim,), eps=1e-6)
-                else:
-                    raw_normed = raw_cols * torch.rsqrt(raw_cols.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
-                raw_cols = (1.0 - eff_blend) * raw_normed + eff_blend * living_cols
+            v_norm = living_assoc_vec.detach().float().norm()
+            has_v = (v_norm > 1e-6).to(dtype=raw_cols.dtype)
+            living_cols = self.project_living_to_columns(living_assoc_vec, batch_size=b)
+            eff_blend = float(living_blend) * (1.0 + 0.25 * min(1.0, cur_val))
+            eff_blend = max(0.0, min(0.22, eff_blend))
+            if hasattr(F, "rms_norm"):
+                raw_normed = F.rms_norm(raw_cols, (self.column_dim,), eps=1e-6)
+            else:
+                raw_normed = raw_cols * torch.rsqrt(raw_cols.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+            blended_cols = (1.0 - eff_blend) * raw_normed + eff_blend * living_cols
+            raw_cols = raw_cols + has_v * (blended_cols - raw_cols)
 
         if hasattr(F, "rms_norm"):
             columns_star = F.rms_norm(raw_cols, (self.column_dim,), eps=1e-6)
@@ -339,6 +438,15 @@ class BiologicalAssociativeCortex(nn.Module):
             else:
                 recalled_columns = rec_raw * torch.rsqrt(rec_raw.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
 
+        context_columns, context_mask = self.build_context_columns(
+            columns_star=columns_star,
+            sensory_patch_columns=sensory_patch_columns,
+            sensory_patch_mask=sensory_patch_mask,
+            recalled_columns=recalled_columns,
+            working_memory_slots=working_memory_slots,
+            thought_slots=thought_slots,
+        )
+
         return CortexThought(
             z_star=z,
             columns_star=columns_star,
@@ -348,6 +456,8 @@ class BiologicalAssociativeCortex(nn.Module):
             sparsity_pct=sparsity_pct,
             max_hopfield_sim=round(best_sim_val, 4),
             recalled_columns=recalled_columns,
+            context_columns=context_columns,
+            context_mask=context_mask,
         )
 
     @torch.no_grad()
@@ -379,8 +489,8 @@ class BiologicalAssociativeCortex(nn.Module):
         )
         z_base = F.normalize(z_batch.to(device=self.device, dtype=torch.float32), dim=-1, eps=1e-6)
 
-        err_start = 0.0
-        err_end = 0.0
+        err_start_t: torch.Tensor | None = None
+        err_end_t: torch.Tensor | None = None
         n_steps = max(1, int(steps))
         # Accumulate local plasticity updates in fp32 so small lr steps never underflow bf16!
         w_in_f = self.W_in.float()
@@ -396,10 +506,10 @@ class BiologicalAssociativeCortex(nn.Module):
             # 1) Predictive Coding: local reconstruction s_hat = z @ W_in, error = s - s_hat
             s_hat = z @ w_in_f  # [B, 16*D]
             err = s_flat - s_hat
-            mse = float(err.pow(2).mean().item())
+            mse_t = err.pow(2).mean()
             if step_i == 0:
-                err_start = mse
-            err_end = mse
+                err_start_t = mse_t
+            err_end_t = mse_t
 
             # Local Hebbian/Predictive delta: dW_in = (z^T @ err) / B with safe row-norm ceiling
             dw_in = (z.T @ err) / float(b)
@@ -427,9 +537,12 @@ class BiologicalAssociativeCortex(nn.Module):
 
         self.W_in.copy_(w_in_f.to(dtype=self.W_in.dtype))
         self.W_rec.copy_(w_rec_f.to(dtype=self.W_rec.dtype))
-        # Re-evaluate final clean reconstruction error after the last update
-        final_err = float((s_flat - (z_base @ w_in_f)).pow(2).mean().item())
-        err_end = min(err_end, final_err) if n_steps > 1 else final_err
+        # Re-evaluate final clean reconstruction error after the last update (single sync at end)
+        final_err_t = (s_flat - (z_base @ w_in_f)).pow(2).mean()
+        err_start = float(err_start_t.item()) if err_start_t is not None else 0.0
+        err_end_raw = float(err_end_t.item()) if err_end_t is not None else 0.0
+        final_err = float(final_err_t.item())
+        err_end = min(err_end_raw, final_err) if n_steps > 1 else final_err
         self.last_prediction_error = round(err_end, 6)
 
         return {
@@ -630,6 +743,9 @@ class BiologicalAssociativeCortex(nn.Module):
         self.avg_activity.copy_(state["avg_activity"].to(device=self.device, dtype=torch.float32))
         if "last_active_sdr" in state:
             self.last_active_sdr.copy_(state["last_active_sdr"].to(device=self.device, dtype=torch.float32))
+        if "segment_embeddings" in state and isinstance(state["segment_embeddings"], torch.Tensor):
+            if state["segment_embeddings"].shape == self.segment_embeddings.shape:
+                self.segment_embeddings.copy_(state["segment_embeddings"].to(device=self.device, dtype=torch.float32))
         self.last_prediction_error = float(state.get("last_prediction_error", 0.0))
         self.total_local_updates = int(state.get("total_local_updates", 0))
 

@@ -49,6 +49,30 @@ def configure_torch_backend() -> None:
         pass
 
 
+def precompute_rope(
+    seq_len: int,
+    head_dim: int,
+    device: torch.device,
+    theta: float = 10000.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Precompute cosine/sine tables for Rotary Positional Embeddings (RoPE)."""
+    half = head_dim // 2
+    inv_freq = 1.0 / (theta ** (torch.arange(0, half, device=device, dtype=torch.float32) / float(half)))
+    pos = torch.arange(seq_len, device=device, dtype=torch.float32)
+    freqs = torch.outer(pos, inv_freq)
+    return freqs.cos(), freqs.sin()
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply Rotary Positional Embeddings to [B, H, T, Dh] in native tensor dtype (bf16/fp32)."""
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    cos_b = cos[None, None, :, :].to(dtype=x.dtype)
+    sin_b = sin[None, None, :, :].to(dtype=x.dtype)
+    out1 = x1 * cos_b - x2 * sin_b
+    out2 = x1 * sin_b + x2 * cos_b
+    return torch.stack((out1, out2), dim=-1).flatten(-2)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -180,13 +204,23 @@ class _WernickeEncoderBlock(nn.Module):
         self.ff = SwiGLU(dim, ff_dim, dropout=dropout)
         self.dropout_p = dropout
 
-    def forward(self, x: torch.Tensor, patch_valid: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        patch_valid: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         b, p, d = x.shape
         h = self.norm1(x)
         q, k, v = self.qkv(h).chunk(3, dim=-1)
         q = q.view(b, p, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(b, p, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(b, p, self.n_heads, self.head_dim).transpose(1, 2)
+
+        if rope_cos is not None and rope_sin is not None:
+            q = apply_rope(q, rope_cos, rope_sin)
+            k = apply_rope(k, rope_cos, rope_sin)
 
         attn_mask = None
         if patch_valid is not None:
@@ -217,6 +251,8 @@ class WernickeOutput:
     active_indices: torch.Tensor  # [B, k] int16
     active_values: torch.Tensor  # [B, k] bfloat16
     sparsity_pct: float
+    patch_columns: torch.Tensor | None = None  # [B, P_active, D] sequential RoPE patches (word order & binding)
+    patch_mask: torch.Tensor | None = None  # [B, P_active] bool mask (True = valid patch)
 
 
 class WernickeByteCortex(nn.Module):
@@ -241,6 +277,8 @@ class WernickeByteCortex(nn.Module):
         self.patch_size = cfg.patch_size
         self.patch_stride = cfg.patch_stride
         self.max_patches = max(16, cfg.max_input_bytes // cfg.patch_stride + 4)
+        self.max_patch_slots = max(16, int(getattr(cfg, "wernicke_max_patch_slots", 64)))
+        self.rf_anchor_weight = max(0.0, min(0.15, float(getattr(cfg, "wernicke_rf_anchor_weight", 0.12))))
 
         self.byte_emb = nn.Embedding(cfg.byte_vocab_size, cfg.byte_embed_dim, padding_idx=PAD_BYTE)
         self.patch_conv = nn.Conv1d(
@@ -264,6 +302,15 @@ class WernickeByteCortex(nn.Module):
             ]
         )
         self.final_norm = RMSNorm(cfg.column_dim)
+        self.patch_out_norm = RMSNorm(cfg.column_dim)
+
+        rope_cos, rope_sin = precompute_rope(
+            self.max_patches + 8,
+            cfg.column_dim // cfg.wernicke_heads,
+            device=torch.device("cpu"),
+        )
+        self.register_buffer("_rope_cos", rope_cos, persistent=False)
+        self.register_buffer("_rope_sin", rope_sin, persistent=False)
 
         # Learned 16 cortical column pooling queries (diverse initialization prevents attention collapse)
         self.col_queries = nn.Parameter(torch.randn(1, cfg.num_columns, cfg.column_dim) * 0.25)
@@ -278,7 +325,7 @@ class WernickeByteCortex(nn.Module):
         self.col_compress = nn.Linear(cfg.column_dim, 64, bias=False)
         self.to_sdr = nn.Linear(cfg.num_columns * 64, cfg.num_neurons, bias=False)
 
-        # Primary sensory receptive fields (fixed V1/A1-like byte-patch basis preventing SDR collapse)
+        # Primary sensory receptive fields (lightweight <= 0.15 anchor so learned RoPE patches lead!)
         gen = torch.Generator().manual_seed(20261125)
         rf_byte = F.normalize(torch.randn(cfg.byte_vocab_size, 32, generator=gen), dim=-1)
         rf_byte[PAD_BYTE].zero_()
@@ -299,6 +346,11 @@ class WernickeByteCortex(nn.Module):
         )
         self.register_buffer("sdr_orth_basis", orth_basis.to(torch.bfloat16))
         self.sdr_col_norm = RMSNorm(cfg.column_dim)
+
+    def _get_rope(self, seq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        if seq_len <= self._rope_cos.shape[0]:
+            return self._rope_cos[:seq_len], self._rope_sin[:seq_len]
+        return precompute_rope(seq_len, self.col_head_dim, device=device)
 
     def total_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -347,10 +399,23 @@ class WernickeByteCortex(nn.Module):
         if valid_mask is not None:
             patch_valid = valid_mask.view(b, p, self.patch_stride).any(dim=-1)  # [B, P]
 
-        # 2) Lightweight RMSNorm + SDPA + SwiGLU encoder blocks
+        # 2) Lightweight RMSNorm + RoPE SDPA + SwiGLU encoder blocks
+        cos, sin = self._get_rope(p, device=h.device)
         for blk in self.blocks:
-            h = blk(h, patch_valid=patch_valid)
+            h = blk(h, patch_valid=patch_valid, rope_cos=cos, rope_sin=sin)
         h = self.final_norm(h)
+
+        # 2b) Sequential sensory patch columns [B, P_active, D] preserving syntactic word order
+        p_valid = patch_valid.clone() if patch_valid is not None else torch.ones((b, p), dtype=torch.bool, device=h.device)
+        p_valid[:, 0] = True
+        if p > self.max_patch_slots:
+            p_cols = F.adaptive_avg_pool1d(h.transpose(1, 2), self.max_patch_slots).transpose(1, 2)
+            p_mask = F.adaptive_max_pool1d(p_valid.float().unsqueeze(1), self.max_patch_slots).squeeze(1) > 0.5
+            p_mask[:, 0] = True
+        else:
+            p_cols = h
+            p_mask = p_valid
+        patch_columns = self.patch_out_norm(p_cols) * p_mask.unsqueeze(-1).to(dtype=p_cols.dtype)
 
         # 3) Project into 16 cortical columns S in R^{B x 16 x D}
         q = self.col_q_proj(self.col_queries.expand(b, -1, -1))
@@ -369,47 +434,47 @@ class WernickeByteCortex(nn.Module):
         cols = cols.transpose(1, 2).contiguous().view(b, self.num_columns, self.column_dim)
         columns = self.col_norm(self.col_out_proj(cols))  # [B, 16, D]
 
-        # 4) Lateral inhibition k-WTA -> Sparse Distributed Representation (SDR)
-        # Combine learned cortical column projection with fixed primary byte-patch receptive fields
-        # so distinct UTF-8 stimuli never collapse to identical SDRs while sharing overlapping patches.
+        # 4) Lateral inhibition k-WTA -> Sparse Distributed Representation (SDR) for fast Hippo/Hopfield indexing.
+        # Learned RoPE patch columns lead (1 - rf_w); fixed 4-gram basis is strictly a lightweight anchor <= 0.15.
         comp = F.silu(self.col_compress(columns)).reshape(b, -1)  # [B, 16 * 64]
         learned_logits = self.to_sdr(comp)  # [B, N]
         learned_logits = (learned_logits - learned_logits.mean(dim=-1, keepdim=True)) / (
             learned_logits.std(dim=-1, keepdim=True).clamp(min=1e-4)
         )
 
-        with torch.no_grad():
-            # Sliding stride=1 byte-4gram primary receptive field so suffix keywords
-            # ("komputer" vs "kot" vs "fotosynteza") produce sharply distinct SDRs
-            # even when questions share the same prefix ("co to jest ").
-            rf_emb = F.embedding(byte_ids, self.rf_byte_basis).to(dtype=h.dtype)  # [B, L, 32]
-            rf_conv = F.conv1d(
-                rf_emb.transpose(1, 2),
-                self.rf_patch_kernel.to(dtype=h.dtype),
-                stride=1,
-                padding=1,
-            ).transpose(1, 2)[:, : byte_ids.shape[1], :]  # [B, L, 256]
-            rf_act = F.silu(rf_conv)
-            if valid_mask is not None:
-                vm = valid_mask[:, : rf_act.shape[1]]
-                vm_f = vm.unsqueeze(-1).to(dtype=rf_act.dtype)
-                rf_mean = (rf_act * vm_f).sum(dim=1) / vm_f.sum(dim=1).clamp(min=1.0)
-                rf_max = rf_act.masked_fill(~vm.unsqueeze(-1), -1e4).max(dim=1).values
-                rf_max = torch.where(vm_f.sum(dim=1) > 0, rf_max, torch.zeros_like(rf_max))
-            else:
-                rf_mean = rf_act.mean(dim=1)
-                rf_max = rf_act.max(dim=1).values
-            rf_feat = F.normalize(torch.cat([rf_mean, rf_max], dim=-1).float(), dim=-1, eps=1e-6)
-            if byte_ids.device.type == "cuda":
-                with amp_autocast(byte_ids.device):
-                    rf_logits = (rf_feat @ self.rf_to_sdr).float()
-            else:
-                rf_logits = rf_feat @ self.rf_to_sdr.float()
-            rf_logits = (rf_logits - rf_logits.mean(dim=-1, keepdim=True)) / (
-                rf_logits.std(dim=-1, keepdim=True).clamp(min=1e-4)
-            )
+        rf_w = self.rf_anchor_weight
+        if rf_w > 0.0:
+            with torch.no_grad():
+                rf_emb = F.embedding(byte_ids, self.rf_byte_basis).to(dtype=h.dtype)  # [B, L, 32]
+                rf_conv = F.conv1d(
+                    rf_emb.transpose(1, 2),
+                    self.rf_patch_kernel.to(dtype=h.dtype),
+                    stride=1,
+                    padding=1,
+                ).transpose(1, 2)[:, : byte_ids.shape[1], :]  # [B, L, 256]
+                rf_act = F.silu(rf_conv)
+                if valid_mask is not None:
+                    vm = valid_mask[:, : rf_act.shape[1]]
+                    vm_f = vm.unsqueeze(-1).to(dtype=rf_act.dtype)
+                    rf_mean = (rf_act * vm_f).sum(dim=1) / vm_f.sum(dim=1).clamp(min=1.0)
+                    rf_max = rf_act.masked_fill(~vm.unsqueeze(-1), -1e4).max(dim=1).values
+                    rf_max = torch.where(vm_f.sum(dim=1) > 0, rf_max, torch.zeros_like(rf_max))
+                else:
+                    rf_mean = rf_act.mean(dim=1)
+                    rf_max = rf_act.max(dim=1).values
+                rf_feat = F.normalize(torch.cat([rf_mean, rf_max], dim=-1), dim=-1, eps=1e-6)
+                if byte_ids.device.type == "cuda":
+                    with amp_autocast(byte_ids.device):
+                        rf_logits = (rf_feat @ self.rf_to_sdr.to(dtype=rf_feat.dtype)).float()
+                else:
+                    rf_logits = rf_feat.float() @ self.rf_to_sdr.float()
+                rf_logits = (rf_logits - rf_logits.mean(dim=-1, keepdim=True)) / (
+                    rf_logits.std(dim=-1, keepdim=True).clamp(min=1e-4)
+                )
+            logits = (1.0 - rf_w) * learned_logits.float() + rf_w * rf_logits
+        else:
+            logits = learned_logits.float()
 
-        logits = 0.55 * learned_logits.float() + 0.85 * rf_logits
         sdr, top_idx, top_val = k_wta(logits, k=self.sdr_k, normalize=True)
         sdr = sdr.to(dtype=columns.dtype)
 
@@ -424,6 +489,8 @@ class WernickeByteCortex(nn.Module):
             active_indices=top_idx.to(torch.int16),
             active_values=top_val.to(torch.bfloat16),
             sparsity_pct=sparsity_pct,
+            patch_columns=patch_columns,
+            patch_mask=p_mask,
         )
 
     @torch.no_grad()
@@ -434,7 +501,7 @@ class WernickeByteCortex(nn.Module):
         batch_size: int = 32,
         mask_prob: float = 0.0,
     ) -> WernickeOutput:
-        """Batch-encode UTF-8 strings into 16 cortical columns & sparse SDRs on GPU/CPU."""
+        """Batch-encode UTF-8 strings into 16 cortical columns, sequential patch columns & sparse SDRs."""
         was_training = self.training
         self.eval()
         all_cols: list[torch.Tensor] = []
@@ -442,6 +509,8 @@ class WernickeByteCortex(nn.Module):
         all_recon: list[torch.Tensor] = []
         all_idx: list[torch.Tensor] = []
         all_val: list[torch.Tensor] = []
+        all_patch_cols: list[torch.Tensor] = []
+        all_patch_masks: list[torch.Tensor] = []
         sparsity_pct = round(100.0 * (self.sdr_k / float(self.num_neurons)), 2)
 
         for i in range(0, len(texts), max(1, batch_size)):
@@ -461,10 +530,33 @@ class WernickeByteCortex(nn.Module):
             all_recon.append(out.reconstructed_columns.float())
             all_idx.append(out.active_indices)
             all_val.append(out.active_values)
+            if out.patch_columns is not None and out.patch_mask is not None:
+                all_patch_cols.append(out.patch_columns.float())
+                all_patch_masks.append(out.patch_mask)
             sparsity_pct = out.sparsity_pct
 
         if was_training:
             self.train()
+
+        cat_patch_cols: torch.Tensor | None = None
+        cat_patch_masks: torch.Tensor | None = None
+        if all_patch_cols:
+            max_p = max(t.shape[1] for t in all_patch_cols)
+            if any(t.shape[1] != max_p for t in all_patch_cols):
+                padded_pc: list[torch.Tensor] = []
+                padded_pm: list[torch.Tensor] = []
+                for pc, pm in zip(all_patch_cols, all_patch_masks):
+                    pad_p = max_p - pc.shape[1]
+                    if pad_p > 0:
+                        pc = F.pad(pc, (0, 0, 0, pad_p), value=0.0)
+                        pm = F.pad(pm, (0, pad_p), value=False)
+                    padded_pc.append(pc)
+                    padded_pm.append(pm)
+                cat_patch_cols = torch.cat(padded_pc, dim=0)
+                cat_patch_masks = torch.cat(padded_pm, dim=0)
+            else:
+                cat_patch_cols = torch.cat(all_patch_cols, dim=0)
+                cat_patch_masks = torch.cat(all_patch_masks, dim=0)
 
         return WernickeOutput(
             columns=torch.cat(all_cols, dim=0),
@@ -473,6 +565,8 @@ class WernickeByteCortex(nn.Module):
             active_indices=torch.cat(all_idx, dim=0),
             active_values=torch.cat(all_val, dim=0),
             sparsity_pct=sparsity_pct,
+            patch_columns=cat_patch_cols,
+            patch_mask=cat_patch_masks,
         )
 
     def export_state(self) -> dict[str, Any]:
@@ -489,8 +583,17 @@ class WernickeByteCortex(nn.Module):
         cur = self.state_dict()
         merged = {}
         for k, v in cur.items():
-            if k in saved and saved[k].shape == v.shape:
-                merged[k] = saved[k].to(device=device, dtype=v.dtype)
+            if k in saved:
+                sv = saved[k]
+                if sv.shape == v.shape:
+                    merged[k] = sv.to(device=device, dtype=v.dtype)
+                elif sv.ndim == v.ndim and sv.ndim >= 2:
+                    dst = v.clone()
+                    slices = tuple(slice(0, min(a, b)) for a, b in zip(sv.shape, v.shape))
+                    dst[slices] = sv[slices].to(device=device, dtype=v.dtype)
+                    merged[k] = dst
+                else:
+                    merged[k] = v
             else:
                 merged[k] = v
         self.load_state_dict(merged)

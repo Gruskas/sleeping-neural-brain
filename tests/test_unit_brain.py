@@ -666,10 +666,20 @@ class TestHTTPServerSSEAndPretrainScript(unittest.TestCase):
             w1 = brain.language_cortex.perceive_one("cześć")
             w2 = brain.language_cortex.perceive_one("co to jest fotosynteza")
             t1 = brain.cortex.perceive_and_think(
-                w1.columns, w1.sdr, engram_bank=None, sdr_to_columns_fn=brain.language_cortex.wernicke_module.sdr_to_columns
+                w1.columns,
+                w1.sdr,
+                engram_bank=None,
+                sdr_to_columns_fn=brain.language_cortex.wernicke_module.sdr_to_columns,
+                sensory_patch_columns=w1.patch_columns,
+                sensory_patch_mask=w1.patch_mask,
             )
             t2 = brain.cortex.perceive_and_think(
-                w2.columns, w2.sdr, engram_bank=None, sdr_to_columns_fn=brain.language_cortex.wernicke_module.sdr_to_columns
+                w2.columns,
+                w2.sdr,
+                engram_bank=None,
+                sdr_to_columns_fn=brain.language_cortex.wernicke_module.sdr_to_columns,
+                sensory_patch_columns=w2.patch_columns,
+                sensory_patch_mask=w2.patch_mask,
             )
 
             # Unified RMSNorm scale on Z*
@@ -684,12 +694,16 @@ class TestHTTPServerSSEAndPretrainScript(unittest.TestCase):
             z_cos = float(F.cosine_similarity(t1.columns_star.flatten(1), t2.columns_star.flatten(1)).item())
             self.assertLess(z_cos, 0.72, f"Z* collapsed across distinct prompts! cos={z_cos:.4f}")
 
-            # Broca logits at <BOS> must diverge clearly between "cześć" and "co to jest fotosynteza"
+            # Broca logits at <BOS> must diverge clearly between "cześć" and "co to jest fotosynteza" under Z_ctx
             bos = torch.tensor([[BOS_BYTE]], dtype=torch.long, device=brain.device)
             brain.language_cortex.broca_module.eval()
             with torch.no_grad():
-                logits1 = brain.language_cortex.broca_module(bos, t1.columns_star)[:, -1, :].float()
-                logits2 = brain.language_cortex.broca_module(bos, t2.columns_star)[:, -1, :].float()
+                logits1 = brain.language_cortex.broca_module(
+                    bos, t1.context_columns, memory_mask=t1.context_mask
+                )[:, -1, :].float()
+                logits2 = brain.language_cortex.broca_module(
+                    bos, t2.context_columns, memory_mask=t2.context_mask
+                )[:, -1, :].float()
                 p1 = F.softmax(logits1 / cfg.broca_temperature, dim=-1)
                 p2 = F.softmax(logits2 / cfg.broca_temperature, dim=-1)
                 l1_dist = float((p1 - p2).abs().sum().item())
@@ -1274,6 +1288,131 @@ class TestHTTPServerSSEAndPretrainScript(unittest.TestCase):
         m2_vecs, m2_pins = lb.export_top_m2_assoc_vectors(top_k=3)
         self.assertEqual(int(m2_vecs.shape[0]), 3)
         self.assertTrue(any(m2_pins))
+
+    def test_dual_wernicke_z_ctx_variable_binding_system2_and_gpu_opt(self) -> None:
+        import torch.nn.functional as F
+        from brain.config import BrainConfig
+        from brain.neural_cortex import BiologicalAssociativeCortex
+        from brain.neural_language import BrocaByteTransformer
+        from brain.sensory_wernicke import BOS_BYTE, PAD_BYTE, WernickeByteCortex, encode_utf8_bytes
+
+        cfg = BrainConfig(
+            language_bootstrap_epochs=0,
+            num_neurons=1024,
+            sdr_k=40,
+            num_columns=16,
+            column_dim=64,
+            wernicke_layers=2,
+            wernicke_heads=4,
+            wernicke_ff_dim=128,
+            wernicke_max_patch_slots=16,
+            wernicke_rf_anchor_weight=0.12,
+            broca_dim=64,
+            broca_layers=2,
+            broca_heads=4,
+            broca_ff_dim=128,
+            broca_max_seq_len=96,
+            broca_max_new_bytes=24,
+            broca_gradient_checkpointing=True,
+            working_memory_slots=4,
+            system2_reasoning_steps=3,
+        )
+        self.assertLessEqual(cfg.wernicke_rf_anchor_weight, 0.15)
+
+        # 1) Dual Wernicke output + adaptive pooling cap + word-order sensitivity
+        wernicke = WernickeByteCortex(cfg)
+        w_out = wernicke.encode_texts(["pies goni kota", "kot goni psa"], device=torch.device("cpu"))
+        self.assertIsNotNone(w_out.patch_columns)
+        self.assertIsNotNone(w_out.patch_mask)
+        assert w_out.patch_columns is not None and w_out.patch_mask is not None
+        self.assertEqual(w_out.patch_columns.shape[0], 2)
+        self.assertEqual(w_out.patch_columns.shape[2], 64)
+        self.assertLessEqual(w_out.patch_columns.shape[1], 16)
+        patch_diff = float((w_out.patch_columns[0] - w_out.patch_columns[1]).abs().mean().item())
+        self.assertGreater(patch_diff, 1e-3, "Word-order permutation must yield distinct patch_columns")
+
+        # Long text triggers adaptive pooling down to wernicke_max_patch_slots
+        w_long = wernicke.encode_texts(["To jest bardzo długie zdanie testowe " * 8], device=torch.device("cpu"))
+        assert w_long.patch_columns is not None and w_long.patch_mask is not None
+        self.assertEqual(tuple(w_long.patch_columns.shape), (1, 16, 64))
+        self.assertEqual(tuple(w_long.patch_mask.shape), (1, 16))
+
+        # 2) Composite Z_ctx with segment embeddings & Broca variable-slot Cross-Attention + grad checkpointing
+        cortex = BiologicalAssociativeCortex(cfg, device=torch.device("cpu"))
+        wm_slots = torch.randn(1, 3, 64)
+        th_slots = torch.randn(1, 2, 64)
+        bank = F.normalize(w_out.sdr[:1], dim=-1).to(torch.bfloat16)
+        thought = cortex.perceive_and_think(
+            sensory_columns=w_out.columns[:1],
+            sensory_sdr=w_out.sdr[:1],
+            engram_bank=bank,
+            sdr_to_columns_fn=wernicke.sdr_to_columns,
+            hopfield_min_sim=0.70,
+            sensory_patch_columns=w_out.patch_columns[:1],
+            sensory_patch_mask=w_out.patch_mask[:1],
+            working_memory_slots=wm_slots,
+            thought_slots=th_slots,
+        )
+        self.assertIsNotNone(thought.context_columns)
+        self.assertIsNotNone(thought.context_mask)
+        assert thought.context_columns is not None and thought.context_mask is not None
+        expected_m = 16 + int(w_out.patch_columns.shape[1]) + 16 + 3 + 2
+        self.assertEqual(tuple(thought.context_columns.shape), (1, expected_m, 64))
+        self.assertEqual(tuple(thought.context_mask.shape), (1, expected_m))
+
+        broca = BrocaByteTransformer(cfg)
+        broca.train()
+        tgt_bytes, _ = encode_utf8_bytes(["pies goni kota"], max_bytes=48, patch_size=1, add_bos_eos=True)
+        loss = broca.compute_loss(tgt_bytes, thought.context_columns, memory_mask=thought.context_mask)
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        broca.eval()
+        gen_b = broca.generate_batch(
+            thought.context_columns.expand(2, -1, -1),
+            temperatures=[0.55, 0.65],
+            max_new_bytes=16,
+            memory_mask=thought.context_mask.expand(2, -1),
+        )
+        self.assertEqual(len(gen_b), 2)
+
+        # 3) Full SleepingBrain: no hard attractor overwrite, sequential System-2, multi-slot WM & compat load
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
+            brain.auto_sleep = False
+            brain.auto_web = False
+            brain.language_cortex._register_known_questions(["Co to jest kot?"], replace=True)
+            sim_f, canon = brain.language_cortex.match_known_attractor(w_out.sdr[0])
+            self.assertIsInstance(sim_f, float)
+            self.assertIsNone(canon, "match_known_attractor must never overwrite input SDR with a canonical vector")
+
+            delib = brain.language_cortex.deliberate_and_critique(
+                user_message="Pies goni kota.",
+                cortex=brain.cortex,
+                engram_bank=None,
+                working_memory_slots=wm_slots.to(device=brain.device),
+                max_new_bytes=16,
+                num_candidates=3,
+            )
+            self.assertEqual(delib["reasoning_steps"], 3)
+            self.assertEqual([c["label"] for c in delib["candidates"]], ["Precyzyjna", "Kontekstowa", "Kreatywna"])
+            self.assertIsNotNone(delib["thought"].context_columns)
+
+            brain.chat("Pies goni kota po ogrodzie.")
+            self.assertGreaterEqual(brain._wm_slot_count, 1)
+            slots_before = brain._get_working_memory_slots()
+            self.assertIsNotNone(slots_before)
+            ckpt_path = brain.save_state()
+
+            # Backward-compatible load when working_memory_slots & segment_embeddings are missing
+            saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            saved.pop("working_memory_slots", None)
+            if "cortex" in saved and isinstance(saved["cortex"], dict):
+                saved["cortex"].pop("segment_embeddings", None)
+            torch.save(saved, ckpt_path)
+
+            brain_reloaded = SleepingBrain(cfg=cfg, base_dir=tmp, load_language_mode="sync")
+            self.assertEqual(brain_reloaded._wm_slot_count, 0)
+            self.assertEqual(tuple(brain_reloaded.cortex.segment_embeddings.shape), (4, 64))
 
 
 if __name__ == "__main__":

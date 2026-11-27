@@ -103,8 +103,12 @@ class SleepingBrain:
 
         # Rolling sensory buffer strictly for Broca denoising motor practice during sleep (NEVER read in chat)
         self._wake_broca_buffer: list[str] = []
-        # Prefrontal Working Memory SDR Ring (tokenless temporary context holding recent user + assistant SDRs on GPU)
+        # Prefrontal Working Memory SDR Ring (fast SDR cueing) + Discrete Multi-Slot GPU Buffer [K_wm, D]
         self._working_sdr_ring: list[torch.Tensor] = []
+        wm_cap = max(2, int(getattr(self.cfg, "working_memory_slots", 8)))
+        wm_dt = torch.bfloat16 if (self.device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
+        self._wm_slot_buf = torch.zeros((wm_cap, self.cfg.column_dim), device=self.device, dtype=wm_dt)
+        self._wm_slot_count: int = 0
 
         # Lifecycle & creativity state
         self.state_mode: str = "AWAKE"
@@ -297,6 +301,43 @@ class SleepingBrain:
         if norm <= 1e-6:
             return None
         return (acc / norm).to(dtype=torch.bfloat16)
+
+    def _push_working_memory_slot(
+        self,
+        cols_or_patches: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> None:
+        """Store a normalized discrete turn representation in the [K_wm, D] GPU working memory buffer."""
+        t = cols_or_patches.detach().to(device=self.device, dtype=torch.float32)
+        if t.ndim == 3:
+            t = t[0]
+        if t.ndim == 1:
+            vec = t
+        else:
+            if mask is not None:
+                m = mask.to(device=self.device, dtype=torch.float32).reshape(-1)
+                if m.shape[0] == t.shape[0]:
+                    m_col = m.unsqueeze(-1)
+                    vec = (t * m_col).sum(dim=0) / m_col.sum().clamp(min=1.0)
+                else:
+                    vec = t.mean(dim=0)
+            else:
+                vec = t.mean(dim=0)
+        vec = F.normalize(vec, dim=-1, eps=1e-6).to(dtype=self._wm_slot_buf.dtype)
+        cap = self._wm_slot_buf.shape[0]
+        if self._wm_slot_count < cap:
+            self._wm_slot_buf[self._wm_slot_count].copy_(vec)
+            self._wm_slot_count += 1
+        else:
+            self._wm_slot_buf[:-1].copy_(self._wm_slot_buf[1:].clone())
+            self._wm_slot_buf[-1].copy_(vec)
+
+    def _get_working_memory_slots(self, max_slots: int | None = None) -> torch.Tensor | None:
+        """Return discrete normalized GPU working memory turn slots [1, K_active, D] without collapsing them."""
+        if self._wm_slot_count <= 0:
+            return None
+        k = self._wm_slot_count if max_slots is None else min(self._wm_slot_count, max(1, int(max_slots)))
+        return self._wm_slot_buf[self._wm_slot_count - k : self._wm_slot_count].unsqueeze(0)
 
     @staticmethod
     def _is_followup_query(msg: str) -> bool:
@@ -2240,6 +2281,7 @@ class SleepingBrain:
         with self.lock:
             engram_bank = self.hippocampus.get_hopfield_bank()
             wm_count = len(self._working_sdr_ring)
+            wm_slots = self._get_working_memory_slots()
 
         temp = temperature if temperature is not None else self._sampling_temperature()
         w_out, q_fam, _ = self.language_cortex.perceive_for_chat(msg)
@@ -2361,6 +2403,7 @@ class SleepingBrain:
                 living_blend=0.08,
                 neuromod=lb_neuromod,
                 living_telemetry=lb_tel,
+                working_memory_slots=wm_slots,
             )
             w_out = delib["w_out"]
             thought = delib["thought"]
@@ -2389,12 +2432,14 @@ class SleepingBrain:
                     else:
                         stream_iter = iter([draft])
                 else:
+                    ctx_cols = thought.context_columns if thought.context_columns is not None else thought.columns_star
                     stream_iter = self.language_cortex.broca_module.generate_stream(
-                        memory_columns=thought.columns_star,
+                        memory_columns=ctx_cols,
                         max_new_bytes=self.cfg.broca_max_new_bytes,
                         temperature=used_temp,
                         top_p=self.cfg.broca_top_p,
                         repetition_penalty=self.cfg.broca_repetition_penalty,
+                        memory_mask=thought.context_mask,
                     )
 
         with self.lock:
@@ -2435,9 +2480,9 @@ class SleepingBrain:
             sem_refs = [f"engram:{eid} ({sc:.2f})" for eid, sc in zip(recalled["semantic"]["ids"][:6], recalled["semantic"]["scores"][:6])]
             rem_refs = [f"rem:{eid} ({sc:.2f})" for eid, sc in zip(recalled["rem"]["ids"][:4], recalled["rem"]["scores"][:4])]
             thinking_telemetry = [
-                f"Wernicke UTF-8 → 16 kolumn S [16×{self.cfg.column_dim}] → k-WTA SDR ({w_out.sparsity_pct:.2f}% aktywnych)",
-                f"Pamięć robocza SDR: {wm_count}/{self.cfg.working_sdr_capacity} tur (wpływ={wm_weight:.2f}) · Kreatywność={self.creativity_level*100:.0f}%",
-                f"Modern Hopfield + W_rec ({thought.attractor_steps} kroków, q_fam={q_fam:.2f}, max_sim={thought.max_hopfield_sim:.2f}) → Z*",
+                f"Wernicke UTF-8 → patche RoPE + 16 kolumn S → k-WTA SDR ({w_out.sparsity_pct:.2f}% aktywnych)",
+                f"Pamięć robocza SDR: {wm_count}/{self.cfg.working_sdr_capacity} · Sloty PFC: {self._wm_slot_count}/{self._wm_slot_buf.shape[0]} · Kreatywność={self.creativity_level*100:.0f}%",
+                f"Modern Hopfield + W_rec ({thought.attractor_steps} kroków, q_fam={q_fam:.2f}, max_sim={thought.max_hopfield_sim:.2f}) → Z_ctx",
             ]
             if lb_note:
                 thinking_telemetry.append(lb_note)
@@ -2464,6 +2509,8 @@ class SleepingBrain:
             "attractor_steps": thought.attractor_steps,
             "temperature": used_temp,
             "user_sdr": w_out.sdr[0].detach(),
+            "user_patch_columns": w_out.patch_columns[0].detach() if w_out.patch_columns is not None else w_out.columns[0].detach(),
+            "user_patch_mask": w_out.patch_mask[0].detach() if w_out.patch_mask is not None else None,
             "thought": thought,
             "living_da": float(lb_neuromod.dopamine) if lb_neuromod is not None else 0.0,
             "is_ood": bool(ood_note),
@@ -2639,12 +2686,20 @@ class SleepingBrain:
         # triggers lightweight Dopamine-gated online reinforcement on clean high-score turns,
         # and stores BOTH user + assistant SDRs into the Prefrontal Working Memory SDR Ring.
         reply_sdr: torch.Tensor | None = None
+        reply_patches: torch.Tensor | None = None
+        reply_patch_mask: torch.Tensor | None = None
         final_critique_note = ""
         da_reinforce_note = ""
         if reply and len(reply.strip()) >= 3:
             try:
                 reply_out = self.language_cortex.perceive_one(reply)
                 reply_sdr = reply_out.sdr[0].detach()
+                reply_patches = (
+                    reply_out.patch_columns[0].detach()
+                    if reply_out.patch_columns is not None
+                    else reply_out.columns[0].detach()
+                )
+                reply_patch_mask = reply_out.patch_mask[0].detach() if reply_out.patch_mask is not None else None
                 if prep.get("is_llm_broca"):
                     qual = self.language_cortex.score_polish_quality(reply, creativity_level=self.creativity_level)
                     final_critique_note = f"Pętla zwrotna Wernickego (SDR odpowiedzi zapisany): jakość={qual*100:.0f}%"
@@ -2688,8 +2743,16 @@ class SleepingBrain:
         with self.lock:
             if "user_sdr" in prep and prep["user_sdr"] is not None:
                 self._push_working_sdr(prep["user_sdr"])
+            if prep.get("user_patch_columns") is not None:
+                self._push_working_memory_slot(prep["user_patch_columns"], prep.get("user_patch_mask"))
             if reply_sdr is not None:
                 self._push_working_sdr(reply_sdr)
+            elif prep.get("thought") is not None:
+                self._push_working_sdr(prep["thought"].z_star[0].detach())
+            if reply_patches is not None:
+                self._push_working_memory_slot(reply_patches, reply_patch_mask)
+            elif prep.get("thought") is not None:
+                self._push_working_memory_slot(prep["thought"].columns_star[0].detach())
             thinking_list = list(prep["thinking"])
             if final_critique_note:
                 thinking_list.append(
@@ -3090,6 +3153,7 @@ class SleepingBrain:
                     "language_cortex": self.language_cortex.export_state(),
                     "hippocampus_engrams": self.hippocampus.export_sparse_tensors(),
                     "living_brain": self.living_brain.export_state(),
+                    "working_memory_slots": self._wm_slot_buf[: self._wm_slot_count].detach().cpu().to(torch.bfloat16),
                 },
                 tmp_ckpt,
             )
@@ -3156,6 +3220,16 @@ class SleepingBrain:
             self.hippocampus.import_state(weights["hippocampus_engrams"], meta.get("hippocampus_meta", {}))
             if "living_brain" in weights:
                 self.living_brain.import_state(weights["living_brain"])
+            self._wm_slot_buf.zero_()
+            self._wm_slot_count = 0
+            if "working_memory_slots" in weights and isinstance(weights["working_memory_slots"], torch.Tensor):
+                saved_wm = weights["working_memory_slots"]
+                if saved_wm.ndim == 2 and saved_wm.shape[1] == self._wm_slot_buf.shape[1] and saved_wm.shape[0] > 0:
+                    take = min(int(saved_wm.shape[0]), int(self._wm_slot_buf.shape[0]))
+                    self._wm_slot_buf[:take].copy_(
+                        saved_wm[-take:].to(device=self.device, dtype=self._wm_slot_buf.dtype)
+                    )
+                    self._wm_slot_count = take
 
             self.day = int(meta.get("day", 1))
             self.energy = self.cfg.max_energy
@@ -3210,6 +3284,8 @@ class SleepingBrain:
             )
             self._wake_broca_buffer.clear()
             self._working_sdr_ring.clear()
+            self._wm_slot_buf.zero_()
+            self._wm_slot_count = 0
             self.state_mode = "AWAKE"
             self.energy = self.cfg.max_energy
             self.day = 1

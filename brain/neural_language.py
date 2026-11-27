@@ -18,26 +18,13 @@ from .sensory_wernicke import (
     RMSNorm,
     SwiGLU,
     amp_autocast,
+    apply_rope,
     encode_utf8_bytes,
+    precompute_rope,
 )
 
-
-def _precompute_rope(seq_len: int, head_dim: int, device: torch.device, theta: float = 10000.0) -> tuple[torch.Tensor, torch.Tensor]:
-    half = head_dim // 2
-    inv_freq = 1.0 / (theta ** (torch.arange(0, half, device=device, dtype=torch.float32) / float(half)))
-    pos = torch.arange(seq_len, device=device, dtype=torch.float32)
-    freqs = torch.outer(pos, inv_freq)  # [T, half]
-    return freqs.cos(), freqs.sin()
-
-
-def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Apply Rotary Positional Embeddings to [B, H, T, Dh] in native tensor dtype (bf16/fp32)."""
-    x1, x2 = x[..., 0::2], x[..., 1::2]
-    cos_b = cos[None, None, :, :].to(dtype=x.dtype)
-    sin_b = sin[None, None, :, :].to(dtype=x.dtype)
-    out1 = x1 * cos_b - x2 * sin_b
-    out2 = x1 * sin_b + x2 * cos_b
-    return torch.stack((out1, out2), dim=-1).flatten(-2)
+_precompute_rope = precompute_rope
+_apply_rope = apply_rope
 
 
 class _BrocaDecoderBlock(nn.Module):
@@ -101,6 +88,7 @@ class _BrocaDecoderBlock(nn.Module):
         cross_kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         film_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         cache_pos: int | None = None,
+        memory_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         b, t, d = x.shape
 
@@ -111,8 +99,8 @@ class _BrocaDecoderBlock(nn.Module):
         k = k.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
 
-        q = _apply_rope(q, rope_cos, rope_sin)
-        k = _apply_rope(k, rope_cos, rope_sin)
+        q = apply_rope(q, rope_cos, rope_sin)
+        k = apply_rope(k, rope_cos, rope_sin)
 
         if self_kv_cache is not None and cache_pos is not None:
             k_buf, v_buf = self_kv_cache
@@ -143,7 +131,7 @@ class _BrocaDecoderBlock(nn.Module):
         attn_self = attn_self.transpose(1, 2).contiguous().view(b, t, d)
         x = x + self.drop1(self.out_self(attn_self))
 
-        # 2) Cross-Attention over 16 cortical columns Z*
+        # 2) Cross-Attention over variable-length cortical context Z_ctx [B, M_total, D]
         h2 = self.norm2(x)
         cq = self.cross_q(h2).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
         if cross_kv_cache is not None:
@@ -151,10 +139,18 @@ class _BrocaDecoderBlock(nn.Module):
         else:
             ck, cv = self.precompute_cross_kv(memory_columns)
 
+        cross_attn_mask = None
+        if memory_mask is not None:
+            safe_m = memory_mask.to(device=cq.device, dtype=torch.bool)
+            if safe_m.shape[1] != ck.shape[2]:
+                safe_m = safe_m[:, : ck.shape[2]]
+            cross_attn_mask = safe_m[:, None, None, :]
+
         attn_cross = F.scaled_dot_product_attention(
             cq,
             ck,
             cv,
+            attn_mask=cross_attn_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
             is_causal=False,
         )
@@ -224,19 +220,25 @@ class BrocaByteTransformer(nn.Module):
         self.lm_head = nn.Linear(self.dim, BYTE_VOCAB_SIZE, bias=False)
 
         # Precompute & cache RoPE cos/sin buffers once (zero per-step trig allocations)
-        rope_cos, rope_sin = _precompute_rope(self.max_seq_len + 8, self.head_dim, device=torch.device("cpu"))
+        rope_cos, rope_sin = precompute_rope(self.max_seq_len + 8, self.head_dim, device=torch.device("cpu"))
         self.register_buffer("_rope_cos", rope_cos, persistent=False)
         self.register_buffer("_rope_sin", rope_sin, persistent=False)
+
+        # Optional activation checkpointing for long sequences on 16 GB VRAM
+        self.gradient_checkpointing: bool = bool(getattr(cfg, "broca_gradient_checkpointing", False))
 
         # Training statistics
         self.trained_steps: int = 0
         self.last_loss: float = 5.5
         self.fluency_score: float = 0.0
 
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        self.gradient_checkpointing = bool(enabled)
+
     def _get_rope(self, seq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         if seq_len <= self._rope_cos.shape[0]:
             return self._rope_cos[:seq_len], self._rope_sin[:seq_len]
-        return _precompute_rope(seq_len, self.head_dim, device=device)
+        return precompute_rope(seq_len, self.head_dim, device=device)
 
     def total_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -256,26 +258,51 @@ class BrocaByteTransformer(nn.Module):
                 z = F.dropout(z, p=float(self.cfg.broca_z_dropout), training=True)
         return z
 
-    def _pool_z_summary(self, z_mem: torch.Tensor) -> torch.Tensor:
-        # Flatten primary 16 cortical columns [B, 16, 32] -> [B, 512] -> [B, col_dim];
-        # any extra columns (e.g. recalled Hippocampus memory columns [16..32]) remain
-        # directly accessible to all Cross-Attention layers without breaking checkpoint shapes!
-        b = z_mem.shape[0]
-        z_primary = z_mem[:, : self.cfg.num_columns, :]
+    def _pool_z_summary(self, z_mem: torch.Tensor, memory_mask: torch.Tensor | None = None) -> torch.Tensor:
+        b, m, _ = z_mem.shape
+        n_prim = self.cfg.num_columns
+        if m >= n_prim:
+            z_primary = z_mem[:, :n_prim, :]
+        else:
+            z_primary = F.pad(z_mem, (0, 0, 0, n_prim - m), value=0.0)
         comp = torch.tanh(self.z_col_compress(z_primary)).reshape(b, -1)
-        return self.z_summary_norm(self.z_summary_proj(comp))
+        primary_sum = self.z_summary_norm(self.z_summary_proj(comp))
+        if m > n_prim:
+            z_extra = z_mem[:, n_prim:, :]
+            if memory_mask is not None:
+                ex_m = memory_mask[:, n_prim:].to(device=z_extra.device, dtype=z_extra.dtype).unsqueeze(-1)
+                extra_mean = (z_extra * ex_m).sum(dim=1) / ex_m.sum(dim=1).clamp(min=1.0)
+            else:
+                extra_mean = z_extra.mean(dim=1)
+            return self.z_summary_norm(0.85 * primary_sum + 0.15 * extra_mean)
+        return primary_sum
+
+    @staticmethod
+    def _block_forward_no_cache(
+        blk: _BrocaDecoderBlock,
+        x: torch.Tensor,
+        z_mem: torch.Tensor,
+        z_summary: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        memory_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        out, _ = blk(x, z_mem, z_summary=z_summary, rope_cos=cos, rope_sin=sin, memory_mask=memory_mask)
+        return out
 
     def forward(
         self,
         byte_ids: torch.Tensor,
         memory_columns: torch.Tensor,
         clean_z: bool = False,
+        memory_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Parallel teacher-forced forward pass for training.
         Args:
           byte_ids: [B, T] int64 target-shifted bytes starting with <BOS>
-          memory_columns: [B, 16, D] cortical columns Z*
+          memory_columns: [B, M_total, D] composite cortical context Z_ctx
+          memory_mask: optional [B, M_total] bool validity mask (True = valid slot)
         Returns:
           logits: [B, T, 260]
         """
@@ -283,7 +310,7 @@ class BrocaByteTransformer(nn.Module):
         device = byte_ids.device
 
         z_mem = self._regularize_memory_columns(memory_columns, clean_z=clean_z)
-        z_summary = self._pool_z_summary(z_mem)  # [B, col_dim]
+        z_summary = self._pool_z_summary(z_mem, memory_mask=memory_mask)  # [B, col_dim]
 
         x = self.byte_emb(byte_ids)  # [B, T, D]
         bos_prefix = self.bos_z_proj(z_summary).unsqueeze(1)  # [B, 1, D]
@@ -295,8 +322,29 @@ class BrocaByteTransformer(nn.Module):
 
         cos, sin = self._get_rope(t, device=device)
 
+        use_ckpt = self.training and self.gradient_checkpointing and x.requires_grad
         for blk in self.blocks:
-            x, _ = blk(x, z_mem, z_summary=z_summary, rope_cos=cos, rope_sin=sin)
+            if use_ckpt:
+                x = torch.utils.checkpoint.checkpoint(
+                    self._block_forward_no_cache,
+                    blk,
+                    x,
+                    z_mem,
+                    z_summary,
+                    cos,
+                    sin,
+                    memory_mask,
+                    use_reentrant=False,
+                )
+            else:
+                x, _ = blk(
+                    x,
+                    z_mem,
+                    z_summary=z_summary,
+                    rope_cos=cos,
+                    rope_sin=sin,
+                    memory_mask=memory_mask,
+                )
 
         x = x + self.out_z_proj(z_summary).unsqueeze(1)
         return self.lm_head(self.final_norm(x))
@@ -308,10 +356,11 @@ class BrocaByteTransformer(nn.Module):
         label_smoothing: float | None = None,
         decoder_byte_dropout: float | None = None,
         clean_z: bool = False,
+        memory_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Compute next-byte cross-entropy loss conditioned strictly on Z*.
-        Applies decoder input byte dropout (~15%) during teacher-forcing so Broca MUST read Z*
+        Compute next-byte cross-entropy loss conditioned strictly on Z_ctx.
+        Applies decoder input byte dropout (~15%) during teacher-forcing so Broca MUST read Z_ctx
         via Cross-Attention + FiLM + <BOS> prefix + output Z* bridge instead of collapsing.
         """
         inp = target_byte_ids[:, :-1]
@@ -326,7 +375,7 @@ class BrocaByteTransformer(nn.Module):
             drop_mask = (torch.rand(inp.shape, device=inp.device) < drop_p) & maskable
             inp = torch.where(drop_mask, torch.full_like(inp, MASK_BYTE), inp)
 
-        logits = self.forward(inp, memory_columns, clean_z=clean_z)
+        logits = self.forward(inp, memory_columns, clean_z=clean_z, memory_mask=memory_mask)
         ls = float(self.cfg.broca_label_smoothing if label_smoothing is None else label_smoothing)
         return F.cross_entropy(
             logits.reshape(-1, BYTE_VOCAB_SIZE),
@@ -343,9 +392,10 @@ class BrocaByteTransformer(nn.Module):
         temperature: float | None = None,
         top_p: float | None = None,
         repetition_penalty: float | None = None,
+        memory_mask: torch.Tensor | None = None,
     ) -> Iterator[str]:
         """
-        Fast GPU autoregressive UTF-8 streaming strictly from Z* [1, 16, D]:
+        Fast GPU autoregressive UTF-8 streaming strictly from Z_ctx [1, M_total, D]:
           - Static pre-allocated KV-cache (zero torch.cat per byte)
           - Precomputed Cross-KV + FiLM + out_z_proj (computed ONCE per reply)
           - Vectorized GPU repetition penalty (zero CPU-GPU sync loops)
@@ -357,8 +407,12 @@ class BrocaByteTransformer(nn.Module):
             if memory_columns.ndim == 2:
                 memory_columns = memory_columns.unsqueeze(0)
             device = next(self.parameters()).device
-            z_mem = self.col_norm(memory_columns[:1].to(device=device, dtype=torch.float32))
-            z_summary = self._pool_z_summary(z_mem)
+            kv_dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
+            mem_mask = None
+            if memory_mask is not None:
+                mem_mask = memory_mask[:1].to(device=device, dtype=torch.bool)
+                if mem_mask.ndim == 1:
+                    mem_mask = mem_mask.unsqueeze(0)
 
             max_bytes = max(8, min(self.max_seq_len - 2, int(max_new_bytes or self.cfg.broca_max_new_bytes)))
             temp = max(0.35, min(1.0, float(temperature if temperature is not None else self.cfg.broca_temperature)))
@@ -366,9 +420,10 @@ class BrocaByteTransformer(nn.Module):
             rep_pen = max(1.0, float(repetition_penalty if repetition_penalty is not None else self.cfg.broca_repetition_penalty))
 
             cos_all, sin_all = self._get_rope(max_bytes + 4, device=device)
-            kv_dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
 
             with amp_autocast(device):
+                z_mem = self.col_norm(memory_columns[:1].to(device=device, dtype=kv_dtype))
+                z_summary = self._pool_z_summary(z_mem, memory_mask=mem_mask)
                 cross_kvs = [blk.precompute_cross_kv(z_mem) for blk in self.blocks]
                 film_caches = [blk.precompute_film(z_summary) for blk in self.blocks]
                 bos_prefix = self.bos_z_proj(z_summary).unsqueeze(1)  # [1, 1, D]
@@ -424,12 +479,16 @@ class BrocaByteTransformer(nn.Module):
                             cross_kv_cache=cross_kvs[i],
                             film_cache=film_caches[i],
                             cache_pos=step,
+                            memory_mask=mem_mask,
                         )
 
                     x = x + out_z_bias
                     logits = self.lm_head(self.final_norm(x))[:, -1, :].float().squeeze(0)  # [260]
 
                 logits.masked_fill_(static_ban, -1e9)
+                if step == 0:
+                    logits[10] = -1e9
+                    logits[32] = -1e9
                 if step < 6:
                     logits[EOS_BYTE] = -1e9
 
@@ -485,19 +544,20 @@ class BrocaByteTransformer(nn.Module):
         max_new_bytes: int | None = None,
         top_p: float | None = None,
         repetition_penalty: float | None = None,
+        memory_mask: torch.Tensor | None = None,
     ) -> list[dict[str, Any]]:
         """
         Batched Parallel System-2 Generation on GPU:
-        Generates K candidate thoughts (e.g. Precyzyjna, Kontekstowa, Kreatywna) simultaneously
-        in ONE GPU batch with static KV-cache and vectorized repetition penalty (~3x faster on RTX 5080!).
+        Generates K candidate thoughts simultaneously in ONE GPU batch with static KV-cache,
+        precomputed Cross-KV for Z_ctx, vectorized repetition penalty, and ZERO per-byte CPU syncs!
         """
         was_training = self.training
         self.eval()
         try:
             device = next(self.parameters()).device
-            z_mem = self.col_norm(memory_columns_batch.to(device=device, dtype=torch.float32))
-            b = z_mem.shape[0]
-            z_summary = self._pool_z_summary(z_mem)
+            kv_dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
+            b = memory_columns_batch.shape[0]
+            mem_mask = memory_mask.to(device=device, dtype=torch.bool) if memory_mask is not None else None
 
             max_bytes = max(8, min(self.max_seq_len - 2, int(max_new_bytes or self.cfg.broca_max_new_bytes)))
             temps = torch.tensor(
@@ -509,9 +569,10 @@ class BrocaByteTransformer(nn.Module):
             rep_pen = max(1.0, float(repetition_penalty if repetition_penalty is not None else self.cfg.broca_repetition_penalty))
 
             cos_all, sin_all = self._get_rope(max_bytes + 4, device=device)
-            kv_dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
 
             with amp_autocast(device):
+                z_mem = self.col_norm(memory_columns_batch.to(device=device, dtype=kv_dtype))
+                z_summary = self._pool_z_summary(z_mem, memory_mask=mem_mask)
                 cross_kvs = [blk.precompute_cross_kv(z_mem) for blk in self.blocks]
                 film_caches = [blk.precompute_film(z_summary) for blk in self.blocks]
                 bos_prefix = self.bos_z_proj(z_summary).unsqueeze(1)  # [B, 1, D]
@@ -530,8 +591,8 @@ class BrocaByteTransformer(nn.Module):
             rep_mask = torch.zeros((b, BYTE_VOCAB_SIZE), dtype=torch.bool, device=device)
             pad_vec = torch.full((b,), PAD_BYTE, dtype=torch.long, device=device)
             eos_vec = torch.full((b,), EOS_BYTE, dtype=torch.long, device=device)
-            finished_py = [False] * b
-            finished_cnt = 0
+            finished = torch.zeros((b,), dtype=torch.bool, device=device)
+            out_tokens = torch.full((b, max_bytes), PAD_BYTE, dtype=torch.long, device=device)
 
             static_ban = torch.zeros(BYTE_VOCAB_SIZE, dtype=torch.bool, device=device)
             static_ban[PAD_BYTE] = True
@@ -542,7 +603,6 @@ class BrocaByteTransformer(nn.Module):
             static_ban[127] = True
 
             cur_ids = torch.full((b, 1), BOS_BYTE, dtype=torch.long, device=device)
-            out_bytes: list[bytearray] = [bytearray() for _ in range(b)]
 
             for step in range(max_bytes):
                 with amp_autocast(device):
@@ -568,12 +628,16 @@ class BrocaByteTransformer(nn.Module):
                             cross_kv_cache=cross_kvs[i],
                             film_cache=film_caches[i],
                             cache_pos=step,
+                            memory_mask=mem_mask,
                         )
 
                     x = x + out_z_bias
                     logits = self.lm_head(self.final_norm(x))[:, -1, :].float()  # [B, 260]
 
                 logits[:, static_ban] = -1e9
+                if step == 0:
+                    logits[:, 10] = -1e9
+                    logits[:, 32] = -1e9
                 if step < 6:
                     logits[:, EOS_BYTE] = -1e9
 
@@ -604,30 +668,21 @@ class BrocaByteTransformer(nn.Module):
                     sorted_idx.gather(1, sampled_pos),
                 ).squeeze(1)  # [B]
 
-                # Single GPU->CPU sync per byte (0 per-row GPU tensor indexing stalls!)
-                next_cpu = next_ids.tolist()
-                for i, nid in enumerate(next_cpu):
-                    if not finished_py[i]:
-                        if nid == EOS_BYTE:
-                            finished_py[i] = True
-                            finished_cnt += 1
-                        elif 0 <= nid <= 255:
-                            out_bytes[i].append(nid)
+                # Branchless GPU state update (zero per-byte CPU->GPU or GPU->CPU sync!)
+                out_tokens[:, step] = torch.where(finished, pad_vec, next_ids)
+                finished = finished | (next_ids == EOS_BYTE)
+                recent_ids[:, step % 32] = torch.where(finished, pad_vec, next_ids)
+                cur_ids[:, 0] = torch.where(finished, eos_vec, next_ids)
 
-                if finished_cnt >= b:
+                if (step + 1) % 16 == 0 and bool(finished.all().item()):
                     break
 
-                if finished_cnt > 0:
-                    fin_t = torch.tensor(finished_py, dtype=torch.bool, device=device)
-                    recent_ids[:, step % 32] = torch.where(fin_t, pad_vec, next_ids)
-                    cur_ids[:, 0] = torch.where(fin_t, eos_vec, next_ids)
-                else:
-                    recent_ids[:, step % 32] = next_ids
-                    cur_ids[:, 0] = next_ids
-
+            # Single GPU -> CPU copy after the entire batch finishes
+            rows_cpu = out_tokens.cpu().tolist()
             results: list[dict[str, Any]] = []
-            for buf in out_bytes:
-                txt = bytes(buf).decode("utf-8", errors="ignore").strip()
+            for row in rows_cpu:
+                raw_bytes = bytearray(nid for nid in row if 0 <= nid <= 255)
+                txt = bytes(raw_bytes).decode("utf-8", errors="ignore").strip()
                 results.append({"text": txt, "num_bytes": len(txt.encode("utf-8"))})
             return results
         finally:
@@ -642,25 +697,32 @@ class BrocaByteTransformer(nn.Module):
         temperature: float | None = None,
         top_p: float | None = None,
         repetition_penalty: float | None = None,
+        memory_mask: torch.Tensor | None = None,
     ) -> dict[str, Any]:
-        chunks = list(
-            self.generate_stream(
-                memory_columns=memory_columns,
-                max_new_bytes=max_new_bytes,
-                temperature=temperature,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-            )
-        )
-        text = "".join(chunks).strip()
-        return {"text": text, "num_bytes": len(text.encode("utf-8"))}
+        if memory_columns.ndim == 2:
+            memory_columns = memory_columns.unsqueeze(0)
+        if memory_mask is not None and memory_mask.ndim == 1:
+            memory_mask = memory_mask.unsqueeze(0)
+        temp = float(temperature if temperature is not None else self.cfg.broca_temperature)
+        return self.generate_batch(
+            memory_columns_batch=memory_columns[:1],
+            temperatures=[temp],
+            max_new_bytes=max_new_bytes,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            memory_mask=memory_mask[:1] if memory_mask is not None else None,
+        )[0]
 
     @torch.no_grad()
-    def score_text_confidence(self, text: str, memory_columns: torch.Tensor) -> dict[str, float]:
+    def score_text_confidence(
+        self,
+        text: str,
+        memory_columns: torch.Tensor,
+        memory_mask: torch.Tensor | None = None,
+    ) -> dict[str, float]:
         """
         Compute Broca's own neural confidence (average byte cross-entropy NLL and exp(-NLL))
-        for a generated draft conditioned on Z* [1, 16, D] in one parallel GPU forward pass.
-        Grounded Polish answers have low NLL (~0.05..0.80); hallucinated gibberish has high NLL (> 1.30).
+        for a generated draft conditioned on Z_ctx in one parallel GPU forward pass.
         """
         s = (text or "").strip()
         if len(s) < 3:
@@ -669,9 +731,13 @@ class BrocaByteTransformer(nn.Module):
         self.eval()
         try:
             device = next(self.parameters()).device
+            kv_dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
             if memory_columns.ndim == 2:
                 memory_columns = memory_columns.unsqueeze(0)
-            z_mem = memory_columns[:1].to(device=device, dtype=torch.float32)
+            z_mem = memory_columns[:1].to(device=device, dtype=kv_dtype)
+            mem_mask = memory_mask[:1].to(device=device, dtype=torch.bool) if memory_mask is not None else None
+            if mem_mask is not None and mem_mask.ndim == 1:
+                mem_mask = mem_mask.unsqueeze(0)
             tgt_bytes, _ = encode_utf8_bytes(
                 [s],
                 max_bytes=self.max_seq_len,
@@ -683,7 +749,7 @@ class BrocaByteTransformer(nn.Module):
             inp = tgt_bytes[:, :-1]
             tgt = tgt_bytes[:, 1:]
             with amp_autocast(device):
-                logits = self.forward(inp, z_mem, clean_z=True)
+                logits = self.forward(inp, z_mem, clean_z=True, memory_mask=mem_mask)
             nll = float(
                 F.cross_entropy(
                     logits.float().reshape(-1, BYTE_VOCAB_SIZE),
@@ -702,10 +768,10 @@ class BrocaByteTransformer(nn.Module):
         self,
         texts: list[str],
         memory_columns_batch: torch.Tensor,
+        memory_mask: torch.Tensor | None = None,
     ) -> list[dict[str, float]]:
         """
-        Score K candidate drafts simultaneously in ONE batched GPU forward pass (~2.5x faster
-        than calling `score_text_confidence()` in a Python loop, with identical per-row NLL!).
+        Score K candidate drafts simultaneously in ONE batched GPU forward pass.
         """
         k = len(texts)
         if k == 0:
@@ -719,9 +785,15 @@ class BrocaByteTransformer(nn.Module):
         self.eval()
         try:
             device = next(self.parameters()).device
+            kv_dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
             sel_texts = [(texts[i] or "").strip() for i in valid_indices]
             idx_t = torch.tensor(valid_indices, dtype=torch.long, device=memory_columns_batch.device)
-            z_mem = memory_columns_batch.index_select(0, idx_t).to(device=device, dtype=torch.float32)
+            z_mem = memory_columns_batch.index_select(0, idx_t).to(device=device, dtype=kv_dtype)
+            mem_mask = (
+                memory_mask.index_select(0, idx_t.to(memory_mask.device)).to(device=device, dtype=torch.bool)
+                if memory_mask is not None
+                else None
+            )
             tgt_bytes, _ = encode_utf8_bytes(
                 sel_texts,
                 max_bytes=self.max_seq_len,
@@ -733,7 +805,7 @@ class BrocaByteTransformer(nn.Module):
             inp = tgt_bytes[:, :-1]
             tgt = tgt_bytes[:, 1:]
             with amp_autocast(device):
-                logits = self.forward(inp, z_mem, clean_z=True)
+                logits = self.forward(inp, z_mem, clean_z=True, memory_mask=mem_mask)
             per_tok = F.cross_entropy(
                 logits.float().reshape(-1, BYTE_VOCAB_SIZE),
                 tgt.reshape(-1),
@@ -764,8 +836,17 @@ class BrocaByteTransformer(nn.Module):
         cur = self.state_dict()
         merged = {}
         for k, v in cur.items():
-            if k in saved and saved[k].shape == v.shape:
-                merged[k] = saved[k].to(device=device, dtype=v.dtype)
+            if k in saved:
+                sv = saved[k]
+                if sv.shape == v.shape:
+                    merged[k] = sv.to(device=device, dtype=v.dtype)
+                elif sv.ndim == v.ndim and sv.ndim >= 2:
+                    dst = v.clone()
+                    slices = tuple(slice(0, min(a, b)) for a, b in zip(sv.shape, v.shape))
+                    dst[slices] = sv[slices].to(device=device, dtype=v.dtype)
+                    merged[k] = dst
+                else:
+                    merged[k] = v
             else:
                 merged[k] = v
         self.load_state_dict(merged)
