@@ -241,6 +241,105 @@
     }
     .tf-brain .tf-role { color: #6ee7b7; }
 
+    /* Auto-Trening Pipeline */
+    .pipe-model-card {
+      background: rgba(15, 23, 42, 0.78);
+      border: 1px solid rgba(56, 189, 248, 0.25);
+      border-radius: 9px;
+      padding: 7px 10px;
+      font-size: 12px;
+      color: #cbd5e1;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .pipe-presets { display: flex; gap: 6px; flex-wrap: wrap; }
+    .pipe-presets button { font-size: 11.5px; padding: 5px 10px; }
+    .pipe-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 8px;
+    }
+    .pipe-stage {
+      background: rgba(15, 23, 42, 0.65);
+      border: 1px solid #1e293b;
+      border-radius: 9px;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .pipe-stage-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+      font-size: 12.5px;
+      font-weight: 600;
+      color: #e2e8f0;
+    }
+    .pipe-stage-head label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+    }
+    .pipe-fields {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+      font-size: 11.5px;
+      color: var(--muted);
+    }
+    .pipe-field {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 92px;
+      flex: 1;
+    }
+    .pipe-field input[type="number"], .pipe-field select {
+      padding: 4px 6px;
+      font-size: 11.5px;
+      min-width: 0;
+      width: 100%;
+    }
+    .pipe-chk {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11.5px;
+      color: #cbd5e1;
+      cursor: pointer;
+    }
+    .pipe-tracker {
+      background: rgba(8, 145, 178, 0.10);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      border-radius: 10px;
+      padding: 9px 11px;
+      display: none;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .pipe-tracker.visible { display: flex; }
+    .pipe-step-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      padding: 3px 6px;
+      border-radius: 6px;
+      background: rgba(15, 23, 42, 0.55);
+    }
+    .pipe-status-running { color: #38bdf8; font-weight: 600; }
+    .pipe-status-done { color: #34d399; font-weight: 600; }
+    .pipe-status-stopped { color: #fbbf24; font-weight: 600; }
+    .pipe-status-error { color: #f87171; font-weight: 600; }
+    .pipe-status-pending, .pipe-status-skipped { color: #94a3b8; }
+
     /* Chat */
     .llm-banner {
       padding: 8px 11px;
@@ -599,15 +698,147 @@
       <section class="panel">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
           <div class="tabs" style="margin:0">
-            <button id="trTab-teacher" class="tab-btn active" onclick="setTrainTab('teacher')">Nauczyciel (Bielik → Mózg)</button>
+            <button id="trTab-pipeline" class="tab-btn active" onclick="setTrainTab('pipeline')">🚀 Auto-Trening</button>
+            <button id="trTab-teacher" class="tab-btn" onclick="setTrainTab('teacher')">Nauczyciel (Bielik → Mózg)</button>
             <button id="trTab-parquet" class="tab-btn" onclick="setTrainTab('parquet')">Korpus Parquet</button>
             <button id="trTab-web" class="tab-btn" onclick="setTrainTab('web')">Sieć i podstawy</button>
           </div>
           <button id="stopStudyBtn" class="danger" onclick="stopStudy()" style="display:none;padding:5px 10px;font-size:12px">Stop</button>
         </div>
 
+        <!-- TAB 0: Full Auto-Training Pipeline -->
+        <div id="trPane-pipeline" style="display:flex;flex-direction:column;gap:8px">
+          <div id="pipeModelInfo" class="pipe-model-card">
+            <span>🧬 Model: ładowanie...</span>
+            <span class="sub">VRAM / RAM: —</span>
+          </div>
+
+          <div class="pipe-presets">
+            <button type="button" onclick="applyPipelinePreset('quick')" title="Szybki test wszystkich etapów (~10 min)">⚡ Szybki test (~10 min)</button>
+            <button type="button" onclick="applyPipelinePreset('standard')" title="Zalecany pełny trening (~45-60 min)">🎯 Standard (~45–60 min)</button>
+            <button type="button" onclick="applyPipelinePreset('full')" title="Długi trening nocny pod duże modele / PEER">🌙 Pełny / Nocny</button>
+          </div>
+
+          <div class="pipe-grid">
+            <div class="pipe-stage">
+              <div class="pipe-stage-head">
+                <label><input type="checkbox" id="pp_pq_en" checked onchange="savePipelinePlanToStorage()"> 1. Korpus Parquet (Polski)</label>
+              </div>
+              <div class="pipe-fields">
+                <div class="pipe-field" style="flex:1 1 100%">
+                  <span>Plik korpusu</span>
+                  <select id="pp_pq_file" onchange="savePipelinePlanToStorage()">
+                    <option value="__ALL__" selected>Wszystkie pliki Parquet</option>
+                  </select>
+                </div>
+                <div class="pipe-field">
+                  <span>Max kroków</span>
+                  <input type="number" id="pp_pq_steps" min="1" max="500000" value="8000" onchange="savePipelinePlanToStorage()" />
+                </div>
+                <div class="pipe-field">
+                  <span>Target loss</span>
+                  <input type="number" id="pp_pq_loss" min="0.05" max="10" step="0.05" value="1.55" onchange="savePipelinePlanToStorage()" />
+                </div>
+                <div class="pipe-field">
+                  <span>Batch (0=auto)</span>
+                  <input type="number" id="pp_pq_bs" min="0" max="512" value="0" onchange="savePipelinePlanToStorage()" />
+                </div>
+              </div>
+            </div>
+
+            <div class="pipe-stage">
+              <div class="pipe-stage-head">
+                <label><input type="checkbox" id="pp_bd_en" checked onchange="savePipelinePlanToStorage()"> 2. Bielik: Dialogi</label>
+              </div>
+              <div class="pipe-fields">
+                <div class="pipe-field">
+                  <span>Liczba dialogów (0–2000)</span>
+                  <input type="number" id="pp_bd_num" min="0" max="2000" value="250" onchange="savePipelinePlanToStorage()" />
+                </div>
+              </div>
+              <div class="sub">Tylko generacja do bazy (bez dublowania treningu Broki).</div>
+            </div>
+
+            <div class="pipe-stage">
+              <div class="pipe-stage-head">
+                <label><input type="checkbox" id="pp_br_en" checked onchange="savePipelinePlanToStorage()"> 3. Bielik: Rozumowanie</label>
+              </div>
+              <div class="pipe-fields">
+                <div class="pipe-field">
+                  <span>Przykłady (0–1200)</span>
+                  <input type="number" id="pp_br_num" min="0" max="1200" value="150" onchange="savePipelinePlanToStorage()" />
+                </div>
+              </div>
+              <div class="sub">Relacje + Logika + Niewiedza (wspólny transfer CPU/GPU z etapem 2).</div>
+            </div>
+
+            <div class="pipe-stage">
+              <div class="pipe-stage-head">
+                <label><input type="checkbox" id="pp_dt_en" checked onchange="savePipelinePlanToStorage()"> 4. Trening Dialogów i Rozumowania</label>
+              </div>
+              <div class="pipe-fields">
+                <div class="pipe-field">
+                  <span>Epoki (10–600)</span>
+                  <input type="number" id="pp_dt_ep" min="10" max="600" value="160" onchange="savePipelinePlanToStorage()" />
+                </div>
+                <div class="pipe-field">
+                  <span>Target loss</span>
+                  <input type="number" id="pp_dt_loss" min="0.01" max="10" step="0.02" value="0.16" onchange="savePipelinePlanToStorage()" />
+                </div>
+              </div>
+              <div class="pipe-fields">
+                <label class="pipe-chk"><input type="checkbox" id="pp_dt_freeze" checked onchange="savePipelinePlanToStorage()"> Zamroź Wernicke (stabilne SDR)</label>
+                <label class="pipe-chk"><input type="checkbox" id="pp_dt_recall" checked onchange="savePipelinePlanToStorage()"> Ucz czytania slotów Hipokampu</label>
+              </div>
+            </div>
+
+            <div class="pipe-stage">
+              <div class="pipe-stage-head">
+                <label><input type="checkbox" id="pp_kn_en" checked onchange="savePipelinePlanToStorage()"> 5. Zasilenie Hipokampu i Sieci</label>
+              </div>
+              <div class="pipe-fields">
+                <label class="pipe-chk"><input type="checkbox" id="pp_kn_elem" checked onchange="savePipelinePlanToStorage()"> Szkoła Podstawowa</label>
+                <label class="pipe-chk"><input type="checkbox" id="pp_kn_facts" checked onchange="savePipelinePlanToStorage()"> Fakty i logika z Bielika</label>
+              </div>
+              <div class="pipe-fields">
+                <div class="pipe-field">
+                  <span>Turbo-tematy z sieci (0–300)</span>
+                  <input type="number" id="pp_kn_turbo" min="0" max="300" value="0" onchange="savePipelinePlanToStorage()" />
+                </div>
+              </div>
+            </div>
+
+            <div class="pipe-stage">
+              <div class="pipe-stage-head">
+                <label><input type="checkbox" id="pp_sl_en" checked onchange="savePipelinePlanToStorage()"> 6. Konsolidacja Snu</label>
+              </div>
+              <div class="pipe-fields">
+                <div class="pipe-field">
+                  <span>Cykle NREM + SHY + REM (1–5)</span>
+                  <input type="number" id="pp_sl_cyc" min="1" max="5" value="1" onchange="savePipelinePlanToStorage()" />
+                </div>
+              </div>
+              <div class="sub">Buduje pamięć trwałą oraz mosty skojarzeniowe 2-hop REM.</div>
+            </div>
+          </div>
+
+          <div class="study-row">
+            <button id="pipeStartBtn" class="primary" onclick="startTrainingPipeline()" style="flex:1">🚀 Start pełnego treningu</button>
+            <button id="pipeStopBtn" class="danger" onclick="stopStudy()" disabled>⏹ Stop</button>
+          </div>
+
+          <div id="pipelineTracker" class="pipe-tracker">
+            <div style="display:flex;justify-content:space-between;align-items:center;font-size:12.5px">
+              <strong id="pipeTrackerTitle">🚀 Auto-Trening</strong>
+              <span id="pipeTrackerMeta" class="sub">0% · 0.0s</span>
+            </div>
+            <div class="bar-bg"><div id="pipeOverallBar" class="bar-fill" style="width:0%;background:var(--green)"></div></div>
+            <div id="pipeStagesList" style="display:flex;flex-direction:column;gap:4px"></div>
+          </div>
+        </div>
+
         <!-- TAB 1: Bielik Teacher -> Self-Sufficient Brain Distillation -->
-        <div id="trPane-teacher" style="display:flex;flex-direction:column;gap:8px">
+        <div id="trPane-teacher" style="display:none;flex-direction:column;gap:8px">
           <div class="study-row">
             <select id="teacherDialoguesCount" title="Ile nowych naturalnych polskich dialogów ma wygenerować Bielik dla Twojego mózgu">
               <option value="40">40 nowych dialogów (szybka sesja ~1 min)</option>
@@ -1181,6 +1412,7 @@
         pqBtn.textContent = pq.exists ? `Trenuj z Parquet (${pq.total_size_mb} MB)` : "Pobierz i trenuj z Parquet";
       }
       document.getElementById("stopStudyBtn").style.display = studying ? "inline-block" : "none";
+      renderPipelineUI(s, studying, lc);
 
       // Study live progress
       const sp = document.getElementById("studyProgress");
@@ -1615,13 +1847,249 @@
     }
 
     function setTrainTab(tab) {
-      for (const name of ["teacher", "parquet", "web"]) {
+      for (const name of ["pipeline", "teacher", "parquet", "web"]) {
         const btn = document.getElementById("trTab-" + name);
         const pane = document.getElementById("trPane-" + name);
         if (btn) btn.classList.toggle("active", name === tab);
         if (pane) pane.style.display = name === tab ? "flex" : "none";
       }
     }
+
+    const PIPELINE_STORAGE_KEY = "sleeping_brain_pipeline_plan_v1";
+    let lastPipelinePreset = "standard";
+
+    const PIPELINE_PRESETS = {
+      quick: {
+        preset: "Szybki test",
+        parquet: { enabled: true, filename: "__ALL__", max_steps: 1500, target_loss: 2.2, batch_size: 0 },
+        bielik_dialogues: { enabled: true, num_dialogues: 60 },
+        bielik_reasoning: { enabled: true, num_samples: 60 },
+        dialogue_train: { enabled: true, epochs: 80, target_loss: 0.20, freeze_wernicke: true, train_recalled_columns: true },
+        knowledge: { enabled: true, include_elementary: true, include_bielik_facts: true, turbo_topics: 0 },
+        sleep: { enabled: true, cycles: 1 },
+      },
+      standard: {
+        preset: "Standard",
+        parquet: { enabled: true, filename: "__ALL__", max_steps: 8000, target_loss: 1.55, batch_size: 0 },
+        bielik_dialogues: { enabled: true, num_dialogues: 250 },
+        bielik_reasoning: { enabled: true, num_samples: 150 },
+        dialogue_train: { enabled: true, epochs: 160, target_loss: 0.16, freeze_wernicke: true, train_recalled_columns: true },
+        knowledge: { enabled: true, include_elementary: true, include_bielik_facts: true, turbo_topics: 0 },
+        sleep: { enabled: true, cycles: 1 },
+      },
+      full: {
+        preset: "Pełny / Nocny",
+        parquet: { enabled: true, filename: "__ALL__", max_steps: 40000, target_loss: 1.35, batch_size: 0 },
+        bielik_dialogues: { enabled: true, num_dialogues: 1000 },
+        bielik_reasoning: { enabled: true, num_samples: 600 },
+        dialogue_train: { enabled: true, epochs: 180, target_loss: 0.14, freeze_wernicke: true, train_recalled_columns: true },
+        knowledge: { enabled: true, include_elementary: true, include_bielik_facts: true, turbo_topics: 100 },
+        sleep: { enabled: true, cycles: 2 },
+      },
+    };
+
+    function writePipelinePlanToUI(plan) {
+      if (!plan) return;
+      if (plan.preset) lastPipelinePreset = plan.preset;
+      const pq = plan.parquet || {};
+      const bd = plan.bielik_dialogues || {};
+      const br = plan.bielik_reasoning || {};
+      const dt = plan.dialogue_train || {};
+      const kn = plan.knowledge || {};
+      const sl = plan.sleep || {};
+      const setVal = (id, v) => { const el = document.getElementById(id); if (el && v !== undefined && v !== null) el.value = String(v); };
+      const setChk = (id, v) => { const el = document.getElementById(id); if (el && v !== undefined) el.checked = Boolean(v); };
+      setChk("pp_pq_en", pq.enabled);
+      setVal("pp_pq_file", pq.filename || "__ALL__");
+      setVal("pp_pq_steps", pq.max_steps);
+      setVal("pp_pq_loss", pq.target_loss);
+      setVal("pp_pq_bs", pq.batch_size || 0);
+      setChk("pp_bd_en", bd.enabled);
+      setVal("pp_bd_num", bd.num_dialogues);
+      setChk("pp_br_en", br.enabled);
+      setVal("pp_br_num", br.num_samples);
+      setChk("pp_dt_en", dt.enabled);
+      setVal("pp_dt_ep", dt.epochs);
+      setVal("pp_dt_loss", dt.target_loss);
+      setChk("pp_dt_freeze", dt.freeze_wernicke);
+      setChk("pp_dt_recall", dt.train_recalled_columns);
+      setChk("pp_kn_en", kn.enabled);
+      setChk("pp_kn_elem", kn.include_elementary);
+      setChk("pp_kn_facts", kn.include_bielik_facts);
+      setVal("pp_kn_turbo", kn.turbo_topics);
+      setChk("pp_sl_en", sl.enabled);
+      setVal("pp_sl_cyc", sl.cycles);
+    }
+
+    function readPipelinePlanFromUI() {
+      const getVal = (id, dflt) => { const el = document.getElementById(id); return el ? el.value : dflt; };
+      const getNum = (id, dflt) => { const v = Number(getVal(id, dflt)); return Number.isFinite(v) ? v : dflt; };
+      const getChk = (id, dflt) => { const el = document.getElementById(id); return el ? Boolean(el.checked) : dflt; };
+      const bsRaw = getNum("pp_pq_bs", 0);
+      return {
+        preset: lastPipelinePreset || "custom",
+        parquet: {
+          enabled: getChk("pp_pq_en", true),
+          filename: String(getVal("pp_pq_file", "__ALL__") || "__ALL__"),
+          max_steps: Math.max(1, Math.round(getNum("pp_pq_steps", 8000))),
+          target_loss: Math.max(0.05, getNum("pp_pq_loss", 1.55)),
+          batch_size: bsRaw > 0 ? Math.round(bsRaw) : null,
+        },
+        bielik_dialogues: {
+          enabled: getChk("pp_bd_en", true),
+          num_dialogues: Math.max(0, Math.round(getNum("pp_bd_num", 250))),
+        },
+        bielik_reasoning: {
+          enabled: getChk("pp_br_en", true),
+          num_samples: Math.max(0, Math.round(getNum("pp_br_num", 150))),
+        },
+        dialogue_train: {
+          enabled: getChk("pp_dt_en", true),
+          epochs: Math.max(1, Math.round(getNum("pp_dt_ep", 160))),
+          target_loss: Math.max(0.01, getNum("pp_dt_loss", 0.16)),
+          freeze_wernicke: getChk("pp_dt_freeze", true),
+          train_recalled_columns: getChk("pp_dt_recall", true),
+        },
+        knowledge: {
+          enabled: getChk("pp_kn_en", true),
+          include_elementary: getChk("pp_kn_elem", true),
+          include_bielik_facts: getChk("pp_kn_facts", true),
+          turbo_topics: Math.max(0, Math.round(getNum("pp_kn_turbo", 0))),
+        },
+        sleep: {
+          enabled: getChk("pp_sl_en", true),
+          cycles: Math.max(1, Math.round(getNum("pp_sl_cyc", 1))),
+        },
+      };
+    }
+
+    function savePipelinePlanToStorage() {
+      try {
+        localStorage.setItem(PIPELINE_STORAGE_KEY, JSON.stringify(readPipelinePlanFromUI()));
+      } catch (_) {}
+    }
+
+    function loadPipelinePlanFromStorage() {
+      try {
+        const raw = localStorage.getItem(PIPELINE_STORAGE_KEY);
+        if (raw) {
+          writePipelinePlanToUI(JSON.parse(raw));
+        }
+      } catch (_) {}
+    }
+
+    function applyPipelinePreset(key) {
+      const p = PIPELINE_PRESETS[key];
+      if (!p) return;
+      writePipelinePlanToUI(p);
+      savePipelinePlanToStorage();
+    }
+
+    async function startTrainingPipeline() {
+      savedDialoguesPreview = null;
+      trainingFeedCollapsed = false;
+      const plan = readPipelinePlanFromUI();
+      savePipelinePlanToStorage();
+      const res = await api("/api/train_pipeline", { plan });
+      if (!res.ok) {
+        alert(res.error || "Nie udało się uruchomić Auto-Treningu.");
+      }
+      await poll();
+    }
+
+    function renderPipelineUI(s, studying, lc) {
+      const infoEl = document.getElementById("pipeModelInfo");
+      if (infoEl && lc) {
+        const mode = String(lc.broca_ffn_mode || "moe").toUpperCase();
+        const totB = Number(lc.broca_params || 0);
+        const actB = Number(lc.broca_active_params || totB);
+        const fmtP = (n) => n >= 1e9 ? `${(n / 1e9).toFixed(2)}B` : `${(n / 1e6).toFixed(1)}M`;
+        const gpu = s.gpu || {};
+        const vramTxt = gpu.cuda_available
+          ? `VRAM: ${gpu.vram_allocated_mb}/${gpu.vram_total_mb} MB`
+          : "CPU";
+        const peer = lc.peer_stats || {};
+        const peerTxt = mode === "PEER" && peer.ram_bank_mb
+          ? ` · RAM bank: ${Number(peer.ram_bank_mb).toFixed(0)} MB · Hit: ${Number(peer.hit_rate_pct || 0).toFixed(1)}%`
+          : "";
+        infoEl.innerHTML =
+          `<span>🧬 Tryb Broca: <strong>${escapeHtml(mode)}</strong> (${fmtP(totB)} total / ${fmtP(actB)} aktywnych)</span>` +
+          `<span class="sub">${escapeHtml(vramTxt)}${escapeHtml(peerTxt)}</span>`;
+      }
+
+      const ppFileSel = document.getElementById("pp_pq_file");
+      const pq = s.parquet_corpus || {};
+      const files = Array.isArray(pq.files) ? pq.files : [];
+      if (ppFileSel) {
+        const sig = files.length > 0 ? files.map(f => `${f.filename}:${f.size_mb}`).join("|") : "__EMPTY__";
+        if (ppFileSel.dataset.sig !== sig) {
+          const prevVal = ppFileSel.value || "__ALL__";
+          const opts = [];
+          if (files.length > 0) {
+            if (files.length > 1) {
+              opts.push(`<option value="__ALL__">Wszystkie (${files.length} pliki · ${pq.total_size_mb} MB)</option>`);
+            }
+            for (const f of files) {
+              opts.push(`<option value="${escapeHtml(f.filename)}">${escapeHtml(f.filename)} (${f.size_mb} MB)</option>`);
+            }
+          } else {
+            opts.push(`<option value="__ALL__">Wszystkie (pobierz z HuggingFace)</option>`);
+            opts.push(`<option value="train-00000-of-00006.parquet">train-00000-of-00006.parquet (Wikipedia PL)</option>`);
+            opts.push(`<option value="000_00000.parquet">000_00000.parquet (FineWeb2-HQ PL)</option>`);
+          }
+          ppFileSel.innerHTML = opts.join("");
+          if ([...ppFileSel.options].some(o => o.value === prevVal)) {
+            ppFileSel.value = prevVal;
+          }
+          ppFileSel.dataset.sig = sig;
+        }
+      }
+
+      const startBtn = document.getElementById("pipeStartBtn");
+      const stopBtn = document.getElementById("pipeStopBtn");
+      if (startBtn) startBtn.disabled = !lc.ready || studying;
+      if (stopBtn) stopBtn.disabled = !studying;
+
+      const tracker = document.getElementById("pipelineTracker");
+      const ps = s.pipeline_state || (s.study && s.study.pipeline) || null;
+      if (!tracker || !ps || !Array.isArray(ps.stages) || ps.stages.length === 0) {
+        if (tracker) tracker.className = "pipe-tracker";
+        return;
+      }
+      tracker.className = "pipe-tracker visible";
+      const pct = Math.max(0, Math.min(100, Number(ps.overall_pct || 0)));
+      const elSec = Number(ps.elapsed_sec || 0).toFixed(1);
+      const titleEl = document.getElementById("pipeTrackerTitle");
+      const metaEl = document.getElementById("pipeTrackerMeta");
+      const barEl = document.getElementById("pipeOverallBar");
+      const listEl = document.getElementById("pipeStagesList");
+      if (titleEl) titleEl.textContent = ps.active ? `🚀 Auto-Trening (${ps.preset || "custom"}) — trwa...` : `🚀 Auto-Trening (${ps.preset || "custom"})`;
+      if (metaEl) metaEl.textContent = `${pct.toFixed(1)}% · ${elSec}s`;
+      if (barEl) barEl.style.width = `${Math.max(2, pct)}%`;
+
+      const statusIcons = {
+        pending: "⏳ czeka",
+        running: "🔄 trwa",
+        done: "✅ gotowe",
+        stopped: "⏹ zatrzymano",
+        skipped: "⏭ pominięto",
+        error: "❌ błąd",
+      };
+      if (listEl) {
+        listEl.innerHTML = ps.stages.map(st => {
+          const stKey = st.status || "pending";
+          const stLbl = statusIcons[stKey] || stKey;
+          const sumTxt = st.summary ? ` · ${st.summary}` : "";
+          return `
+            <div class="pipe-step-row">
+              <span>${escapeHtml(st.label || st.key)}</span>
+              <span class="pipe-status-${escapeHtml(stKey)}">${escapeHtml(stLbl)}${escapeHtml(sumTxt)}</span>
+            </div>`;
+        }).join("");
+      }
+    }
+
+    loadPipelinePlanFromStorage();
 
     function setAuxTab(tab) {
       for (const name of ["sleep", "log"]) {
@@ -1648,7 +2116,9 @@
       }
       const usingSaved = Boolean(savedDialoguesPreview && savedDialoguesPreview.length > 0);
       const items = usingSaved ? savedDialoguesPreview : liveItems;
+      const pipeActive = Boolean(s.pipeline_state && s.pipeline_state.active);
       const isLangTraining = studying && (
+        pipeActive ||
         (s.study.topic || "").includes("Bielik") ||
         (s.study.topic || "").includes("Polski") ||
         (s.study.topic || "").includes(".parquet") ||

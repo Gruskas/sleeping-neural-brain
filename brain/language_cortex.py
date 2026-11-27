@@ -185,11 +185,11 @@ class LanguageCortex:
             self._pinned_qa_keys = set()
             self._refresh_status()
 
-    def export_state(self) -> dict[str, Any]:
+    def export_state(self, include_peer_banks: bool = True) -> dict[str, Any]:
         with self._op_lock:
             return {
                 "wernicke": self._wernicke_raw.export_state(),
-                "broca": self._broca_raw.export_state(),
+                "broca": self._broca_raw.export_state(include_peer_banks=include_peer_banks),
                 "lora_updates_count": self.lora_updates_count,
                 "known_q_sdrs": self._known_q_sdrs.detach().cpu(),
                 "canonical_q_sdrs": self._canonical_q_sdrs.detach().cpu(),
@@ -1666,6 +1666,8 @@ class LanguageCortex:
         progress_callback: Any | None = None,
         stop_event: threading.Event | None = None,
         priority_probe_pairs: list[tuple[str, str]] | None = None,
+        freeze_wernicke: bool = False,
+        train_recalled_columns: bool = False,
     ) -> dict[str, Any]:
         """
         Tokenless Dialogue + Q&A Fine-Tuning through the full cognitive pipeline:
@@ -1715,7 +1717,16 @@ class LanguageCortex:
             bs = 24
         bs = max(2, bs)
         total_epochs = max(1, int(epochs))
-        all_params = list(self._wernicke_raw.parameters()) + list(self._broca_raw.parameters())
+        freeze_wernicke = bool(freeze_wernicke)
+        train_recalled_columns = bool(train_recalled_columns)
+        all_params = (
+            [p for p in self._broca_raw.parameters() if p.requires_grad]
+            if freeze_wernicke
+            else (
+                [p for p in self._wernicke_raw.parameters() if p.requires_grad]
+                + [p for p in self._broca_raw.parameters() if p.requires_grad]
+            )
+        )
 
         # Pre-encode all UTF-8 byte sequences ONCE on CPU before the epoch loop
         # (eliminates 160x redundant Python string encoding + regex diacritic stripping!).
@@ -1794,7 +1805,14 @@ class LanguageCortex:
 
         with self._op_lock:
             self._broca_raw.maybe_repair_collapsed_conditioning()
-            self._wernicke_raw.train()
+            wernicke_prev_grad: list[tuple[torch.nn.Parameter, bool]] = []
+            if freeze_wernicke:
+                for p in self._wernicke_raw.parameters():
+                    wernicke_prev_grad.append((p, p.requires_grad))
+                    p.requires_grad_(False)
+                self._wernicke_raw.eval()
+            else:
+                self._wernicke_raw.train()
             self._broca_raw.train()
             cond_mult = 2.0
             opt = self._build_optimizer(lr=eff_lr, cond_lr_mult=cond_mult)
@@ -1917,10 +1935,43 @@ class LanguageCortex:
                             cuda_ev_ring[ev_slot].synchronize()
                         in_bytes, in_mask, tgt_bytes = _pack_preencoded_batch(batch_idxs, use_alt_prob=0.25, mask_p=0.04)
 
+                        def _synth_recalled_cols(tgt_b: torch.Tensor) -> torch.Tensor | None:
+                            if not train_recalled_columns or tgt_b.shape[1] <= 1 or random.random() >= 0.50:
+                                return None
+                            ans_ids = tgt_b[:, 1 : min(tgt_b.shape[1], 1 + in_cap)]
+                            ans_ids = torch.where(
+                                (ans_ids == EOS_BYTE) | (ans_ids == MASK_BYTE),
+                                torch.full_like(ans_ids, PAD_BYTE),
+                                ans_ids,
+                            )
+                            if patch_stride > 1:
+                                rem = ans_ids.shape[1] % patch_stride
+                                if rem != 0:
+                                    pad_n = patch_stride - rem
+                                    if ans_ids.shape[1] + pad_n <= in_cap:
+                                        ans_ids = F.pad(ans_ids, (0, pad_n), value=PAD_BYTE)
+                                    else:
+                                        trim_n = max(patch_stride, (ans_ids.shape[1] // patch_stride) * patch_stride)
+                                        ans_ids = ans_ids[:, :trim_n]
+                            ans_mask = ans_ids.ne(PAD_BYTE)
+                            if not bool(ans_mask.any().item()):
+                                return None
+                            ans_mask[:, 0] = True
+                            with torch.no_grad():
+                                w_rec = self._wernicke_raw(ans_ids, ans_mask)
+                                rec_c = self._normalize_z_columns(w_rec.reconstructed_columns.detach())
+                                rec_c = self._normalize_z_columns(rec_c + torch.randn_like(rec_c) * 0.08)
+                            return rec_c
+
                         opt.zero_grad(set_to_none=True)
                         with amp_autocast(self.device):
-                            w_out = self.wernicke(in_bytes, in_mask)
-                            z_wernicke = self._normalize_z_columns(w_out.reconstructed_columns)
+                            if freeze_wernicke:
+                                with torch.no_grad():
+                                    w_out = self._wernicke_raw(in_bytes, in_mask)
+                                    z_wernicke = self._normalize_z_columns(w_out.reconstructed_columns)
+                            else:
+                                w_out = self.wernicke(in_bytes, in_mask)
+                                z_wernicke = self._normalize_z_columns(w_out.reconstructed_columns)
 
                             with torch.no_grad():
                                 thought = cortex.perceive_and_think(
@@ -1938,11 +1989,18 @@ class LanguageCortex:
 
                             z_star = self._normalize_z_columns(z_wernicke + (z_cortex - z_wernicke.detach()))
                             use_patches = random.random() >= 0.05
+                            synth_rec = _synth_recalled_cols(tgt_bytes)
+                            if synth_rec is not None and thought.recalled_columns is not None:
+                                rec_cols_in = torch.cat([thought.recalled_columns, synth_rec.to(dtype=thought.recalled_columns.dtype)], dim=1)
+                            elif synth_rec is not None:
+                                rec_cols_in = synth_rec
+                            else:
+                                rec_cols_in = thought.recalled_columns
                             z_ctx, z_ctx_mask = cortex.build_context_columns(
                                 columns_star=z_star,
                                 sensory_patch_columns=w_out.patch_columns if use_patches else None,
                                 sensory_patch_mask=w_out.patch_mask if use_patches else None,
-                                recalled_columns=thought.recalled_columns,
+                                recalled_columns=rec_cols_in,
                             )
                             ce_loss, aux_loss, z_loss = self._broca_raw.compute_loss(
                                 tgt_bytes,
@@ -1959,7 +2017,8 @@ class LanguageCortex:
                                 + float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001)) * z_loss
                             ) if self._broca_raw.has_sparse_router else 0.0
                             cond_dec = self._broca_raw.conditioning_decorr_loss(z_ctx, z_ctx_mask)
-                            loss = ce_loss + moe_reg + cond_dec + self._wernicke_bottleneck_loss(w_out, z_star)
+                            w_btl = 0.0 if freeze_wernicke else self._wernicke_bottleneck_loss(w_out, z_star)
+                            loss = ce_loss + moe_reg + cond_dec + w_btl
 
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
@@ -2038,7 +2097,10 @@ class LanguageCortex:
                                     hard_indices.append(chunk_idxs[j])
 
                     if hard_indices:
-                        self._wernicke_raw.train()
+                        if not freeze_wernicke:
+                            self._wernicke_raw.train()
+                        else:
+                            self._wernicke_raw.eval()
                         self._broca_raw.train()
                         self._broca_raw.set_peer_lr(scale=0.65)
                         opt_p = self._build_optimizer(lr=eff_lr * 0.65, cond_lr_mult=2.0)
@@ -2062,8 +2124,13 @@ class LanguageCortex:
                                 )
                                 opt_p.zero_grad(set_to_none=True)
                                 with amp_autocast(self.device):
-                                    w_out = self.wernicke(in_bytes, in_mask)
-                                    z_wernicke = self._normalize_z_columns(w_out.reconstructed_columns)
+                                    if freeze_wernicke:
+                                        with torch.no_grad():
+                                            w_out = self._wernicke_raw(in_bytes, in_mask)
+                                            z_wernicke = self._normalize_z_columns(w_out.reconstructed_columns)
+                                    else:
+                                        w_out = self.wernicke(in_bytes, in_mask)
+                                        z_wernicke = self._normalize_z_columns(w_out.reconstructed_columns)
                                     with torch.no_grad():
                                         thought = cortex.perceive_and_think(
                                             sensory_columns=w_out.columns.detach(),
@@ -2099,7 +2166,8 @@ class LanguageCortex:
                                         + float(getattr(self.cfg, "broca_moe_z_loss_coef", 0.001)) * z_loss
                                     ) if self._broca_raw.has_sparse_router else 0.0
                                     cond_dec = self._broca_raw.conditioning_decorr_loss(z_ctx, z_ctx_mask)
-                                    loss = ce_loss + moe_reg + cond_dec + self._wernicke_bottleneck_loss(w_out, z_star)
+                                    w_btl = 0.0 if freeze_wernicke else self._wernicke_bottleneck_loss(w_out, z_star)
+                                    loss = ce_loss + moe_reg + cond_dec + w_btl
                                 loss.backward()
                                 torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
                                 opt_p.step()
@@ -2118,6 +2186,8 @@ class LanguageCortex:
                             if hit_p_stop:
                                 break
             finally:
+                for p, req in wernicke_prev_grad:
+                    p.requires_grad_(req)
                 self._broca_raw.set_peer_lr(scale=1.0)
                 opt.zero_grad(set_to_none=True)
                 if opt_p is not None:
@@ -2155,6 +2225,9 @@ class LanguageCortex:
         progress_callback: Any | None = None,
         stop_event: threading.Event | None = None,
         priority_probe_pairs: list[tuple[str, str]] | None = None,
+        early_stop_loss: float | None = None,
+        freeze_wernicke: bool = False,
+        train_recalled_columns: bool = False,
     ) -> dict[str, Any]:
         if cortex is not None:
             merged_extra = list(self._learned_qa_replay)
@@ -2173,10 +2246,16 @@ class LanguageCortex:
                 lr=self.cfg.broca_dialogue_lr,
                 batch_size=None,
                 label_smoothing=self.cfg.broca_dialogue_label_smoothing,
-                early_stop_loss=self.cfg.broca_dialogue_early_stop_loss,
+                early_stop_loss=(
+                    float(early_stop_loss)
+                    if early_stop_loss is not None
+                    else self.cfg.broca_dialogue_early_stop_loss
+                ),
                 progress_callback=progress_callback,
                 stop_event=stop_event,
                 priority_probe_pairs=priority_probe_pairs,
+                freeze_wernicke=freeze_wernicke,
+                train_recalled_columns=train_recalled_columns,
             )
         corpus = build_denoising_corpus(
             extra_texts=extra_texts,

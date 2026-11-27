@@ -218,6 +218,12 @@ class BrainServer:
                         self._send_json({"ok": True, **res})
                         return
 
+                    if parsed.path == "/api/train_pipeline":
+                        plan = body.get("plan") if isinstance(body.get("plan"), dict) else body
+                        res = brain.start_training_pipeline_async(plan)
+                        self._send_json({"ok": True, **res})
+                        return
+
                     if parsed.path == "/api/training_feed/clear":
                         brain.clear_training_dialogue_feed()
                         self._send_json({"ok": True})

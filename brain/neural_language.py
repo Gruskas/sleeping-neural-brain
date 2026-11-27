@@ -1342,8 +1342,31 @@ class BrocaByteTransformer(nn.Module):
             if was_training:
                 self.train()
 
-    def export_state(self) -> dict[str, Any]:
-        if self.use_peer:
+    def export_peer_banks(self) -> dict[str, dict[str, torch.Tensor]]:
+        if not self.use_peer:
+            return {}
+        self.flush_peer_caches()
+        return {
+            str(idx): blk.ff.export_bank_state()
+            for idx, blk in enumerate(self.blocks)
+            if isinstance(blk.ff, PEERMicroExpertFFN)
+        }
+
+    def import_peer_banks(self, saved_banks: dict[str, Any]) -> int:
+        if not self.use_peer or not isinstance(saved_banks, dict):
+            return 0
+        restored = 0
+        for idx, blk in enumerate(self.blocks):
+            if isinstance(blk.ff, PEERMicroExpertFFN):
+                b_state = saved_banks.get(str(idx))
+                if b_state is None:
+                    b_state = saved_banks.get(idx)
+                if isinstance(b_state, dict) and blk.ff.import_bank_state(b_state):
+                    restored += 1
+        return restored
+
+    def export_state(self, include_peer_banks: bool = True) -> dict[str, Any]:
+        if self.use_peer and include_peer_banks:
             self.flush_peer_caches()
         out: dict[str, Any] = {
             "weights": {k: v.detach().cpu().to(torch.bfloat16) for k, v in self.state_dict().items()},
@@ -1352,12 +1375,8 @@ class BrocaByteTransformer(nn.Module):
             "fluency_score": self.fluency_score,
             "ffn_mode": self.ffn_mode,
         }
-        if self.use_peer:
-            out["peer_banks"] = {
-                str(idx): blk.ff.export_bank_state()
-                for idx, blk in enumerate(self.blocks)
-                if isinstance(blk.ff, PEERMicroExpertFFN)
-            }
+        if self.use_peer and include_peer_banks:
+            out["peer_banks"] = self.export_peer_banks()
         return out
 
     def import_state(self, state: dict[str, Any], device: torch.device) -> dict[str, list[str]]:
@@ -1386,15 +1405,9 @@ class BrocaByteTransformer(nn.Module):
 
         self.load_state_dict(merged, strict=False)
         if self.use_peer:
-            saved_banks = state.get("peer_banks", {})
+            saved_banks = state.get("peer_banks")
             if isinstance(saved_banks, dict):
-                for idx, blk in enumerate(self.blocks):
-                    if isinstance(blk.ff, PEERMicroExpertFFN):
-                        b_state = saved_banks.get(str(idx))
-                        if b_state is None:
-                            b_state = saved_banks.get(idx)
-                        if isinstance(b_state, dict):
-                            blk.ff.import_bank_state(b_state)
+                self.import_peer_banks(saved_banks)
         self.trained_steps = int(state.get("trained_steps", 0))
         self.last_loss = float(state.get("last_loss", 5.5))
         self.fluency_score = float(state.get("fluency_score", 0.0))

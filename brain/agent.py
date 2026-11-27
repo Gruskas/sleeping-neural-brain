@@ -57,6 +57,79 @@ from .web_learner import (
 
 CHECKPOINT_VERSION = "tokenless_bio_v1"
 
+PIPELINE_STAGE_ORDER: tuple[tuple[str, str], ...] = (
+    ("parquet", "1. Korpus Parquet (polszczyzna i gramatyka)"),
+    ("bielik_dialogues", "2. Bielik (generacja dialogów)"),
+    ("bielik_reasoning", "3. Bielik (Relacje + Logika + Niewiedza)"),
+    ("dialogue_train", "4. Trening dialogów i rozumowania (Wernicke + Broca)"),
+    ("knowledge", "5. Zasilenie Hipokampu i sieci"),
+    ("sleep", "6. Konsolidacja NREM + SHY + REM 2-hop"),
+)
+
+
+def normalize_training_pipeline_plan(plan: dict[str, Any] | None, cfg: BrainConfig) -> dict[str, Any]:
+    raw = plan if isinstance(plan, dict) else {}
+    pq_in = raw.get("parquet") if isinstance(raw.get("parquet"), dict) else {}
+    bd_in = raw.get("bielik_dialogues") if isinstance(raw.get("bielik_dialogues"), dict) else {}
+    br_in = raw.get("bielik_reasoning") if isinstance(raw.get("bielik_reasoning"), dict) else {}
+    dt_in = raw.get("dialogue_train") if isinstance(raw.get("dialogue_train"), dict) else {}
+    kn_in = raw.get("knowledge") if isinstance(raw.get("knowledge"), dict) else {}
+    sl_in = raw.get("sleep") if isinstance(raw.get("sleep"), dict) else {}
+
+    def _opt_int(val: Any, lo: int, hi: int) -> int | None:
+        if val is None or val == "" or val == 0:
+            return None
+        return max(lo, min(hi, int(val)))
+
+    def _opt_float(val: Any, lo: float, hi: float) -> float | None:
+        if val is None or val == "" or float(val) == 0.0:
+            return None
+        return max(lo, min(hi, float(val)))
+
+    freeze_raw = dt_in.get("freeze_wernicke")
+    freeze_val = None if freeze_raw is None else bool(freeze_raw)
+
+    normalized: dict[str, Any] = {
+        "preset": str(raw.get("preset") or "custom").strip()[:48],
+        "parquet": {
+            "enabled": bool(pq_in.get("enabled", True)),
+            "filename": str(pq_in.get("filename") or "__ALL__").strip() or "__ALL__",
+            "max_steps": max(1, min(500000, int(pq_in.get("max_steps", 10000)))),
+            "target_loss": max(0.05, min(10.0, float(pq_in.get("target_loss", 1.50)))),
+            "batch_size": _opt_int(pq_in.get("batch_size"), 1, 512),
+            "lr": _opt_float(pq_in.get("lr"), 1e-6, 1e-1),
+        },
+        "bielik_dialogues": {
+            "enabled": bool(bd_in.get("enabled", True)),
+            "num_dialogues": max(0, min(2000, int(bd_in.get("num_dialogues", 300)))),
+        },
+        "bielik_reasoning": {
+            "enabled": bool(br_in.get("enabled", True)),
+            "num_samples": max(0, min(1200, int(br_in.get("num_samples", 180)))),
+        },
+        "dialogue_train": {
+            "enabled": bool(dt_in.get("enabled", True)),
+            "epochs": max(1, min(600, int(dt_in.get("epochs", 160)))),
+            "target_loss": max(0.01, min(10.0, float(dt_in.get("target_loss", cfg.broca_dialogue_early_stop_loss)))),
+            "freeze_wernicke": freeze_val,
+            "train_recalled_columns": bool(dt_in.get("train_recalled_columns", True)),
+        },
+        "knowledge": {
+            "enabled": bool(kn_in.get("enabled", True)),
+            "include_elementary": bool(kn_in.get("include_elementary", True)),
+            "include_bielik_facts": bool(kn_in.get("include_bielik_facts", True)),
+            "turbo_topics": max(0, min(300, int(kn_in.get("turbo_topics", 0)))),
+        },
+        "sleep": {
+            "enabled": bool(sl_in.get("enabled", True)),
+            "cycles": max(1, min(5, int(sl_in.get("cycles", 1)))),
+        },
+    }
+
+    if not any(normalized[k]["enabled"] for k, _ in PIPELINE_STAGE_ORDER):
+        raise ValueError("Włącz co najmniej jeden etap pipeline'u treningowego.")
+    return normalized
+
 
 class SleepingBrain:
     """
@@ -150,6 +223,18 @@ class SleepingBrain:
             "sources": [],
             "summary": "",
         }
+        self.pipeline_state: dict[str, Any] = {
+            "active": False,
+            "preset": "custom",
+            "current_stage_index": 0,
+            "total_stages": 0,
+            "current_stage_key": "",
+            "current_stage_label": "",
+            "overall_pct": 0.0,
+            "elapsed_sec": 0.0,
+            "stages": [],
+        }
+        self._brain_offloaded_to_cpu: bool = False
 
         self._save_lock = threading.Lock()
         self._save_thread: threading.Thread | None = None
@@ -944,15 +1029,27 @@ class SleepingBrain:
             raise
         return {"started": True, "topics": count}
 
-    def run_turbo_learn(self, topics_count: int = 200, _op_acquired: bool = False) -> dict[str, Any]:
+    def run_turbo_learn(
+        self,
+        topics_count: int = 200,
+        _op_acquired: bool = False,
+        skip_final_sleep: bool = False,
+        skip_foundation: bool = False,
+        _from_pipeline: bool = False,
+    ) -> dict[str, Any]:
         if not _op_acquired:
             self._acquire_op("study")
-        count = max(5, min(len(BROAD_AUTONOMOUS_SYLLABUS), int(topics_count)))
+        count = max(1, min(len(BROAD_AUTONOMOUS_SYLLABUS), int(topics_count)))
         try:
             with self.lock:
-                self._study_stop_event.clear()
+                if not _from_pipeline:
+                    self._study_stop_event.clear()
                 self.state_mode = "STUDYING"
-            foundation_res = self.learn_elementary_foundation(consolidate=False, _from_nested=True)
+            foundation_res = (
+                {"added_facts": 0}
+                if skip_foundation
+                else self.learn_elementary_foundation(consolidate=False, _from_nested=True)
+            )
             with self.lock:
                 self.state_mode = "STUDYING"
                 studied_lower = set(self.hippocampus.studied_topics.keys())
@@ -1024,25 +1121,27 @@ class SleepingBrain:
                         self.study_state["topic"] = f"⚡ Turbo-nauka: {topic}"
                         self.study_state["mastery"] = round((done_topics / max(1, len(pending_topics))) * 85.0, 1)
                         self.study_state["current_action"] = f"Zakodowano {done_topics}/{len(pending_topics)} tematów (+{total_facts} SDR)..."
-                    if since_last_sleep >= 60 and not self._study_stop_event.is_set():
+                    if not skip_final_sleep and since_last_sleep >= 60 and not self._study_stop_event.is_set():
                         self.sleep_now(visual_pacing=False, _from_nested=True)
                         since_last_sleep = 0
 
-            if len(self.hippocampus.short_term) > 0 and not self._study_stop_event.is_set():
+            if not skip_final_sleep and len(self.hippocampus.short_term) > 0 and not self._study_stop_event.is_set():
                 self.study_state["current_action"] = "Sen NREM+SHY+REM oraz pre-warming Broki na GPU..."
                 self.sleep_now(visual_pacing=False, _from_nested=True)
                 self.train_language_now(epochs=10, _from_nested=True)
 
             self.study_state["mastery"] = 100.0
-            self.save_state()
+            if not _from_pipeline:
+                self.save_state()
             return {"topics": done_topics, "pages": total_pages, "facts": total_facts}
         finally:
-            with self.lock:
-                self.study_state["active"] = False
-                self.study_state["current_action"] = ""
-                if self.state_mode == "STUDYING":
-                    self.state_mode = "AWAKE"
-            self._release_op("study")
+            if not _from_pipeline:
+                with self.lock:
+                    self.study_state["active"] = False
+                    self.study_state["current_action"] = ""
+                    if self.state_mode == "STUDYING":
+                        self.state_mode = "AWAKE"
+                self._release_op("study")
 
     def start_continuous_learning_async(self, duration_minutes: int = 60) -> dict[str, Any]:
         mins = max(1, min(480, int(duration_minutes)))
@@ -1710,6 +1809,10 @@ class SleepingBrain:
         batch_size: int | None = None,
         lr: float | None = None,
         _op_acquired: bool = False,
+        target_loss: float | None = None,
+        skip_post_dialogue_align: bool = False,
+        _from_pipeline: bool = False,
+        _progress_hook: Any | None = None,
     ) -> dict[str, Any]:
         """
         Stream Polish sentences from one or all local *.parquet corpora (e.g. `train-00000-of-00006.parquet`
@@ -1729,7 +1832,8 @@ class SleepingBrain:
                     self._acquire_op("study")
                     _op_acquired = True
                 with self.lock:
-                    self._study_stop_event.clear()
+                    if not _from_pipeline:
+                        self._study_stop_event.clear()
                     self.state_mode = "STUDYING"
                     self.study_state["active"] = True
                     self.study_state["current_action"] = (
@@ -1754,21 +1858,23 @@ class SleepingBrain:
                     )
                     self._parquet_info_cache = None
                 except InterruptedError:
-                    with self.lock:
-                        self.study_state["active"] = False
-                        self.study_state["current_action"] = "Przerwano pobieranie korpusu Parquet."
-                        self.state_mode = "AWAKE"
-                    self._release_op("study")
-                    return {"stopped": True, "downloaded": False}
+                    if not _from_pipeline:
+                        with self.lock:
+                            self.study_state["active"] = False
+                            self.study_state["current_action"] = "Przerwano pobieranie korpusu Parquet."
+                            self.state_mode = "AWAKE"
+                        self._release_op("study")
+                    return {"trained": False, "steps": 0, "samples": 0, "stopped": True, "downloaded": False}
                 except Exception as exc:
-                    with self.lock:
-                        self.study_state["active"] = False
-                        self.study_state["current_action"] = f"Błąd pobierania Parquet: {exc}"
-                        self.state_mode = "AWAKE"
-                    self._release_op("study")
+                    if not _from_pipeline:
+                        with self.lock:
+                            self.study_state["active"] = False
+                            self.study_state["current_action"] = f"Błąd pobierania Parquet: {exc}"
+                            self.state_mode = "AWAKE"
+                        self._release_op("study")
                     raise
             if not paths:
-                if _op_acquired:
+                if _op_acquired and not _from_pipeline:
                     with self.lock:
                         self.study_state["active"] = False
                         self.state_mode = "AWAKE"
@@ -1783,9 +1889,10 @@ class SleepingBrain:
             self._acquire_op("study")
 
         with self.lock:
-            self._study_stop_event.clear()
+            if not _from_pipeline:
+                self._study_stop_event.clear()
+                self.training_dialogue_feed.clear()
             self.state_mode = "STUDYING"
-            self.training_dialogue_feed.clear()
             self.study_state = {
                 "active": True,
                 "topic": f"🇵🇱 Polski i gramatyka ({label})",
@@ -1799,13 +1906,14 @@ class SleepingBrain:
                 "summary": "",
             }
             self._log("STUDY", f"🇵🇱 Start treningu języka polskiego i gramatyki z {label} ({steps} kroków, batch={bs}).")
-            self._append_chat(
-                "assistant",
-                f"🇵🇱 Rozpoczynam naukę pisania i polskiej gramatyki z `{label}` ({steps} kroków, batch={bs}, `bfloat16` na GPU). "
-                f"Możesz w każdej chwili zatrzymać trening przyciskiem **Stop** — dotychczasowe postępy zostaną zapisane!",
-                meta={"kind": "study_start", "topic": label},
-                add_to_working=False,
-            )
+            if not _from_pipeline:
+                self._append_chat(
+                    "assistant",
+                    f"🇵🇱 Rozpoczynam naukę pisania i polskiej gramatyki z `{label}` ({steps} kroków, batch={bs}, `bfloat16` na GPU). "
+                    f"Możesz w każdej chwili zatrzymać trening przyciskiem **Stop** — dotychczasowe postępy zostaną zapisane!",
+                    meta={"kind": "study_start", "topic": label},
+                    add_to_working=False,
+                )
 
         def _on_progress(st: dict[str, Any]) -> None:
             pct = round(100.0 * st["step"] / max(1, st["max_steps"]), 1)
@@ -1844,10 +1952,13 @@ class SleepingBrain:
                         teacher_role="Cel" if s_target and s_target != s_prompt else "",
                         teacher_reply=s_target if s_target and s_target != s_prompt else "",
                     )
+            if _progress_hook is not None:
+                _progress_hook(st)
 
         def _on_checkpoint() -> None:
             self.save_state_async()
 
+        eff_target_loss = float(target_loss if target_loss is not None else self.cfg.broca_early_stop_loss)
         try:
             # Start from a rotating row group based on trained_steps so repeated runs read fresh articles
             start_rg = int(self.language_cortex.broca_module.trained_steps // 200)
@@ -1865,7 +1976,7 @@ class SleepingBrain:
                 max_steps=steps,
                 batch_size=bs,
                 lr=lr,
-                early_stop_loss=self.cfg.broca_early_stop_loss,
+                early_stop_loss=eff_target_loss,
                 mask_prob=0.16,
                 stop_event=self._study_stop_event,
                 progress_callback=_on_progress,
@@ -1874,8 +1985,7 @@ class SleepingBrain:
             )
 
             # Re-align Hippocampus, Cortex & Dialogue Q&A after corpus pre-training:
-            # 1) Automatically polish Broca back to Polish dialogue + Q&A (if substantial pre-training ran)
-            #    so the brain never stays stuck in Wikipedia-continuation mode!
+            # 1) Automatically polish Broca back to Polish dialogue + Q&A (unless Stage 4 handles it later)
             # 2) Reset stale W_in / W_rec / threshold and re-encode curriculum entries in the updated Wernicke space.
             if res["trained"]:
                 with self.lock:
@@ -1883,7 +1993,7 @@ class SleepingBrain:
                     self.cortex.reset_synaptic_weights()
                     self.hippocampus.reset_all_banks()
 
-                if res["steps"] >= 50:
+                if res["steps"] >= 50 and not skip_post_dialogue_align:
                     with self.lock:
                         self.study_state["current_action"] = "Dostrajam dialogi i Q&A po nauce z Parquet (GPU)..."
 
@@ -1968,25 +2078,28 @@ class SleepingBrain:
                     f"{res['steps']} kroków, {res['samples']:,} zdań, loss {res['loss_start']}→{res['loss_end']}, "
                     f"płynność {res['fluency']:.0f}%.",
                 )
-                self._append_chat(
-                    "assistant",
-                    f"{'⏹️ Zatrzymano i zapisano' if stopped else '✅ Zakończono'} naukę języka polskiego z `{label}`!\n"
-                    f"Przerobiono **{res['samples']:,} polskich zdań** ({res['steps']} kroków w {res['duration_ms']/1000:.1f}s), "
-                    f"Broca Loss: **{res['loss_start']} → {res['loss_end']}**, płynność: **{res['fluency']:.0f}%**.{preview_note}\n"
-                    f"Dialogi i Q&A zostały automatycznie wyrównane — możesz od razu rozmawiać!",
-                    meta={"kind": "study_done", "topic": label, "facts": res["samples"]},
-                    add_to_working=False,
-                )
-            self.save_state()
+                if not _from_pipeline:
+                    self._append_chat(
+                        "assistant",
+                        f"{'⏹️ Zatrzymano i zapisano' if stopped else '✅ Zakończono'} naukę języka polskiego z `{label}`!\n"
+                        f"Przerobiono **{res['samples']:,} polskich zdań** ({res['steps']} kroków w {res['duration_ms']/1000:.1f}s), "
+                        f"Broca Loss: **{res['loss_start']} → {res['loss_end']}**, płynność: **{res['fluency']:.0f}%**.{preview_note}\n"
+                        f"Dialogi i Q&A zostały automatycznie wyrównane — możesz od razu rozmawiać!",
+                        meta={"kind": "study_done", "topic": label, "facts": res["samples"]},
+                        add_to_working=False,
+                    )
+            if not _from_pipeline:
+                self.save_state()
             trim_process_ram()
             return res
         finally:
-            with self.lock:
-                self.study_state["active"] = False
-                self.study_state["current_action"] = ""
-                if self.state_mode == "STUDYING":
-                    self.state_mode = "AWAKE"
-            self._release_op("study")
+            if not _from_pipeline:
+                with self.lock:
+                    self.study_state["active"] = False
+                    self.study_state["current_action"] = ""
+                    if self.state_mode == "STUDYING":
+                        self.state_mode = "AWAKE"
+                self._release_op("study")
 
     # Alias matching corpus pretrain terminology
     run_corpus_pretrain = train_polish_from_parquet
@@ -2592,6 +2705,542 @@ class SleepingBrain:
                 if self.state_mode == "STUDYING":
                     self.state_mode = "AWAKE"
             self._release_op("study")
+
+    def _offload_brain_to_cpu(self) -> bool:
+        if self.device.type != "cuda" or self._brain_offloaded_to_cpu:
+            return False
+        with self.language_cortex._op_lock:
+            self.language_cortex._wernicke_raw.to("cpu")
+            self.language_cortex._broca_raw.to("cpu")
+            self.cortex.to("cpu")
+            self._brain_offloaded_to_cpu = True
+        torch.cuda.empty_cache()
+        trim_process_ram()
+        return True
+
+    def _restore_brain_to_device(self) -> bool:
+        if not self._brain_offloaded_to_cpu:
+            return False
+        with self.language_cortex._op_lock:
+            self.language_cortex._wernicke_raw.to(self.device)
+            self.language_cortex._broca_raw.to(self.device)
+            self.cortex.to(self.device)
+            self._brain_offloaded_to_cpu = False
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        trim_process_ram()
+        return True
+
+    def start_training_pipeline_async(self, plan: dict[str, Any]) -> dict[str, Any]:
+        norm = normalize_training_pipeline_plan(plan, self.cfg)
+        enabled_stages = [
+            {"key": k, "label": lbl, "status": "pending", "summary": "", "progress_pct": 0.0}
+            for k, lbl in PIPELINE_STAGE_ORDER
+            if norm[k]["enabled"]
+        ]
+        self._acquire_op("study")
+        with self.lock:
+            self._study_stop_event.clear()
+            self.training_dialogue_feed.clear()
+            self.state_mode = "STUDYING"
+            first = enabled_stages[0]
+            self.pipeline_state = {
+                "active": True,
+                "preset": norm["preset"],
+                "current_stage_index": 0,
+                "total_stages": len(enabled_stages),
+                "current_stage_key": first["key"],
+                "current_stage_label": first["label"],
+                "overall_pct": 0.0,
+                "elapsed_sec": 0.0,
+                "stages": enabled_stages,
+            }
+            self.study_state = {
+                "active": True,
+                "topic": f"🚀 Auto-Trening ({norm['preset']})",
+                "round": 0,
+                "max_rounds": len(enabled_stages),
+                "mastery": 0.0,
+                "pages_read": 0,
+                "facts_learned": 0,
+                "current_action": f"Start pipeline'u ({len(enabled_stages)} etapów)...",
+                "sources": [],
+                "summary": "",
+            }
+        try:
+            t = threading.Thread(target=self.run_training_pipeline, args=(norm, True), daemon=True)
+            t.start()
+        except Exception:
+            with self.lock:
+                self.pipeline_state["active"] = False
+                self.study_state["active"] = False
+                self.state_mode = "AWAKE"
+            self._release_op("study")
+            raise
+        return {
+            "started": True,
+            "preset": norm["preset"],
+            "stages": [s["key"] for s in enabled_stages],
+        }
+
+    def run_training_pipeline(self, plan: dict[str, Any], _op_acquired: bool = False) -> dict[str, Any]:
+        norm = normalize_training_pipeline_plan(plan, self.cfg)
+        if not _op_acquired:
+            self._acquire_op("study")
+
+        enabled_meta = [(k, lbl) for k, lbl in PIPELINE_STAGE_ORDER if norm[k]["enabled"]]
+        stages_list = [
+            {"key": k, "label": lbl, "status": "pending", "summary": "", "progress_pct": 0.0}
+            for k, lbl in enabled_meta
+        ]
+        total_stages = len(stages_list)
+        pipe_t0 = time.perf_counter()
+
+        with self.lock:
+            self._study_stop_event.clear()
+            self.training_dialogue_feed.clear()
+            self.state_mode = "STUDYING"
+            self.pipeline_state = {
+                "active": True,
+                "preset": norm["preset"],
+                "current_stage_index": 0,
+                "total_stages": total_stages,
+                "current_stage_key": stages_list[0]["key"],
+                "current_stage_label": stages_list[0]["label"],
+                "overall_pct": 0.0,
+                "elapsed_sec": 0.0,
+                "stages": stages_list,
+            }
+            self.study_state = {
+                "active": True,
+                "topic": f"🚀 Auto-Trening ({norm['preset']})",
+                "round": 0,
+                "max_rounds": total_stages,
+                "mastery": 0.0,
+                "pages_read": 0,
+                "facts_learned": 0,
+                "current_action": f"Start pipeline'u ({total_stages} etapów)...",
+                "sources": [],
+                "summary": "",
+            }
+            self._log("STUDY", f"🚀 Start Auto-Treningu ({norm['preset']}): {', '.join(k for k, _ in enabled_meta)}")
+            self._append_chat(
+                "assistant",
+                f"🚀 Uruchamiam **Auto-Trening** (`{norm['preset']}`, {total_stages} etapów). "
+                f"Możesz bezpiecznie zatrzymać w dowolnym momencie przyciskiem **Stop**.",
+                meta={"kind": "study_start", "topic": "Auto-Trening"},
+                add_to_working=False,
+            )
+
+        def _sync_stage(idx: int, stage_pct: float, status: str | None = None, summary: str | None = None) -> None:
+            clamped = max(0.0, min(100.0, float(stage_pct)))
+            overall = round(((float(idx) + clamped / 100.0) / float(max(1, total_stages))) * 100.0, 1)
+            elapsed = round(time.perf_counter() - pipe_t0, 1)
+            with self.lock:
+                st_entry = self.pipeline_state["stages"][idx]
+                if status is not None:
+                    st_entry["status"] = status
+                st_entry["progress_pct"] = round(clamped, 1)
+                if summary is not None:
+                    st_entry["summary"] = summary
+                self.pipeline_state["current_stage_index"] = idx
+                self.pipeline_state["current_stage_key"] = st_entry["key"]
+                self.pipeline_state["current_stage_label"] = st_entry["label"]
+                self.pipeline_state["overall_pct"] = min(100.0, overall)
+                self.pipeline_state["elapsed_sec"] = elapsed
+
+        stage_results: dict[str, Any] = {}
+        parquet_ran = False
+        bielik_dial_done = False
+        bielik_reas_done = False
+        bielik_dial_enabled = norm["bielik_dialogues"]["enabled"] and norm["bielik_dialogues"]["num_dialogues"] > 0
+        bielik_reas_enabled = norm["bielik_reasoning"]["enabled"] and norm["bielik_reasoning"]["num_samples"] > 0
+        dialogue_enabled = norm["dialogue_train"]["enabled"]
+        sleep_enabled = norm["sleep"]["enabled"]
+
+        try:
+            for idx, (s_key, s_label) in enumerate(enabled_meta):
+                if self._study_stop_event.is_set():
+                    with self.lock:
+                        for rem in self.pipeline_state["stages"][idx:]:
+                            rem["status"] = "stopped"
+                    break
+
+                _sync_stage(idx, 0.0, status="running", summary="W trakcie...")
+                with self.lock:
+                    self.study_state["topic"] = f"🚀 Auto-Trening · {s_label}"
+                    self.study_state["current_action"] = f"Uruchamiam: {s_label}..."
+
+                try:
+                    if s_key == "parquet":
+                        pq_cfg = norm["parquet"]
+
+                        def _on_pq(st: dict[str, Any]) -> None:
+                            pct = 100.0 * float(st.get("step", 0)) / float(max(1, st.get("max_steps", 1)))
+                            _sync_stage(
+                                idx,
+                                pct,
+                                summary=f"Krok {st['step']:,}/{st['max_steps']:,} · loss {st['loss_now']:.2f}",
+                            )
+
+                        res_pq = self.train_polish_from_parquet(
+                            parquet_path=pq_cfg["filename"],
+                            max_steps=pq_cfg["max_steps"],
+                            batch_size=pq_cfg["batch_size"],
+                            lr=pq_cfg["lr"],
+                            _op_acquired=True,
+                            target_loss=pq_cfg["target_loss"],
+                            skip_post_dialogue_align=dialogue_enabled,
+                            _from_pipeline=True,
+                            _progress_hook=_on_pq,
+                        )
+                        stage_results["parquet"] = res_pq
+                        parquet_ran = bool(res_pq.get("trained"))
+                        summary_txt = (
+                            f"{int(res_pq.get('steps', 0)):,} kroków · loss {res_pq.get('loss_start', 0)}→{res_pq.get('loss_end', 0)}"
+                        )
+
+                    elif s_key == "bielik_dialogues":
+                        bd_cfg = norm["bielik_dialogues"]
+                        target_n = int(bd_cfg["num_dialogues"])
+                        if target_n <= 0:
+                            stage_results["bielik_dialogues"] = {"generated": 0, "skipped": True}
+                            _sync_stage(idx, 100.0, status="skipped", summary="0 dialogów (pominięto)")
+                            continue
+
+                        self._offload_brain_to_cpu()
+                        with self.lock:
+                            extra_topics = [
+                                m.preview_label[:60] for m in self.hippocampus.semantic.meta[-60:] if m.preview_label
+                            ]
+                        chunk_limit = 500 if target_n > 1000 else target_n
+                        generated_total = 0
+                        remaining = target_n
+                        gen_seen = 0
+                        while remaining > 0 and not self._study_stop_event.is_set():
+                            cur_batch = min(chunk_limit, remaining)
+                            batch_base = generated_total
+
+                            def _on_bd_prog(st: dict[str, Any]) -> None:
+                                nonlocal gen_seen
+                                done = int(st.get("done", 0))
+                                overall_done = min(target_n, batch_base + done)
+                                pct = 100.0 * float(overall_done) / float(max(1, target_n))
+                                new_pairs = st.get("new_pairs") or []
+                                with self.lock:
+                                    self.study_state["round"] = overall_done
+                                    self.study_state["max_rounds"] = target_n
+                                    self.study_state["mastery"] = round(pct, 1)
+                                    self.study_state["facts_learned"] = overall_done
+                                    self.study_state["current_action"] = (
+                                        f"Bielik dialogi {overall_done}/{target_n} · {st.get('message', '')}"
+                                    )
+                                    for pair in new_pairs:
+                                        if not isinstance(pair, dict):
+                                            continue
+                                        pq_t = str(pair.get("q", ""))
+                                        pa_t = str(pair.get("a", ""))
+                                        if pq_t and pa_t:
+                                            gen_seen += 1
+                                            self._push_training_dialogue(
+                                                mode="teacher_gen",
+                                                tag=f"Bielik · dialog #{gen_seen}/{target_n}",
+                                                prompt_role="Pytanie",
+                                                prompt=pq_t,
+                                                teacher_role="Bielik (Nauczyciel)",
+                                                teacher_reply=pa_t,
+                                            )
+                                _sync_stage(idx, pct, summary=f"+{overall_done}/{target_n} dialogów")
+
+                            g_res = run_bielik_teacher_subprocess(
+                                state_dir=self.state_dir,
+                                model_id=self.cfg.teacher_model_id,
+                                num_dialogues=cur_batch,
+                                extra_topics=extra_topics,
+                                stop_event=self._study_stop_event,
+                                progress_callback=_on_bd_prog,
+                            )
+                            generated_total += int(g_res.get("generated", 0))
+                            remaining -= cur_batch
+                            gc.collect()
+                            if self.device.type == "cuda":
+                                torch.cuda.empty_cache()
+                            trim_process_ram()
+
+                        bielik_dial_done = True
+                        if not bielik_reas_enabled or self._study_stop_event.is_set():
+                            self._restore_brain_to_device()
+                        stage_results["bielik_dialogues"] = {
+                            "generated": generated_total,
+                            "total_saved": count_teacher_dialogues(self.state_dir),
+                        }
+                        summary_txt = f"+{generated_total} dialogów (baza: {stage_results['bielik_dialogues']['total_saved']})"
+
+                    elif s_key == "bielik_reasoning":
+                        br_cfg = norm["bielik_reasoning"]
+                        target_n = int(br_cfg["num_samples"])
+                        if target_n <= 0:
+                            if bielik_dial_done:
+                                self._restore_brain_to_device()
+                            stage_results["bielik_reasoning"] = {"generated": 0, "skipped": True}
+                            _sync_stage(idx, 100.0, status="skipped", summary="0 przykładów (pominięto)")
+                            continue
+
+                        self._offload_brain_to_cpu()
+                        cat_labels = {"relational": "Relacje", "causal": "Logika", "ignorance": "Niewiedza"}
+                        chunk_limit = 300
+                        generated_total = 0
+                        filtered_total = 0
+                        remaining = target_n
+                        gen_seen = 0
+                        try:
+                            while remaining > 0 and not self._study_stop_event.is_set():
+                                cur_batch = min(chunk_limit, remaining)
+                                batch_base = generated_total
+
+                                def _on_br_prog(st: dict[str, Any]) -> None:
+                                    nonlocal gen_seen
+                                    done = int(st.get("done", 0))
+                                    overall_done = min(target_n, batch_base + done)
+                                    pct = 100.0 * float(overall_done) / float(max(1, target_n))
+                                    new_pairs = st.get("new_pairs") or []
+                                    with self.lock:
+                                        self.study_state["round"] = overall_done
+                                        self.study_state["max_rounds"] = target_n
+                                        self.study_state["mastery"] = round(pct, 1)
+                                        self.study_state["facts_learned"] = overall_done
+                                        self.study_state["current_action"] = (
+                                            f"Bielik rozumowanie {overall_done}/{target_n} · {st.get('message', '')}"
+                                        )
+                                        for pair in new_pairs:
+                                            if not isinstance(pair, dict):
+                                                continue
+                                            pq_t = str(pair.get("q", ""))
+                                            pa_t = str(pair.get("a", ""))
+                                            pcat = str(pair.get("category", "reasoning"))
+                                            if pq_t and pa_t and not is_ai_corporate_reply(pa_t):
+                                                gen_seen += 1
+                                                c_lbl = cat_labels.get(pcat, pcat)
+                                                self._push_training_dialogue(
+                                                    mode="teacher_gen",
+                                                    tag=f"Bielik · {c_lbl} #{gen_seen}/{target_n}",
+                                                    prompt_role="Pytanie",
+                                                    prompt=pq_t,
+                                                    teacher_role="Bielik (Nauczyciel)",
+                                                    teacher_reply=pa_t,
+                                                )
+                                    _sync_stage(idx, pct, summary=f"+{overall_done}/{target_n} rozumowania")
+
+                                g_res = run_bielik_reasoning_subprocess(
+                                    state_dir=self.state_dir,
+                                    model_id=self.cfg.teacher_model_id,
+                                    num_samples=cur_batch,
+                                    stop_event=self._study_stop_event,
+                                    progress_callback=_on_br_prog,
+                                )
+                                generated_total += int(g_res.get("generated", 0))
+                                filtered_total += int(g_res.get("filtered_ai", 0))
+                                remaining -= cur_batch
+                                gc.collect()
+                                if self.device.type == "cuda":
+                                    torch.cuda.empty_cache()
+                                trim_process_ram()
+                        finally:
+                            self._restore_brain_to_device()
+
+                        bielik_reas_done = True
+                        stage_results["bielik_reasoning"] = {
+                            "generated": generated_total,
+                            "filtered_ai": filtered_total,
+                            "total_saved": count_reasoning_dialogues(self.state_dir),
+                        }
+                        summary_txt = f"+{generated_total} rozumowania (baza: {stage_results['bielik_reasoning']['total_saved']})"
+
+                    elif s_key == "dialogue_train":
+                        self._restore_brain_to_device()
+                        dt_cfg = norm["dialogue_train"]
+                        all_teacher_pairs = load_teacher_dialogues(self.state_dir)
+                        all_reasoning_pairs = [
+                            (r["q"], r["a"])
+                            for r in load_reasoning_records(self.state_dir)
+                            if not is_ai_corporate_reply(r["a"])
+                        ]
+                        combined_pairs = all_teacher_pairs + all_reasoning_pairs
+                        eff_freeze = (
+                            bool(dt_cfg["freeze_wernicke"])
+                            if dt_cfg["freeze_wernicke"] is not None
+                            else bool(parquet_ran or self.language_cortex.broca_module.trained_steps > 0)
+                        )
+                        with self.lock:
+                            engram_bank = self.hippocampus.get_hopfield_bank()
+                            self.study_state["round"] = 0
+                            self.study_state["max_rounds"] = dt_cfg["epochs"]
+                            self.study_state["facts_learned"] = len(combined_pairs)
+                            self.study_state["current_action"] = (
+                                f"Trening dialogów ({dt_cfg['epochs']} epok, par={len(combined_pairs)}, "
+                                f"freeze_wernicke={'TAK' if eff_freeze else 'NIE'})..."
+                            )
+
+                        def _on_dt_prog(st: dict[str, Any]) -> None:
+                            ep = int(st.get("epoch", 0))
+                            tot = max(1, int(st.get("total_epochs", dt_cfg["epochs"])))
+                            phase = str(st.get("phase", "dialogue_train"))
+                            loss_s = float(st.get("loss_start", 0.0))
+                            loss_n = float(st.get("loss_now", 0.0))
+                            flu = float(st.get("fluency", 0.0))
+                            pct = min(98.0, (85.0 * ep / tot) if phase == "dialogue_train" else (85.0 + 13.0 * ep / tot))
+                            phase_lbl = "Szlifowanie" if phase == "dialogue_polish" else "Epoka"
+                            with self.lock:
+                                self.study_state["round"] = ep
+                                self.study_state["max_rounds"] = tot
+                                self.study_state["mastery"] = round(pct, 1)
+                                self.study_state["current_action"] = (
+                                    f"{phase_lbl} {ep}/{tot} · Loss: {loss_s:.2f}→{loss_n:.2f} · Płynność: {flu:.0f}%"
+                                )
+                                if st.get("fresh_probe") and st.get("sample_q"):
+                                    self._push_training_dialogue(
+                                        mode="dialogue_train",
+                                        tag=f"{phase_lbl} {ep}/{tot} · loss {loss_n:.2f}",
+                                        prompt_role="Pytanie",
+                                        prompt=str(st["sample_q"]),
+                                        teacher_role="Wzorzec",
+                                        teacher_reply=str(st.get("sample_target", "")),
+                                        brain_role="Twój mózg (na żywo)",
+                                        brain_reply=str(st.get("sample_brain", "")) or "(odpowiada...)",
+                                    )
+                            _sync_stage(idx, pct, summary=f"{phase_lbl} {ep}/{tot} · loss {loss_s:.2f}→{loss_n:.2f}")
+
+                        res_dt = self.language_cortex.train_language_cortex(
+                            extra_qa_pairs=combined_pairs or None,
+                            epochs=dt_cfg["epochs"],
+                            include_curriculum=True,
+                            cortex=self.cortex,
+                            engram_bank=engram_bank,
+                            progress_callback=_on_dt_prog,
+                            stop_event=self._study_stop_event,
+                            priority_probe_pairs=combined_pairs[-120:] if combined_pairs else None,
+                            early_stop_loss=dt_cfg["target_loss"],
+                            freeze_wernicke=eff_freeze,
+                            train_recalled_columns=dt_cfg["train_recalled_columns"],
+                        )
+                        self.language_cortex.ensure_familiarity_bank(force_rebuild=True)
+                        stage_results["dialogue_train"] = res_dt
+                        summary_txt = (
+                            f"{int(res_dt.get('epochs_run', 0))} epok · loss {res_dt.get('loss_start', 0)}→{res_dt.get('loss_end', 0)}"
+                        )
+
+                    elif s_key == "knowledge":
+                        self._restore_brain_to_device()
+                        kn_cfg = norm["knowledge"]
+                        added_total = 0
+                        parts_note: list[str] = []
+                        if kn_cfg["include_elementary"] and not self._study_stop_event.is_set():
+                            el_res = self.learn_elementary_foundation(consolidate=False, _from_nested=True)
+                            added_el = int(el_res.get("added_facts", 0))
+                            added_total += added_el
+                            parts_note.append(f"Szkoła +{added_el}")
+                            _sync_stage(idx, 35.0, summary=" · ".join(parts_note))
+
+                        if kn_cfg["include_bielik_facts"] and not self._study_stop_event.is_set():
+                            t_pairs = load_teacher_dialogues(self.state_dir)
+                            r_recs = load_reasoning_records(self.state_dir)
+                            causal_pairs = [
+                                (r["q"], r["a"])
+                                for r in r_recs
+                                if r.get("category") == "causal" and not is_ai_corporate_reply(r.get("a", ""))
+                            ]
+                            fact_pool = t_pairs + causal_pairs
+                            if fact_pool:
+                                ing_res = self._ingest_teacher_pairs_to_short_term(
+                                    fact_pool,
+                                    max_items=max(80, min(600, len(fact_pool))),
+                                )
+                                added_f = int(ing_res.get("engrams_added", 0))
+                                added_total += added_f
+                                parts_note.append(f"Fakty Bielika +{added_f}")
+                            _sync_stage(idx, 65.0, summary=" · ".join(parts_note))
+
+                        if kn_cfg["turbo_topics"] > 0 and not self._study_stop_event.is_set():
+                            tb_res = self.run_turbo_learn(
+                                topics_count=kn_cfg["turbo_topics"],
+                                _op_acquired=True,
+                                skip_final_sleep=sleep_enabled,
+                                skip_foundation=True,
+                                _from_pipeline=True,
+                            )
+                            added_tb = int(tb_res.get("facts", 0))
+                            added_total += added_tb
+                            parts_note.append(f"Turbo {tb_res.get('topics', 0)} tem. (+{added_tb})")
+
+                        stage_results["knowledge"] = {"added_engrams": added_total, "details": parts_note}
+                        summary_txt = " · ".join(parts_note) if parts_note else "Brak nowych danych"
+
+                    elif s_key == "sleep":
+                        self._restore_brain_to_device()
+                        sl_cfg = norm["sleep"]
+                        cycles = int(sl_cfg["cycles"])
+                        reports: list[dict[str, Any]] = []
+                        for cyc in range(cycles):
+                            if self._study_stop_event.is_set():
+                                break
+                            _sync_stage(idx, 100.0 * cyc / max(1, cycles), summary=f"Cykl snu {cyc + 1}/{cycles}...")
+                            rep = self.sleep_now(visual_pacing=False, _from_nested=True)
+                            reports.append(rep.to_dict())
+                        stage_results["sleep"] = {"cycles_run": len(reports), "reports": reports}
+                        last_rem = reports[-1].get("rem_bridges_created", 0) if reports else 0
+                        summary_txt = f"{len(reports)}/{cycles} cykli · mosty REM +{last_rem}"
+
+                    else:
+                        summary_txt = "Pominięto"
+
+                    if self._study_stop_event.is_set():
+                        self.save_state(save_peer_bank=True)
+                        _sync_stage(idx, self.pipeline_state["stages"][idx]["progress_pct"], status="stopped", summary=summary_txt)
+                        with self.lock:
+                            for rem in self.pipeline_state["stages"][idx + 1 :]:
+                                rem["status"] = "stopped"
+                        break
+                    else:
+                        self.save_state(save_peer_bank=True)
+                        _sync_stage(idx, 100.0, status="done", summary=summary_txt)
+
+                except Exception as stage_exc:
+                    _sync_stage(idx, self.pipeline_state["stages"][idx]["progress_pct"], status="error", summary=str(stage_exc)[:120])
+                    with self.lock:
+                        self._log("ERROR", f"Błąd w etapie {s_label}: {stage_exc}")
+                    raise
+
+            stopped = self._study_stop_event.is_set()
+            with self.lock:
+                self.pipeline_state["elapsed_sec"] = round(time.perf_counter() - pipe_t0, 1)
+                if not stopped:
+                    self.pipeline_state["overall_pct"] = 100.0
+                    self.study_state["mastery"] = 100.0
+                done_msg = (
+                    f"{'⏹️ Auto-Trening zatrzymany — dotychczasowe postępy zapisane.' if stopped else '✅ Auto-Trening zakończony pomyślnie!'}"
+                    f" ({self.pipeline_state['elapsed_sec']:.1f}s)"
+                )
+                self._log("STUDY", done_msg)
+                self._append_chat("assistant", done_msg, meta={"kind": "study_done"}, add_to_working=False)
+            return {
+                "completed": not stopped,
+                "stopped": stopped,
+                "preset": norm["preset"],
+                "elapsed_sec": self.pipeline_state["elapsed_sec"],
+                "stages": stage_results,
+            }
+        finally:
+            try:
+                self._restore_brain_to_device()
+            finally:
+                with self.lock:
+                    self.pipeline_state["active"] = False
+                    self.pipeline_state["elapsed_sec"] = round(time.perf_counter() - pipe_t0, 1)
+                    self.study_state["active"] = False
+                    self.study_state["current_action"] = ""
+                    if self.state_mode == "STUDYING":
+                        self.state_mode = "AWAKE"
+                self._release_op("study")
 
     # ── Tokenless Cognitive Chat & True Real-Time UTF-8 Streaming ────────────
     def _handle_system_command(self, msg: str) -> dict[str, Any] | None:
@@ -3735,25 +4384,42 @@ class SleepingBrain:
         if moved:
             self._log("WARN", f"Migracja starego checkpointu ({reason}): {', '.join(moved)}.")
 
-    def save_state(self) -> Path:
+    def save_state(self, save_peer_bank: bool = True) -> Path:
         with self.lock:
             self.state_dir.mkdir(parents=True, exist_ok=True)
             ckpt_path = self.state_dir / "brain_weights.pt"
+            peer_path = self.state_dir / "peer_bank.pt"
             meta_path = self.state_dir / "brain_memory.json"
             tmp_ckpt = self.state_dir / "brain_weights.pt.tmp"
+            tmp_peer = self.state_dir / "peer_bank.pt.tmp"
             tmp_meta = self.state_dir / "brain_memory.json.tmp"
 
-            ckpt_payload = {
-                "version": CHECKPOINT_VERSION,
-                "cortex": self.cortex.export_state(),
-                "language_cortex": self.language_cortex.export_state(),
-                "hippocampus_engrams": self.hippocampus.export_sparse_tensors(),
-                "living_brain": self.living_brain.export_state(),
-                "working_memory_slots": self._wm_slot_buf[: self._wm_slot_count].detach().cpu().to(torch.bfloat16),
-            }
-            torch.save(ckpt_payload, tmp_ckpt)
-            del ckpt_payload
-            os.replace(tmp_ckpt, ckpt_path)
+            broca = self.language_cortex.broca_module
+            is_peer = bool(getattr(broca, "use_peer", False))
+            is_large_non_peer = (not is_peer) and (int(broca.total_parameters()) * 2 > 500_000_000)
+            write_weights = bool(save_peer_bank or (not is_large_non_peer) or (not ckpt_path.exists()))
+
+            if write_weights:
+                ckpt_payload = {
+                    "version": CHECKPOINT_VERSION,
+                    "cortex": self.cortex.export_state(),
+                    "language_cortex": self.language_cortex.export_state(include_peer_banks=False),
+                    "hippocampus_engrams": self.hippocampus.export_sparse_tensors(),
+                    "living_brain": self.living_brain.export_state(),
+                    "working_memory_slots": self._wm_slot_buf[: self._wm_slot_count].detach().cpu().to(torch.bfloat16),
+                }
+                torch.save(ckpt_payload, tmp_ckpt)
+                del ckpt_payload
+                os.replace(tmp_ckpt, ckpt_path)
+
+            if is_peer and save_peer_bank:
+                peer_payload = {
+                    "version": CHECKPOINT_VERSION,
+                    "peer_banks": broca.export_peer_banks(),
+                }
+                torch.save(peer_payload, tmp_peer)
+                del peer_payload
+                os.replace(tmp_peer, peer_path)
 
             meta = {
                 "checkpoint_version": CHECKPOINT_VERSION,
@@ -3776,15 +4442,15 @@ class SleepingBrain:
             trim_process_ram()
             return ckpt_path
 
-    def save_state_async(self) -> None:
-        """Non-blocking background checkpoint save so chat stays instant even with a ~490M brain."""
+    def save_state_async(self, save_peer_bank: bool = False) -> None:
+        """Non-blocking background checkpoint save; skips multi-GB PEER bank writes during routine chat turns."""
         with self._save_lock:
             if self._save_thread is not None and self._save_thread.is_alive():
                 return
 
             def _bg_save() -> None:
                 try:
-                    self.save_state()
+                    self.save_state(save_peer_bank=save_peer_bank)
                 except Exception:
                     pass
 
@@ -3793,6 +4459,7 @@ class SleepingBrain:
 
     def load_state(self) -> bool:
         ckpt_path = self.state_dir / "brain_weights.pt"
+        peer_path = self.state_dir / "peer_bank.pt"
         meta_path = self.state_dir / "brain_memory.json"
         if not ckpt_path.exists() and not meta_path.exists():
             return False
@@ -3817,6 +4484,14 @@ class SleepingBrain:
 
             self.cortex.import_state(weights["cortex"])
             self.language_cortex.import_state(weights["language_cortex"])
+            if getattr(self.language_cortex._broca_raw, "use_peer", False) and peer_path.exists():
+                try:
+                    pb_obj = torch.load(peer_path, map_location="cpu", weights_only=False, mmap=True)
+                except Exception:
+                    pb_obj = torch.load(peer_path, map_location="cpu", weights_only=False)
+                if isinstance(pb_obj, dict) and isinstance(pb_obj.get("peer_banks"), dict):
+                    self.language_cortex._broca_raw.import_peer_banks(pb_obj["peer_banks"])
+                del pb_obj
             broca_rep = getattr(self.language_cortex._broca_raw, "last_import_report", None)
             if broca_rep and (broca_rep.get("mismatched") or broca_rep.get("missing") or broca_rep.get("unexpected")):
                 self._log(
@@ -3872,7 +4547,7 @@ class SleepingBrain:
     def reset_brain(self) -> None:
         self.stop_study()
         with self.lock:
-            for fname in ("brain_weights.pt", "brain_memory.json"):
+            for fname in ("brain_weights.pt", "peer_bank.pt", "brain_memory.json"):
                 p = self.state_dir / fname
                 if p.exists():
                     p.unlink()
@@ -3987,7 +4662,17 @@ class SleepingBrain:
                     "saved_reasoning": count_reasoning_dialogues(self.state_dir),
                 },
                 "self_correction_enabled": self.cfg.self_correction_enabled,
-                "study": dict(self.study_state),
+                "study": {
+                    **dict(self.study_state),
+                    "pipeline": {
+                        **self.pipeline_state,
+                        "stages": [dict(st) for st in self.pipeline_state.get("stages", [])],
+                    },
+                },
+                "pipeline_state": {
+                    **self.pipeline_state,
+                    "stages": [dict(st) for st in self.pipeline_state.get("stages", [])],
+                },
                 "studied_topics": list(self.hippocampus.studied_topics.values()),
                 "language_cortex": {
                     "model_id": lc_model_id,
@@ -4001,6 +4686,9 @@ class SleepingBrain:
                     "wernicke_params": w_params,
                     "cortex_params": c_params,
                     "broca_params": lc_broca_params,
+                    "broca_active_params": self.language_cortex.broca_module.active_parameters(),
+                    "broca_ffn_mode": getattr(self.language_cortex.broca_module, "ffn_mode", "moe"),
+                    "peer_stats": self.language_cortex.broca_module.get_peer_cache_stats(),
                     "num_columns": self.cfg.num_columns,
                     "column_dim": self.cfg.column_dim,
                     "num_neurons": self.cfg.num_neurons,
