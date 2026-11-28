@@ -438,24 +438,44 @@ class QuantizedSynapseMatrix:
     def count_nonzero(self) -> int:
         if self.data.numel() == 0:
             return 0
+        chunk = 512
+        rows = int(self.data.shape[0])
         if self.mode == "fp8":
-            # In E4M3, +0.0 is 0x00 and -0.0 is 0x80; check via raw uint8 view (zero cast!)
+            # In E4M3, +0.0 is 0x00 and -0.0 is 0x80; chunked uint8 check avoids 1.12 GiB int64 promotion!
             raw = self.data.view(torch.uint8)
-            return int(((raw & 0x7F) != 0).sum().item())
-        return int((self.data != 0).sum().item())
+            total = 0
+            for s in range(0, rows, chunk):
+                sl = raw[s : s + chunk]
+                total += int(((sl != 0) & (sl != 128)).sum().item())
+            return total
+        total = 0
+        for s in range(0, rows, chunk):
+            total += int(torch.count_nonzero(self.data[s : s + chunk]).item())
+        return total
 
     @torch.no_grad()
     def is_all_finite(self) -> bool:
         if self.data.numel() == 0:
             return True
+        chunk = 512
+        rows = int(self.data.shape[0])
         if self.mode == "fp8":
-            # In float8_e4m3fn, NaN is 0x7F or 0xFF (no Inf exists)
+            # In float8_e4m3fn, NaN is 0x7F (127) or 0xFF (255); chunked uint8 check avoids int64 promotion!
             raw = self.data.view(torch.uint8)
-            data_ok = not bool(((raw & 0x7F) == 0x7F).any().item())
+            data_ok = True
+            for s in range(0, rows, chunk):
+                sl = raw[s : s + chunk]
+                if bool(((sl == 127) | (sl == 255)).any().item()):
+                    data_ok = False
+                    break
         elif self.mode == "int8":
             data_ok = True
         else:
-            data_ok = bool(torch.isfinite(self.data).all().item())
+            data_ok = True
+            for s in range(0, rows, chunk):
+                if not bool(torch.isfinite(self.data[s : s + chunk]).all().item()):
+                    data_ok = False
+                    break
         if not data_ok:
             return False
         if self.row_scale is not None:
