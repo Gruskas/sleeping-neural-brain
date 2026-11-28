@@ -64,11 +64,11 @@ class BrainConfig:
     peer_grid_size: int = 256
     peer_num_heads: int = 8
     peer_top_k: int = 8
-    peer_cache_slots: int = 4096
+    peer_cache_slots: int = 16384
     peer_lr: float = 3e-3
     peer_weight_decay: float = 1e-4
     broca_dropout: float = 0.2
-    broca_max_seq_len: int = 1024
+    broca_max_seq_len: int = 1536
     broca_use_cuda_graphs: bool = True
     broca_lr: float = 4.0e-4
     broca_weight_decay: float = 0.05
@@ -84,6 +84,10 @@ class BrainConfig:
     broca_top_p: float = 0.85
     broca_repetition_penalty: float = 1.18
     broca_max_new_bytes: int = 1024
+    broca_use_verbatim_prompt: bool = True
+    broca_max_prompt_bytes: int = 512
+    broca_verbatim_prompt_dropout: float = 0.15
+    broca_verbatim_min_trained_steps: int = 10
 
     # Training epochs & GPU optimization (RTX 5080 / CUDA 12.8)
     language_bootstrap_epochs: int = 5
@@ -101,11 +105,15 @@ class BrainConfig:
 
     # Autonomous 2-hop Concept Graph (DMN idle thinking & REM bridge synthesis)
     dmn_enabled: bool = True
-    idle_think_delay_sec: float = 25.0
-    dmn_think_interval_sec: float = 25.0
+    dmn_always_think: bool = True
+    idle_think_delay_sec: float = 15.0
+    dmn_think_interval_sec: float = 12.0
     rem_2hop_steps: int = 5
     dmn_bridge_min_hop_sim: float = 0.32
     dmn_bridge_max_direct_sim: float = 0.25
+    dmn_relaxed_min_hop_sim: float = 0.22
+    dmn_relaxed_max_direct_sim: float = 0.45
+    dmn_max_short_term_auto_sleep: int = 16
 
     # Memory Limits (Expanded Prefrontal Working Memory + Tensor Engram Banks on GPU)
     max_short_term_memories: int = 50000

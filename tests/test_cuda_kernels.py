@@ -351,6 +351,154 @@ class TestCUDAKernelsAndGraphs(unittest.TestCase):
         out_p = "".join(peer_model.generate_stream(z_p, max_new_bytes=16))
         self.assertIsInstance(out_p, str)
 
+    def test_generate_batch_cuda_graphs_parity(self) -> None:
+        torch.manual_seed(4242)
+        for mode in ("moe", "dense"):
+            cfg = BrainConfig(
+                broca_dim=128,
+                column_dim=64,
+                broca_layers=2,
+                broca_heads=4,
+                broca_ff_dim=256,
+                broca_use_moe=(mode == "moe"),
+                broca_ffn_mode=mode,
+                broca_num_experts=4,
+                broca_moe_top_k=2,
+                broca_moe_expert_dim=128,
+                broca_dropout=0.0,
+                broca_max_seq_len=128,
+                broca_use_cuda_graphs=True,
+            )
+            model = BrocaByteTransformer(cfg).to(self.device).eval()
+            kv_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+            b = 3
+            z_raw = torch.randn((b, 8, cfg.column_dim), device=self.device, dtype=kv_dtype)
+            cos_all, sin_all = model._get_rope(40, device=self.device)
+
+            with torch.no_grad():
+                from brain.sensory_wernicke import amp_autocast
+
+                with amp_autocast(self.device):
+                    z_mem = model.col_norm(z_raw)
+                    z_summary = model._pool_z_summary(z_mem)
+                    cross_kvs = [blk.precompute_cross_kv(z_mem) for blk in model.blocks]
+                    film_caches = [blk.precompute_film(z_summary) for blk in model.blocks]
+                    bos_prefix = model._norm_z_proj(model.bos_z_proj(z_summary)).unsqueeze(1)
+                    out_z_bias = 0.50 * model._norm_z_proj(model.out_z_proj(z_summary)).unsqueeze(1)
+
+                run_eager, cur_eager, _, _, _, used_eager = model._create_batch_step_runner(
+                    batch_size=b,
+                    z_mem=z_mem,
+                    z_summary=z_summary,
+                    cross_kvs=cross_kvs,
+                    film_caches=film_caches,
+                    bos_prefix=bos_prefix,
+                    out_z_bias=out_z_bias,
+                    cos_all=cos_all,
+                    sin_all=sin_all,
+                    mem_mask=None,
+                    cache_len=36,
+                    device=self.device,
+                    kv_dtype=kv_dtype,
+                    force_eager=True,
+                )
+                run_graph, cur_graph, _, _, _, used_graph = model._create_batch_step_runner(
+                    batch_size=b,
+                    z_mem=z_mem,
+                    z_summary=z_summary,
+                    cross_kvs=cross_kvs,
+                    film_caches=film_caches,
+                    bos_prefix=bos_prefix,
+                    out_z_bias=out_z_bias,
+                    cos_all=cos_all,
+                    sin_all=sin_all,
+                    mem_mask=None,
+                    cache_len=36,
+                    device=self.device,
+                    kv_dtype=kv_dtype,
+                    force_eager=False,
+                )
+                self.assertFalse(used_eager)
+                self.assertTrue(used_graph, f"Batch CUDA Graph not captured for mode={mode}")
+
+                for step in range(24):
+                    tok_col = torch.tensor([[65 + (step + r) % 26] for r in range(b)], device=self.device) if step > 0 else torch.full((b, 1), 257, device=self.device)
+                    cur_eager.copy_(tok_col)
+                    cur_graph.copy_(tok_col)
+                    le = run_eager(step)
+                    lg = run_graph(step)
+                    self.assertTrue(bool(torch.isfinite(lg).all().item()))
+                    self.assertLess((le - lg).abs().max().item(), 0.15)
+                    self.assertGreater(F.cosine_similarity(le, lg, dim=-1).min().item(), 0.999)
+
+                # End-to-end generate_batch parity with fixed seed
+                torch.manual_seed(777)
+                out_e = model.generate_batch(z_raw, temperatures=[0.5, 0.6, 0.7], max_new_bytes=24, force_eager=True)
+                self.assertFalse(model._last_batch_used_cuda_graph)
+                torch.manual_seed(777)
+                out_g = model.generate_batch(z_raw, temperatures=[0.5, 0.6, 0.7], max_new_bytes=24, force_eager=False)
+                self.assertTrue(model._last_batch_used_cuda_graph)
+                self.assertEqual(len(out_e), 3)
+                self.assertEqual(len(out_g), 3)
+
+    def test_peer_cache_epoch_skips_redundant_ensure_in_backward(self) -> None:
+        from unittest.mock import patch
+
+        peer = PEERMicroExpertFFN(
+            dim=128,
+            grid_size=16,
+            num_heads=4,
+            top_k=4,
+            cache_slots=256,
+            peer_lr=1e-3,
+            dropout=0.0,
+        ).to(self.device).train()
+        x = torch.randn((2, 8, 128), device=self.device, dtype=torch.bfloat16, requires_grad=True)
+        # Warmup once so cache is populated and _cache_epoch stabilizes
+        y0, _, _ = peer(x, compute_aux=False)
+        y0.sum().backward()
+        peer.zero_grad(set_to_none=True)
+
+        orig_ensure = peer._ensure_experts_cached
+        ensure_calls = 0
+
+        def _count_ensure(*args, **kwargs):
+            nonlocal ensure_calls
+            ensure_calls += 1
+            return orig_ensure(*args, **kwargs)
+
+        with patch.object(peer, "_ensure_experts_cached", side_effect=_count_ensure):
+            y1, _, _ = peer(x, compute_aux=False)
+            self.assertEqual(ensure_calls, 1)
+            y1.sum().backward()
+            # Backward must reuse saved slot_ids without re-calling _ensure_experts_cached!
+            self.assertEqual(ensure_calls, 1)
+
+    def test_sparse_sdr_to_columns_parity(self) -> None:
+        from brain.sensory_wernicke import WernickeByteCortex, k_wta
+
+        cfg = BrainConfig(
+            num_neurons=1024,
+            sdr_k=48,
+            num_columns=8,
+            column_dim=128,
+            wernicke_layers=1,
+            wernicke_heads=4,
+            wernicke_ff_dim=256,
+        )
+        wernicke = WernickeByteCortex(cfg).to(self.device).eval()
+        logits = torch.randn((4, cfg.num_neurons), device=self.device, dtype=torch.float32)
+        sdr, top_idx, top_val = k_wta(logits, k=cfg.sdr_k, normalize=True)
+        sdr_bf = sdr.to(dtype=torch.bfloat16)
+        top_val_bf = top_val.to(dtype=torch.bfloat16)
+        with torch.no_grad():
+            dense_cols = wernicke.sdr_to_columns(sdr_bf)
+            sparse_cols = wernicke.sdr_to_columns(sdr_bf, active_indices=top_idx, active_values=top_val_bf)
+        max_diff = (dense_cols.float() - sparse_cols.float()).abs().max().item()
+        cos = F.cosine_similarity(dense_cols.float().flatten(1), sparse_cols.float().flatten(1), dim=-1).min().item()
+        self.assertLess(max_diff, 1e-2, f"Sparse vs dense max_diff={max_diff}")
+        self.assertGreater(cos, 0.9999)
+
     def test_rtx5080_benchmarks(self) -> None:
         results: list[tuple[str, float, float, str]] = []
 
@@ -478,7 +626,50 @@ class TestCUDAKernelsAndGraphs(unittest.TestCase):
         results.append(
             ("Broca.generate_stream 128B", eager_ms, graph_ms, f"{eager_bps:.1f} -> {graph_bps:.1f} B/s")
         )
+
+        # 4) BrocaByteTransformer.generate_batch (B=3, 128B eager vs CUDA Graph)
+        z_b3 = z_ctx.expand(3, -1, -1).contiguous()
+        _ = broca.generate_batch(z_b3, temperatures=[0.5, 0.6, 0.7], max_new_bytes=128, repetition_penalty=1.0, force_eager=False)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        _ = broca.generate_batch(z_b3, temperatures=[0.5, 0.6, 0.7], max_new_bytes=128, repetition_penalty=1.0, force_eager=True)
+        torch.cuda.synchronize()
+        gb_eager_ms = (time.perf_counter() - t0) * 1000.0
+        t0 = time.perf_counter()
+        _ = broca.generate_batch(z_b3, temperatures=[0.5, 0.6, 0.7], max_new_bytes=128, repetition_penalty=1.0, force_eager=False)
+        torch.cuda.synchronize()
+        gb_graph_ms = (time.perf_counter() - t0) * 1000.0
+        results.append(
+            ("Broca.generate_batch (B=3, 128B)", gb_eager_ms, gb_graph_ms, f"{384.0/(gb_eager_ms/1000):.1f} -> {384.0/(gb_graph_ms/1000):.1f} B/s")
+        )
         del broca
+        torch.cuda.empty_cache()
+
+        # 5) Wernicke.sdr_to_columns (B=16, N=12288, dense vs sparse)
+        from brain.sensory_wernicke import WernickeByteCortex, k_wta
+
+        w_cfg = BrainConfig(wernicke_layers=1)
+        wernicke = WernickeByteCortex(w_cfg).to(self.device).eval()
+        sdr_b16, idx_b16, val_b16 = k_wta(torch.randn((16, w_cfg.num_neurons), device=self.device), k=w_cfg.sdr_k, normalize=True)
+        sdr_b16 = sdr_b16.to(dtype=torch.bfloat16)
+        val_b16 = val_b16.to(dtype=torch.bfloat16)
+        with torch.no_grad():
+            for _ in range(3):
+                _ = wernicke.sdr_to_columns(sdr_b16)
+                _ = wernicke.sdr_to_columns(sdr_b16, active_indices=idx_b16, active_values=val_b16)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(20):
+                _ = wernicke.sdr_to_columns(sdr_b16)
+            torch.cuda.synchronize()
+            w_dense_ms = (time.perf_counter() - t0) * 1000.0 / 20.0
+            t0 = time.perf_counter()
+            for _ in range(20):
+                _ = wernicke.sdr_to_columns(sdr_b16, active_indices=idx_b16, active_values=val_b16)
+            torch.cuda.synchronize()
+            w_sparse_ms = (time.perf_counter() - t0) * 1000.0 / 20.0
+        results.append(("Wernicke.sdr_to_columns (B=16)", w_dense_ms, w_sparse_ms, "sparse k-WTA"))
+        del wernicke
         torch.cuda.empty_cache()
 
         print("\n=== RTX 5080 Before vs After Benchmark ===")

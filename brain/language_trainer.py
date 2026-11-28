@@ -1111,6 +1111,36 @@ def iter_parquet_polish_pairs(
     )
 
 
+def iter_processed_corpus_pairs(
+    base_dir: str | Path = ".",
+    continuation_ratio: float = 0.35,
+    min_chars: int = 32,
+    max_chars: int = 230,
+    max_pairs: int | None = None,
+) -> Iterator[tuple[str, str]]:
+    """Stream `(source, target)` sentence pairs from `data/corpora/processed/*.jsonl`."""
+    from .corpus_fetcher import iter_processed_corpus_texts
+
+    cont_mod = max(2, int(round(1.0 / max(0.05, min(0.95, continuation_ratio)))))
+    yielded = 0
+    for doc in iter_processed_corpus_texts(base_dir):
+        sents = [
+            s
+            for s in split_clean_sentences(doc[:3000], min_chars=min_chars, max_chars=max_chars)
+            if _is_grammatical_polish_sentence(s, min_chars=min_chars, max_chars=max_chars)
+        ]
+        if not sents:
+            continue
+        for i, cur in enumerate(sents):
+            if i + 1 < len(sents) and (yielded % cont_mod == 0):
+                yield (cur, sents[i + 1])
+            else:
+                yield (cur, cur)
+            yielded += 1
+            if max_pairs is not None and yielded >= max_pairs:
+                return
+
+
 def train_reasoning_with_bielik(
     brain: Any,
     num_samples: int = 90,

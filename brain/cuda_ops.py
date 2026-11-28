@@ -6,12 +6,16 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
 import torch
 
 _logger = logging.getLogger(__name__)
+
+# Global lock serializing CUDA Graph capture against background LivingBrainClock GPU work
+CUDA_GRAPH_CAPTURE_LOCK = threading.RLock()
 
 _CSRC_DIR = Path(__file__).resolve().parent / "csrc"
 _BUILD_DIR = _CSRC_DIR / "build"

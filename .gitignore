@@ -25,6 +25,8 @@ brain_state/
 *.safetensors
 *.parquet
 *.parquet.part
+data/corpora/
+data/corpora/*
 
 # IDE / OS
 .vscode/

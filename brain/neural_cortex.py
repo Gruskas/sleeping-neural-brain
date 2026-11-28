@@ -299,6 +299,7 @@ class BiologicalAssociativeCortex(nn.Module):
         sensory_patch_mask: torch.Tensor | None = None,
         working_memory_slots: torch.Tensor | None = None,
         thought_slots: torch.Tensor | None = None,
+        compute_metrics: bool = True,
     ) -> CortexThought:
         """
         Execute 3-6 attractor iterations combining:
@@ -418,8 +419,12 @@ class BiologicalAssociativeCortex(nn.Module):
 
             z, _, _ = k_wta(pre_act, k=self.sdr_k, normalize=True)
 
-        energy = float(energy_t.item()) if energy_t is not None else 0.0
-        best_sim_val = float(best_sim_t.item()) if best_sim_t is not None else 0.0
+        if compute_metrics:
+            energy = float(energy_t.item()) if energy_t is not None else 0.0
+            best_sim_val = float(best_sim_t.item()) if best_sim_t is not None else 0.0
+        else:
+            energy = 0.0
+            best_sim_val = 0.0
 
         sparsity_pct = round(100.0 * (self.sdr_k / float(self.num_neurons)), 2)
         if update_last_active and b > 0:
@@ -460,7 +465,7 @@ class BiologicalAssociativeCortex(nn.Module):
 
         # Project strongly recalled Hippocampus engram into 16 cortical columns for Broca Cross-Attention
         recalled_columns: torch.Tensor | None = None
-        if last_h_hop is not None and (force_hopfield or best_sim_val >= hopfield_min_sim):
+        if last_h_hop is not None and (force_hopfield or (not compute_metrics) or best_sim_val >= hopfield_min_sim):
             if sdr_to_columns_fn is not None:
                 rec_raw = sdr_to_columns_fn(
                     last_h_hop.to(dtype=next_param_dtype(sdr_to_columns_fn, torch.float32))
@@ -475,6 +480,8 @@ class BiologicalAssociativeCortex(nn.Module):
                 recalled_columns = F.rms_norm(rec_raw, (self.column_dim,), eps=1e-6)
             else:
                 recalled_columns = rec_raw * torch.rsqrt(rec_raw.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+            if (not compute_metrics) and (not force_hopfield) and best_sim_t is not None:
+                recalled_columns = recalled_columns * (best_sim_t >= hopfield_min_sim).to(dtype=recalled_columns.dtype)
 
         context_columns, context_mask = self.build_context_columns(
             columns_star=columns_star,

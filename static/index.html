@@ -717,6 +717,7 @@
             <button type="button" onclick="applyPipelinePreset('quick')" title="Szybki test wszystkich etapów (~10 min)">⚡ Szybki test (~10 min)</button>
             <button type="button" onclick="applyPipelinePreset('standard')" title="Zalecany pełny trening (~45-60 min)">🎯 Standard (~45–60 min)</button>
             <button type="button" onclick="applyPipelinePreset('full')" title="Długi trening nocny pod duże modele / PEER">🌙 Pełny / Nocny</button>
+            <button type="button" onclick="applyPipelinePreset('llm_pro')" title="Tryb LLM-Pro: kontekst dosłowny + encyklopedia faktów + Artykuły na Medal" style="border-color:var(--cyan);color:var(--cyan)">🧠 Tryb LLM-Pro (Kontekst + Fakty)</button>
           </div>
 
           <div class="pipe-grid">
@@ -789,6 +790,8 @@
               <div class="pipe-fields">
                 <label class="pipe-chk"><input type="checkbox" id="pp_dt_freeze" checked onchange="savePipelinePlanToStorage()"> Zamroź Wernicke (stabilne SDR)</label>
                 <label class="pipe-chk"><input type="checkbox" id="pp_dt_recall" checked onchange="savePipelinePlanToStorage()"> Ucz czytania slotów Hipokampu</label>
+                <label class="pipe-chk"><input type="checkbox" id="pp_dt_verbatim" checked onchange="savePipelinePlanToStorage()"> Kontekst dosłowny (tryb LLM)</label>
+                <label class="pipe-chk"><input type="checkbox" id="pp_dt_factqa" checked onchange="savePipelinePlanToStorage()"> Baza Faktów Q&amp;A + [Pamięć]</label>
               </div>
             </div>
 
@@ -799,9 +802,14 @@
               <div class="pipe-fields">
                 <label class="pipe-chk"><input type="checkbox" id="pp_kn_elem" checked onchange="savePipelinePlanToStorage()"> Szkoła Podstawowa</label>
                 <label class="pipe-chk"><input type="checkbox" id="pp_kn_course" checked onchange="savePipelinePlanToStorage()"> Kurs łączenia pojęć</label>
+                <label class="pipe-chk"><input type="checkbox" id="pp_kn_curated" checked onchange="savePipelinePlanToStorage()"> Baza Faktów (Encyklopedia)</label>
                 <label class="pipe-chk"><input type="checkbox" id="pp_kn_facts" checked onchange="savePipelinePlanToStorage()"> Fakty i logika z Bielika</label>
               </div>
               <div class="pipe-fields">
+                <div class="pipe-field">
+                  <span>Wiki Medalowe (0–250)</span>
+                  <input type="number" id="pp_kn_wiki_feat" min="0" max="250" value="30" onchange="savePipelinePlanToStorage()" />
+                </div>
                 <div class="pipe-field">
                   <span>Turbo-tematy z sieci (0–300)</span>
                   <input type="number" id="pp_kn_turbo" min="0" max="300" value="0" onchange="savePipelinePlanToStorage()" />
@@ -897,6 +905,7 @@
           <div class="chips">
             <button id="schoolBtn" onclick="installSchoolFoundation()" style="padding:5px 10px;font-size:12px">Podstawy szkolne</button>
             <button id="courseBtn" onclick="startConceptCourse()" style="padding:5px 10px;font-size:12px" title="60 modułów przyczynowości, analogii i twórczego budowania zdań">🎓 Kurs Wiedzy i Łączenia Pojęć (60 modułów)</button>
+            <button id="factsStudyBtn" onclick="startFactKnowledgeStudy()" style="padding:5px 10px;font-size:12px" title="105+ sprawdzonych haseł encyklopedycznych + Artykuły na Medal Wikipedii PL">📚 Baza Faktów (Encyklopedia + Wiki Medalowe)</button>
             <button id="trainLangBtn" onclick="trainLanguageNow()" style="padding:5px 10px;font-size:12px">Wykształć dialogi</button>
             <button id="continuousStudyBtn" onclick="startContinuousLearning(60)" style="padding:5px 10px;font-size:12px">Auto-nauka 1h</button>
             <button id="schoolWebBtn" onclick="startSchoolWebCourse()" style="padding:5px 10px;font-size:12px">Kurs z Wikipedii</button>
@@ -1880,8 +1889,8 @@
         parquet: { enabled: true, filename: "__ALL__", max_steps: 2000, target_loss: 2.1, batch_size: 0 },
         bielik_dialogues: { enabled: true, num_dialogues: 100 },
         bielik_reasoning: { enabled: true, num_samples: 80 },
-        dialogue_train: { enabled: true, epochs: 45, target_loss: 0.70, freeze_wernicke: true, train_recalled_columns: true },
-        knowledge: { enabled: true, include_elementary: true, include_synthesis_course: true, include_bielik_facts: true, turbo_topics: 0 },
+        dialogue_train: { enabled: true, epochs: 45, target_loss: 0.70, freeze_wernicke: true, train_recalled_columns: true, use_verbatim_prompt: true, include_fact_qa: true },
+        knowledge: { enabled: true, include_elementary: true, include_synthesis_course: true, include_curated_facts: true, fetch_wiki_featured: 0, include_bielik_facts: true, turbo_topics: 0 },
         sleep: { enabled: true, cycles: 1 },
       },
       standard: {
@@ -1889,8 +1898,8 @@
         parquet: { enabled: true, filename: "__ALL__", max_steps: 10000, target_loss: 1.50, batch_size: 0 },
         bielik_dialogues: { enabled: true, num_dialogues: 400 },
         bielik_reasoning: { enabled: true, num_samples: 200 },
-        dialogue_train: { enabled: true, epochs: 65, target_loss: 0.65, freeze_wernicke: true, train_recalled_columns: true },
-        knowledge: { enabled: true, include_elementary: true, include_synthesis_course: true, include_bielik_facts: true, turbo_topics: 0 },
+        dialogue_train: { enabled: true, epochs: 65, target_loss: 0.65, freeze_wernicke: true, train_recalled_columns: true, use_verbatim_prompt: true, include_fact_qa: true },
+        knowledge: { enabled: true, include_elementary: true, include_synthesis_course: true, include_curated_facts: true, fetch_wiki_featured: 30, include_bielik_facts: true, turbo_topics: 0 },
         sleep: { enabled: true, cycles: 1 },
       },
       full: {
@@ -1898,8 +1907,17 @@
         parquet: { enabled: true, filename: "__ALL__", max_steps: 40000, target_loss: 1.35, batch_size: 0 },
         bielik_dialogues: { enabled: true, num_dialogues: 1000 },
         bielik_reasoning: { enabled: true, num_samples: 500 },
-        dialogue_train: { enabled: true, epochs: 90, target_loss: 0.55, freeze_wernicke: true, train_recalled_columns: true },
-        knowledge: { enabled: true, include_elementary: true, include_synthesis_course: true, include_bielik_facts: true, turbo_topics: 100 },
+        dialogue_train: { enabled: true, epochs: 90, target_loss: 0.55, freeze_wernicke: true, train_recalled_columns: true, use_verbatim_prompt: true, include_fact_qa: true },
+        knowledge: { enabled: true, include_elementary: true, include_synthesis_course: true, include_curated_facts: true, fetch_wiki_featured: 60, include_bielik_facts: true, turbo_topics: 100 },
+        sleep: { enabled: true, cycles: 2 },
+      },
+      llm_pro: {
+        preset: "Tryb LLM-Pro",
+        parquet: { enabled: true, filename: "__ALL__", max_steps: 25000, target_loss: 1.40, batch_size: 0 },
+        bielik_dialogues: { enabled: true, num_dialogues: 800 },
+        bielik_reasoning: { enabled: true, num_samples: 450 },
+        dialogue_train: { enabled: true, epochs: 110, target_loss: 0.45, freeze_wernicke: true, train_recalled_columns: true, use_verbatim_prompt: true, include_fact_qa: true },
+        knowledge: { enabled: true, include_elementary: true, include_synthesis_course: true, include_curated_facts: true, fetch_wiki_featured: 80, include_bielik_facts: true, turbo_topics: 0 },
         sleep: { enabled: true, cycles: 2 },
       },
     };
@@ -1929,9 +1947,13 @@
       setVal("pp_dt_loss", dt.target_loss);
       setChk("pp_dt_freeze", dt.freeze_wernicke);
       setChk("pp_dt_recall", dt.train_recalled_columns);
+      setChk("pp_dt_verbatim", dt.use_verbatim_prompt !== undefined ? dt.use_verbatim_prompt : true);
+      setChk("pp_dt_factqa", dt.include_fact_qa !== undefined ? dt.include_fact_qa : true);
       setChk("pp_kn_en", kn.enabled);
       setChk("pp_kn_elem", kn.include_elementary);
       setChk("pp_kn_course", kn.include_synthesis_course !== undefined ? kn.include_synthesis_course : true);
+      setChk("pp_kn_curated", kn.include_curated_facts !== undefined ? kn.include_curated_facts : true);
+      setVal("pp_kn_wiki_feat", kn.fetch_wiki_featured !== undefined ? kn.fetch_wiki_featured : 30);
       setChk("pp_kn_facts", kn.include_bielik_facts);
       setVal("pp_kn_turbo", kn.turbo_topics);
       setChk("pp_sl_en", sl.enabled);
@@ -1966,11 +1988,15 @@
           target_loss: Math.max(0.01, getNum("pp_dt_loss", 0.65)),
           freeze_wernicke: getChk("pp_dt_freeze", true),
           train_recalled_columns: getChk("pp_dt_recall", true),
+          use_verbatim_prompt: getChk("pp_dt_verbatim", true),
+          include_fact_qa: getChk("pp_dt_factqa", true),
         },
         knowledge: {
           enabled: getChk("pp_kn_en", true),
           include_elementary: getChk("pp_kn_elem", true),
           include_synthesis_course: getChk("pp_kn_course", true),
+          include_curated_facts: getChk("pp_kn_curated", true),
+          fetch_wiki_featured: Math.max(0, Math.min(250, Math.round(getNum("pp_kn_wiki_feat", 30)))),
           include_bielik_facts: getChk("pp_kn_facts", true),
           turbo_topics: Math.max(0, Math.round(getNum("pp_kn_turbo", 0))),
         },
@@ -2030,9 +2056,14 @@
         const peerTxt = mode === "PEER" && peer.ram_bank_mb
           ? ` · RAM bank: ${Number(peer.ram_bank_mb).toFixed(0)} MB · Hit: ${Number(peer.hit_rate_pct || 0).toFixed(1)}%`
           : "";
+        const vbReady = Boolean(lc.broca_verbatim_ready);
+        const vbTxt = vbReady
+          ? `<span style="color:var(--green)">Kontekst dosłowny: AKTYWNY</span>`
+          : `<span style="color:var(--amber)">Kontekst dosłowny: tylko Z* (wytrenuj LLM-Pro)</span>`;
+        const factsCnt = Number(s.fact_knowledge_count || 0);
         infoEl.innerHTML =
-          `<span>🧬 Tryb Broca: <strong>${escapeHtml(mode)}</strong> (${fmtP(totB)} total / ${fmtP(actB)} aktywnych)</span>` +
-          `<span class="sub">${escapeHtml(vramTxt)}${escapeHtml(peerTxt)}</span>`;
+          `<span>🧬 Tryb Broca: <strong>${escapeHtml(mode)}</strong> (${fmtP(totB)} total / ${fmtP(actB)} aktywnych) · ${vbTxt}</span>` +
+          `<span class="sub">Fakty: ${factsCnt} · ${escapeHtml(vramTxt)}${escapeHtml(peerTxt)}</span>`;
       }
 
       const ppFileSel = document.getElementById("pp_pq_file");
@@ -2276,6 +2307,14 @@
       trainingFeedCollapsed = false;
       const res = await api("/api/study/course", {});
       if (!res.ok) alert(res.error || "Nie udało się uruchomić Kursu Wiedzy i Łączenia Pojęć.");
+      await poll();
+    }
+
+    async function startFactKnowledgeStudy() {
+      savedDialoguesPreview = null;
+      trainingFeedCollapsed = false;
+      const res = await api("/api/study/facts", { fetch_wiki_featured: 60, train_epochs: 35 });
+      if (!res.ok) alert(res.error || "Nie udało się uruchomić Bazy Faktów.");
       await poll();
     }
 

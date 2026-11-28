@@ -253,6 +253,16 @@ class BrainServer:
                         self._send_json({"ok": True, **res})
                         return
 
+                    if parsed.path == "/api/study/facts":
+                        wiki_n = int(body.get("fetch_wiki_featured", 60))
+                        ep_n = int(body.get("train_epochs", 35))
+                        res = brain.start_fact_knowledge_study_async(
+                            fetch_wiki_featured=wiki_n,
+                            train_epochs=ep_n,
+                        )
+                        self._send_json({"ok": True, **res})
+                        return
+
                     if parsed.path == "/api/dmn/think":
                         res = brain.run_dmn_2hop_step(non_blocking=True)
                         clean_res = None
@@ -299,6 +309,10 @@ class BrainServer:
                             brain.auto_sleep = bool(body["auto_sleep"])
                         if "auto_web" in body:
                             brain.auto_web = bool(body["auto_web"])
+                        if "dmn_enabled" in body:
+                            brain.cfg.dmn_enabled = bool(body["dmn_enabled"])
+                        if "dmn_always_think" in body:
+                            brain.cfg.dmn_always_think = bool(body["dmn_always_think"])
                         if "creativity_level" in body:
                             lvl = max(0.0, min(1.0, float(body["creativity_level"])))
                             brain.creativity_level = lvl
@@ -307,6 +321,8 @@ class BrainServer:
                             "ok": True,
                             "auto_sleep": brain.auto_sleep,
                             "auto_web": brain.auto_web,
+                            "dmn_enabled": bool(getattr(brain.cfg, "dmn_enabled", True)),
+                            "dmn_always_think": bool(getattr(brain.cfg, "dmn_always_think", True)),
                             "creativity_level": brain.creativity_level,
                             "creativity_score": brain.creativity_score(),
                         })

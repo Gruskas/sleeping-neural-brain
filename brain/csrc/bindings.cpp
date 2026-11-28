@@ -55,6 +55,8 @@ void launch_peer_backward_update_cuda(
     bool x_bf16,
     const void* slot_ids,
     bool slots_i64,
+    const void* uniq_slots,
+    const int64_t* inv_slot_ids,
     const float* weights,
     const float* pre_act,
     void* cache_u,
@@ -65,10 +67,9 @@ void launch_peer_backward_update_cuda(
     float* grad_weights,
     float* g_u,
     float* g_v,
-    int32_t* slot_touched,
     int64_t n_tokens,
     int64_t k_tot,
-    int64_t num_slots,
+    int64_t u_slots,
     int64_t dim,
     float lr,
     float weight_decay,
@@ -298,17 +299,27 @@ std::tuple<torch::Tensor, torch::Tensor> peer_backward_update_cuda(
     }
 
     bool active_update = do_update && (lr > 0.0) && (num_slots > 0);
-    torch::Tensor g_u, g_v, slot_touched;
+    torch::Tensor uniq_slots, inv_slot_ids, g_u, g_v;
+    const void* uniq_ptr = nullptr;
+    const int64_t* inv_ptr = nullptr;
     float* gu_ptr = nullptr;
     float* gv_ptr = nullptr;
-    int32_t* touched_ptr = nullptr;
+    int64_t u_slots = 0;
     if (active_update) {
-        g_u = torch::zeros({num_slots, dim}, x_c.options().dtype(torch::kFloat32));
-        g_v = torch::zeros({num_slots, dim}, x_c.options().dtype(torch::kFloat32));
-        slot_touched = torch::zeros({num_slots}, x_c.options().dtype(torch::kInt32));
-        gu_ptr = g_u.data_ptr<float>();
-        gv_ptr = g_v.data_ptr<float>();
-        touched_ptr = slot_touched.data_ptr<int32_t>();
+        auto uniq_res = at::_unique2(slots_c.reshape({-1}), false, true, false);
+        uniq_slots = std::get<0>(uniq_res).contiguous();
+        inv_slot_ids = std::get<1>(uniq_res).to(torch::kInt64).contiguous();
+        u_slots = uniq_slots.size(0);
+        if (u_slots > 0) {
+            g_u = torch::zeros({u_slots, dim}, x_c.options().dtype(torch::kFloat32));
+            g_v = torch::zeros({u_slots, dim}, x_c.options().dtype(torch::kFloat32));
+            uniq_ptr = uniq_slots.data_ptr();
+            inv_ptr = inv_slot_ids.data_ptr<int64_t>();
+            gu_ptr = g_u.data_ptr<float>();
+            gv_ptr = g_v.data_ptr<float>();
+        } else {
+            active_update = false;
+        }
     }
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream(x_c.device().index()).stream();
@@ -318,6 +329,8 @@ std::tuple<torch::Tensor, torch::Tensor> peer_backward_update_cuda(
         x_c.scalar_type() == torch::kBFloat16,
         slots_c.data_ptr(),
         slots_c.scalar_type() == torch::kInt64,
+        uniq_ptr,
+        inv_ptr,
         w_c.data_ptr<float>(),
         pre_c.data_ptr<float>(),
         cache_u.data_ptr(),
@@ -328,10 +341,9 @@ std::tuple<torch::Tensor, torch::Tensor> peer_backward_update_cuda(
         grad_weights.data_ptr<float>(),
         gu_ptr,
         gv_ptr,
-        touched_ptr,
         n_tokens,
         k_tot,
-        num_slots,
+        u_slots,
         dim,
         static_cast<float>(lr),
         static_cast<float>(weight_decay),

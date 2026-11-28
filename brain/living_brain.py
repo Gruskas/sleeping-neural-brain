@@ -11,6 +11,7 @@ import psutil
 import torch
 import torch.nn.functional as F
 
+from .cuda_ops import CUDA_GRAPH_CAPTURE_LOCK
 from .fp8_synapse import QuantizedSynapseMatrix, resolve_bio_synapse_mode, tensor_or_qmat_bytes
 from .sensory_wernicke import k_wta
 
@@ -1318,13 +1319,17 @@ class LivingBrainEngine:
             while not self._stop_event.is_set():
                 if not self._pause_event.is_set():
                     try:
-                        # Non-blocking acquire so spontaneous background NEVER stalls chat or training
-                        if self.lock.acquire(blocking=False):
+                        # Non-blocking acquire so spontaneous background NEVER stalls chat, training, or CUDA Graph capture
+                        if CUDA_GRAPH_CAPTURE_LOCK.acquire(blocking=False):
                             try:
-                                if not self._pause_event.is_set():
-                                    self.cognitive_step(sensory_vec=None, allow_growth=False, spontaneous=True)
+                                if self.lock.acquire(blocking=False):
+                                    try:
+                                        if not self._pause_event.is_set():
+                                            self.cognitive_step(sensory_vec=None, allow_growth=False, spontaneous=True)
+                                    finally:
+                                        self.lock.release()
                             finally:
-                                self.lock.release()
+                                CUDA_GRAPH_CAPTURE_LOCK.release()
                     except Exception:
                         pass
                     cb = self._idle_callback

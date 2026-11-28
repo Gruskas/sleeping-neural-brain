@@ -355,14 +355,53 @@ class WernickeByteCortex(nn.Module):
     def total_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    def sdr_to_columns(self, sdr: torch.Tensor) -> torch.Tensor:
+    def sdr_to_columns(
+        self,
+        sdr: torch.Tensor,
+        active_indices: torch.Tensor | None = None,
+        active_values: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Map sparse cortical state z [B, N] into 16 cortical columns Z [B, 16, D].
-        Combines learned symmetric-tanh expansion with a frozen orthogonal SDR residual basis
-        so distinct SDR inputs ALWAYS remain sharply separated in Z* space.
+        When `active_indices` & `active_values` [B, K] are provided, computes both
+        `sdr_expand_in` and `sdr @ sdr_orth_basis` sparsely over the K active indices
+        instead of dense [B, N] x [N, N] matmul (while staying identical when called with `sdr` alone).
         """
         b = sdr.shape[0]
-        h = torch.tanh(self.sdr_expand_norm(self.sdr_expand_in(sdr)))
+        if active_indices is not None and active_values is not None:
+            idx_long = active_indices.to(device=sdr.device, dtype=torch.long)
+            k = idx_long.shape[1]
+            flat_idx = idx_long.reshape(-1)
+            w_in = self.sdr_expand_in.weight
+            val_w = active_values.to(device=sdr.device, dtype=w_in.dtype)
+            w_sel = w_in.index_select(1, flat_idx).view(w_in.shape[0], b, k).permute(1, 2, 0)
+            exp_in = torch.bmm(val_w.unsqueeze(1), w_sel).squeeze(1)
+            if self.sdr_expand_in.bias is not None:
+                exp_in = exp_in + self.sdr_expand_in.bias
+            h = torch.tanh(self.sdr_expand_norm(exp_in))
+            learned_cols = self.sdr_expand_out(h).view(b, self.num_columns, self.column_dim)
+
+            orth_dtype = self.sdr_orth_basis.dtype if (sdr.device.type == "cuda" and self.sdr_orth_basis.dtype == torch.bfloat16) else sdr.dtype
+            orth_basis_d = self.sdr_orth_basis if self.sdr_orth_basis.dtype == orth_dtype else self.sdr_orth_basis.to(dtype=orth_dtype)
+            chunk_b = 8
+            if b <= chunk_b:
+                orth_sel = orth_basis_d.index_select(0, flat_idx).view(b, k, -1)
+                orth_flat = torch.bmm(active_values.to(device=sdr.device, dtype=orth_dtype).unsqueeze(1), orth_sel).squeeze(1)
+            else:
+                chunks: list[torch.Tensor] = []
+                for s in range(0, b, chunk_b):
+                    e = min(b, s + chunk_b)
+                    cb = e - s
+                    f_c = idx_long[s:e].reshape(-1)
+                    o_sel = orth_basis_d.index_select(0, f_c).view(cb, k, -1)
+                    v_c = active_values[s:e].to(device=sdr.device, dtype=orth_dtype).unsqueeze(1)
+                    chunks.append(torch.bmm(v_c, o_sel).squeeze(1))
+                orth_flat = torch.cat(chunks, dim=0)
+            orth_cols = orth_flat.to(dtype=learned_cols.dtype).view(b, self.num_columns, self.column_dim)
+            return self.sdr_col_norm(0.65 * learned_cols + 0.65 * orth_cols)
+
+        sdr_in = sdr if sdr.dtype == self.sdr_expand_in.weight.dtype else sdr.to(dtype=self.sdr_expand_in.weight.dtype)
+        h = torch.tanh(self.sdr_expand_norm(self.sdr_expand_in(sdr_in)))
         learned_cols = self.sdr_expand_out(h).view(b, self.num_columns, self.column_dim)
         if sdr.device.type == "cuda" and self.sdr_orth_basis.dtype == torch.bfloat16:
             # Avoid allocating/copying the 600 MB float32 [12288, 12288] basis on every call!
@@ -479,7 +518,11 @@ class WernickeByteCortex(nn.Module):
         sdr = sdr.to(dtype=columns.dtype)
 
         # 5) Bottleneck reconstruction into 16 cortical columns (raw text is gone)
-        recon_cols = self.sdr_to_columns(sdr)
+        recon_cols = self.sdr_to_columns(
+            sdr,
+            active_indices=top_idx,
+            active_values=top_val.to(dtype=sdr.dtype),
+        )
         sparsity_pct = round(100.0 * (top_idx.shape[-1] / float(self.num_neurons)), 2)
 
         return WernickeOutput(

@@ -8,3 +8,7 @@ transformers>=4.48.0
 accelerate>=1.0.0
 safetensors>=0.4.5
 huggingface_hub>=0.26.0
+datasets>=3.0.0
+speakleash>=0.3.2
+wn>=0.9.5
+requests>=2.31.0

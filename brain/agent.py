@@ -32,14 +32,23 @@ from .curriculum import (
     ELEMENTARY_WEB_SYLLABUS,
     get_concept_synthesis_qa_pairs,
 )
+from .fact_sources import (
+    build_fact_training_pairs,
+    count_fact_knowledge_records,
+    fetch_curated_polish_facts,
+    get_fact_engram_texts,
+)
 from .hippocampus import Hippocampus
 from .language_cortex import LanguageCortex, _strip_pl
+from .neural_language import format_verbatim_broca_prompt
+from .corpus_fetcher import load_corpus_2hop_facts, load_corpus_qa_pairs
 from .language_trainer import (
     _short_answer_from_fact,
     PARQUET_CORPORA_CATALOG,
     ensure_parquet_corpora,
     inspect_parquet_corpus,
     iter_parquet_polish_pairs,
+    iter_processed_corpus_pairs,
     list_parquet_corpora,
     try_prefrontal_math,
 )
@@ -100,6 +109,7 @@ def normalize_training_pipeline_plan(plan: dict[str, Any] | None, cfg: BrainConf
             "target_loss": max(0.05, min(10.0, float(pq_in.get("target_loss", 1.50)))),
             "batch_size": _opt_int(pq_in.get("batch_size"), 1, 512),
             "lr": _opt_float(pq_in.get("lr"), 1e-6, 1e-1),
+            "include_polish_corpora": bool(pq_in.get("include_polish_corpora", True)),
         },
         "bielik_dialogues": {
             "enabled": bool(bd_in.get("enabled", True)),
@@ -115,12 +125,18 @@ def normalize_training_pipeline_plan(plan: dict[str, Any] | None, cfg: BrainConf
             "target_loss": max(0.01, min(10.0, float(dt_in.get("target_loss", cfg.broca_dialogue_early_stop_loss)))),
             "freeze_wernicke": freeze_val,
             "train_recalled_columns": bool(dt_in.get("train_recalled_columns", True)),
+            "use_verbatim_prompt": bool(dt_in.get("use_verbatim_prompt", True)),
+            "include_fact_qa": bool(dt_in.get("include_fact_qa", True)),
+            "include_polish_corpora": bool(dt_in.get("include_polish_corpora", True)),
         },
         "knowledge": {
             "enabled": bool(kn_in.get("enabled", True)),
             "include_elementary": bool(kn_in.get("include_elementary", True)),
             "include_bielik_facts": bool(kn_in.get("include_bielik_facts", True)),
             "include_synthesis_course": bool(kn_in.get("include_synthesis_course", True)),
+            "include_curated_facts": bool(kn_in.get("include_curated_facts", True)),
+            "include_polish_corpora": bool(kn_in.get("include_polish_corpora", True)),
+            "fetch_wiki_featured": max(0, min(250, int(kn_in.get("fetch_wiki_featured", 0)))),
             "turbo_topics": max(0, min(300, int(kn_in.get("turbo_topics", 0)))),
         },
         "sleep": {
@@ -389,10 +405,12 @@ class SleepingBrain:
                 sparsity_pct=self.cortex.last_sparsity_pct,
                 target_bank="rem" if tag == "rem_2hop" else "short_term",
             )
+            scratchpad_text = str(res.get("scratchpad") or "").strip()
             log_kind = "REM" if tag == "rem_2hop" else "DMN"
+            sp_note = f" [MYŚL: {scratchpad_text[:60]}]" if scratchpad_text else ""
             self._log(
                 log_kind,
-                f"💡 Myśl 2-hop ({tag}): „{thought_text}” | Most: [{id_a}] „{lbl_a[:56]}” "
+                f"💡 Myśl 2-hop ({tag}): „{thought_text}”{sp_note} | Most: [{id_a}] „{lbl_a[:56]}” "
                 f"—([{id_b}] „{lbl_b[:44]}”)→ [{id_c}] „{lbl_c[:56]}”",
             )
             record_entry = {
@@ -402,6 +420,7 @@ class SleepingBrain:
                 "engram_id": saved_engram["id"],
                 "bank": saved_engram["bank"],
                 "thought": thought_text,
+                "scratchpad": scratchpad_text,
                 "parent_ids": [id_a, id_b, id_c],
                 "parent_labels": {"a": lbl_a[:80], "b": lbl_b[:80], "c": lbl_c[:80]},
                 "sim_ab": bridge_meta.get("sim_ab") if bridge_meta else None,
@@ -425,9 +444,29 @@ class SleepingBrain:
             thought_vec=thought_sdr,
         )
 
+        # 3) Local synaptic consolidation in BiologicalAssociativeCortex W_rec (@torch.no_grad())
+        cortex_stats: dict[str, Any] = {}
+        try:
+            with torch.no_grad():
+                sdr_a_f = F.normalize(sdr_a.to(device=self.device, dtype=torch.float32).reshape(-1), dim=-1, eps=1e-6)
+                sdr_c_f = F.normalize(sdr_c.to(device=self.device, dtype=torch.float32).reshape(-1), dim=-1, eps=1e-6)
+                t_sdr_f = F.normalize(thought_sdr.to(device=self.device, dtype=torch.float32).reshape(-1), dim=-1, eps=1e-6)
+                sdrs_triple = torch.stack([sdr_a_f, sdr_c_f, t_sdr_f], dim=0)
+                w_dt = next(self.language_cortex._wernicke_raw.parameters()).dtype
+                cols_triple = self.language_cortex._wernicke_raw.sdr_to_columns(sdrs_triple.to(dtype=w_dt))
+                cortex_stats = self.cortex.learn_local(
+                    sensory_columns=cols_triple,
+                    z_batch=sdrs_triple,
+                    steps=1,
+                    noise_std=0.01,
+                )
+        except Exception:
+            pass
+
         res["engram_id"] = saved_engram["id"]
         res["engram"] = saved_engram
         res["oja_stats"] = oja_stats
+        res["cortex_stats"] = cortex_stats
         return res
 
     def run_dmn_2hop_step(self, non_blocking: bool = True) -> dict[str, Any] | None:
@@ -442,25 +481,22 @@ class SleepingBrain:
             else:
                 self.lock.acquire()
             try:
-                if self._is_busy_for_dmn() or len(self.hippocampus.semantic) < 3:
+                total_engrams = (
+                    len(self.hippocampus.semantic)
+                    + len(self.hippocampus.short_term)
+                    + len(self.hippocampus.rem)
+                )
+                if self._is_busy_for_dmn() or total_engrams < 3:
                     return None
                 bridge = self.hippocampus.sample_2hop_bridge(
                     min_hop_sim=float(getattr(self.cfg, "dmn_bridge_min_hop_sim", 0.32)),
                     max_direct_sim=float(getattr(self.cfg, "dmn_bridge_max_direct_sim", 0.25)),
                     current_day=self.day,
+                    include_short_term=True,
+                    relaxed_min_hop_sim=float(getattr(self.cfg, "dmn_relaxed_min_hop_sim", 0.22)),
+                    relaxed_max_direct_sim=float(getattr(self.cfg, "dmn_relaxed_max_direct_sim", 0.45)),
+                    allow_fallback=True,
                 )
-                if bridge is None:
-                    bridge = self.hippocampus.sample_2hop_bridge(
-                        min_hop_sim=0.18,
-                        max_direct_sim=0.55,
-                        current_day=self.day,
-                    )
-                if bridge is None:
-                    bridge = self.hippocampus.sample_2hop_bridge(
-                        min_hop_sim=0.0,
-                        max_direct_sim=1.01,
-                        current_day=self.day,
-                    )
             finally:
                 self.lock.release()
 
@@ -488,15 +524,41 @@ class SleepingBrain:
         """
         if not bool(getattr(self.cfg, "dmn_enabled", True)):
             return
+        if not bool(getattr(self.cfg, "dmn_always_think", True)):
+            return
         if self._is_busy_for_dmn() or self._dmn_running.is_set():
             return
         now = time.monotonic()
-        idle_delay = float(getattr(self.cfg, "idle_think_delay_sec", 50.0))
-        think_interval = float(getattr(self.cfg, "dmn_think_interval_sec", 40.0))
+        idle_delay = float(getattr(self.cfg, "idle_think_delay_sec", 15.0))
+        think_interval = float(getattr(self.cfg, "dmn_think_interval_sec", 12.0))
         if (now - self._last_user_activity_ts) < idle_delay:
             return
         if (now - self._last_dmn_think_ts) < think_interval:
             return
+
+        # Auto-consolidate accumulated short-term thoughts when idle
+        max_st = int(getattr(self.cfg, "dmn_max_short_term_auto_sleep", 16))
+        if self.auto_sleep and max_st > 0 and len(self.hippocampus.short_term) >= max_st:
+            auto_t = getattr(self, "_dmn_auto_sleep_thread", None)
+            if auto_t is None or not auto_t.is_alive():
+                def _bg_sleep() -> None:
+                    try:
+                        if self._is_busy_for_dmn():
+                            return
+                        self._acquire_op("sleep")
+                        try:
+                            self.sleep_now(visual_pacing=False, _from_nested=True)
+                        finally:
+                            self._release_op("sleep")
+                    except Exception:
+                        pass
+
+                self._dmn_auto_sleep_thread = threading.Thread(
+                    target=_bg_sleep, daemon=True, name="dmn-auto-sleep"
+                )
+                self._dmn_auto_sleep_thread.start()
+                return
+
         self._last_dmn_think_ts = now
         self.run_dmn_2hop_step(non_blocking=True)
 
@@ -757,6 +819,40 @@ class SleepingBrain:
                 return joined
             segments.pop(0)
         return ""
+
+    def _build_verbatim_broca_prompt(
+        self,
+        current_msg: str,
+        recalled_facts: list[str] | None = None,
+        max_turns: int = 5,
+    ) -> str:
+        """
+        Build a lossless multi-turn UTF-8 byte prompt (with recalled Hippocampus facts)
+        so Broca can read literal details without losing them inside Z* compression.
+        """
+        cur = (current_msg or "").strip()
+        if not cur:
+            return ""
+        with self.lock:
+            recent = list(self.working_chat[-(max_turns * 2 + 1) :])
+        if recent and recent[-1].get("role") == "user" and str(recent[-1].get("content", "")).strip() == cur:
+            recent = recent[:-1]
+        recent = recent[-(max_turns * 2) :]
+
+        lines: list[str] = []
+        for item in recent:
+            role_tag = "U" if item.get("role") == "user" else "A"
+            txt = re.sub(r"\s+", " ", str(item.get("content", "")).strip())
+            if not txt:
+                continue
+            if len(txt) > 200:
+                txt = txt[:197].rstrip() + "..."
+            lines.append(f"{role_tag}: {txt}")
+        lines.append(f"U: {cur}")
+        lines.append("A:")
+        raw_ctx = "\n".join(lines) + " "
+        max_b = int(getattr(self.cfg, "broca_max_prompt_bytes", 512))
+        return format_verbatim_broca_prompt(raw_ctx, recalled_facts=recalled_facts, max_bytes=max_b)
 
     @staticmethod
     def _extract_conversational_qa_pairs(msg: str) -> list[tuple[str, str]]:
@@ -1176,6 +1272,249 @@ class SleepingBrain:
             self._release_op("study")
             raise
         return {"started": True, "topic": "Kurs Wiedzy i Łączenia Pojęć"}
+
+    def _ingest_curated_fact_engrams(self, max_items: int = 800) -> int:
+        items = get_fact_engram_texts(self.state_dir, include_offline=True, max_items=max_items)
+        if not items:
+            return 0
+        with self.lock:
+            existing_labels = {
+                (m.preview_label or "").strip().lower()
+                for m in list(self.hippocampus.short_term.meta) + list(self.hippocampus.semantic.meta)
+                if m.preview_label
+            }
+        fresh_texts: list[str] = []
+        for _dom, _title, fact_txt in items:
+            key = fact_txt[:180].strip().lower()
+            if key and key not in existing_labels:
+                existing_labels.add(key)
+                fresh_texts.append(fact_txt)
+        if not fresh_texts:
+            return 0
+        ids = self._ingest_sensory_texts(
+            texts=fresh_texts,
+            category="wiedza",
+            importances=[4] * len(fresh_texts),
+            topic="Baza Faktów (Encyklopedia + Wikipedia)",
+            pinned_flags=[False] * len(fresh_texts),
+        )
+        added = len(ids)
+        with self.lock:
+            self.hippocampus.studied_topics["baza faktów"] = {
+                "topic": "Baza Faktów (Encyklopedia + Wikipedia)",
+                "mastery": 95.0,
+                "facts_learned": added,
+                "pages_read": 0,
+                "day": self.day,
+                "summary": f"Zakodowano {added} sprawdzonych faktów encyklopedycznych i medalowych do SDR.",
+                "sources": [],
+            }
+            self._log("STUDY", f"📚 Zasilono Hipokamp Bazą Faktów (+{added} engramów SDR).")
+        return added
+
+    def _ingest_processed_corpus_facts(self, max_items: int = 800) -> int:
+        items = load_corpus_2hop_facts(self.base_dir, max_items=max_items)
+        if not items:
+            return 0
+        with self.lock:
+            existing_labels = {
+                (m.preview_label or "").strip().lower()
+                for m in list(self.hippocampus.short_term.meta) + list(self.hippocampus.semantic.meta)
+                if m.preview_label
+            }
+        fresh_texts: list[str] = []
+        for it in items:
+            txt = str(it.get("text") or "").strip()
+            key = txt[:180].lower()
+            if key and key not in existing_labels:
+                existing_labels.add(key)
+                fresh_texts.append(txt)
+        if not fresh_texts:
+            return 0
+        ids = self._ingest_sensory_texts(
+            texts=fresh_texts,
+            category="wiedza",
+            importances=[4] * len(fresh_texts),
+            topic="Korpusy PL + Graf 2-hop",
+            pinned_flags=[False] * len(fresh_texts),
+        )
+        added = len(ids)
+        with self.lock:
+            self._log("STUDY", f"🧠 Zasilono Hipokamp faktami i ścieżkami 2-hop z polskich korpusów (+{added} engramów).")
+        return added
+
+    def run_fact_knowledge_study(
+        self,
+        fetch_wiki_featured: int = 60,
+        train_epochs: int = 35,
+        consolidate: bool = True,
+        _op_acquired: bool = False,
+    ) -> dict[str, Any]:
+        """Fetch curated Polish Wikipedia featured facts, ingest into Hippocampus, and fine-tune Broca verbatim."""
+        if not _op_acquired:
+            self._acquire_op("study")
+        eff_wiki = max(0, min(250, int(fetch_wiki_featured)))
+        eff_epochs = max(1, min(200, int(train_epochs)))
+        with self.lock:
+            self._study_stop_event.clear()
+            self.state_mode = "STUDYING"
+            self.study_state = {
+                "active": True,
+                "topic": "📚 Baza Faktów (Encyklopedia + Wiki Medalowe)",
+                "round": 0,
+                "max_rounds": eff_epochs,
+                "mastery": 5.0,
+                "pages_read": 0,
+                "facts_learned": 0,
+                "current_action": "Pobieram sprawdzone artykuły medalowe i dobre z Wikipedii PL...",
+                "sources": [],
+                "summary": "",
+            }
+        try:
+            wiki_res = {"added": 0, "errors": 0, "total_saved": count_fact_knowledge_records(self.state_dir)}
+            if eff_wiki > 0 and not self._study_stop_event.is_set():
+                wiki_res = fetch_curated_polish_facts(
+                    self.state_dir,
+                    target_count=eff_wiki,
+                    stop_event=self._study_stop_event,
+                    progress_callback=lambda st: self._sync_study_progress(
+                        round_n=int(st.get("done", 0)),
+                        max_r=max(1, int(st.get("target", eff_wiki))),
+                        pct=min(25.0, 25.0 * float(st.get("done", 0)) / max(1, float(st.get("target", eff_wiki)))),
+                        action=f"Pobieram fakty Wiki: {st.get('done', 0)}/{st.get('target', eff_wiki)}...",
+                    ),
+                )
+
+            added_facts = self._ingest_curated_fact_engrams()
+            fact_pairs = build_fact_training_pairs(
+                self.state_dir,
+                include_offline=True,
+                include_grounded_memory=True,
+                include_multiturn=True,
+                max_pairs=900,
+            )
+            pq_replay = self._sample_parquet_replay_pairs(limit=160)
+            with self.lock:
+                engram_bank = self.hippocampus.get_hopfield_bank()
+                self.study_state["pages_read"] = int(wiki_res.get("added", 0))
+                self.study_state["facts_learned"] = added_facts
+                self.study_state["mastery"] = 35.0
+                self.study_state["current_action"] = (
+                    f"Trenuję Broca na {len(fact_pairs)} parach faktów [Pamięć]+Q&A ({eff_epochs} epok)..."
+                )
+
+            def _on_fact_prog(st: dict[str, Any]) -> None:
+                ep = int(st.get("epoch", 0))
+                tot = max(1, int(st.get("total_epochs", eff_epochs)))
+                loss_n = float(st.get("loss_now", 0.0))
+                pct = 35.0 + 55.0 * (ep / tot)
+                with self.lock:
+                    self.study_state["round"] = ep
+                    self.study_state["max_rounds"] = tot
+                    self.study_state["mastery"] = round(min(92.0, pct), 1)
+                    self.study_state["current_action"] = f"Baza Faktów · Epoka {ep}/{tot} · loss {loss_n:.2f}"
+                    if st.get("fresh_probe") and st.get("sample_q"):
+                        self._push_training_dialogue(
+                            mode="dialogue_train",
+                            tag=f"Baza Faktów {ep}/{tot} · loss {loss_n:.2f}",
+                            prompt_role="Pytanie",
+                            prompt=str(st["sample_q"]),
+                            teacher_role="Wzorzec",
+                            teacher_reply=str(st.get("sample_target", "")),
+                            brain_role="Twój mózg (na żywo)",
+                            brain_reply=str(st.get("sample_brain", "")) or "(odpowiada...)",
+                        )
+
+            train_res = self.language_cortex.train_dialogue_finetune(
+                pairs=fact_pairs,
+                cortex=self.cortex,
+                engram_bank=engram_bank,
+                epochs=eff_epochs,
+                lr=self.cfg.broca_dialogue_lr,
+                label_smoothing=self.cfg.broca_dialogue_label_smoothing,
+                early_stop_loss=self.cfg.broca_dialogue_early_stop_loss,
+                register_questions=False,
+                progress_callback=_on_fact_prog,
+                stop_event=self._study_stop_event,
+                priority_probe_pairs=fact_pairs[:80],
+                freeze_wernicke=self.language_cortex.broca_module.trained_steps > 0,
+                train_recalled_columns=True,
+                train_working_memory=True,
+                parquet_replay_pairs=pq_replay,
+                use_verbatim_prompt=True,
+            )
+            self.language_cortex._register_known_questions(
+                [q for q, _ in fact_pairs if not q.startswith("[Pamięć]") and "Kontekst rozmowy:" not in q][:250],
+                replace=False,
+            )
+            self.language_cortex.ensure_familiarity_bank(force_rebuild=False)
+            if consolidate and len(self.hippocampus.short_term) > 0 and not self._study_stop_event.is_set():
+                self.sleep_now(visual_pacing=False, _from_nested=True)
+
+            self.save_state()
+            with self.lock:
+                total_sem = len(self.hippocampus.semantic)
+                done_msg = (
+                    f"📚 Zakończono **Bazę Faktów** (+{wiki_res.get('added', 0)} z Wikipedii PL, "
+                    f"+{added_facts} engramów, par Q&A: {len(fact_pairs)}, "
+                    f"loss {train_res.get('loss_start', 0)}→{train_res.get('loss_end', 0)})."
+                )
+                self.study_state["mastery"] = 100.0
+                self.study_state["current_action"] = done_msg
+                self._log("STUDY", done_msg)
+                self._append_chat(
+                    "assistant",
+                    done_msg,
+                    meta={"kind": "study_done", "topic": "Baza Faktów", "facts": added_facts},
+                    add_to_working=False,
+                )
+            return {
+                "wiki_added": int(wiki_res.get("added", 0)),
+                "added_facts": added_facts,
+                "fact_pairs": len(fact_pairs),
+                "total_semantic": total_sem,
+                "train_result": train_res,
+            }
+        finally:
+            with self.lock:
+                self.study_state["active"] = False
+                self.study_state["current_action"] = ""
+                if self.state_mode == "STUDYING":
+                    self.state_mode = "AWAKE"
+            if not _op_acquired:
+                self._release_op("study")
+
+    def _sync_study_progress(self, *, round_n: int, max_r: int, pct: float, action: str) -> None:
+        with self.lock:
+            self.study_state["round"] = round_n
+            self.study_state["max_rounds"] = max_r
+            self.study_state["mastery"] = round(pct, 1)
+            self.study_state["current_action"] = action
+
+    def start_fact_knowledge_study_async(self, fetch_wiki_featured: int = 60, train_epochs: int = 35) -> dict[str, Any]:
+        self._acquire_op("study")
+        with self.lock:
+            self._study_stop_event.clear()
+            self.training_dialogue_feed.clear()
+            self.state_mode = "STUDYING"
+        try:
+            t = threading.Thread(
+                target=self.run_fact_knowledge_study,
+                kwargs={
+                    "fetch_wiki_featured": fetch_wiki_featured,
+                    "train_epochs": train_epochs,
+                    "consolidate": True,
+                    "_op_acquired": True,
+                },
+                daemon=True,
+            )
+            t.start()
+        except Exception:
+            with self.lock:
+                self.state_mode = "AWAKE"
+            self._release_op("study")
+            raise
+        return {"started": True, "topic": "Baza Faktów (Encyklopedia + Wiki Medalowe)"}
 
     def start_curriculum_async(self, deep_web: bool = False, max_topics: int = 12) -> dict[str, Any]:
         if not deep_web:
@@ -2254,8 +2593,9 @@ class SleepingBrain:
         try:
             # Start from a rotating row group based on trained_steps so repeated runs read fresh articles
             start_rg = int(self.language_cortex.broca_module.trained_steps // 200)
-            res = self.language_cortex.train_parquet_polish_stream(
-                pair_iterable_factory=lambda: iter_parquet_polish_pairs(
+
+            def _combined_corpus_pairs() -> Iterator[tuple[str, str]]:
+                pq_it = iter_parquet_polish_pairs(
                     paths if len(paths) > 1 else paths[0],
                     continuation_ratio=0.35,
                     min_chars=32,
@@ -2264,7 +2604,22 @@ class SleepingBrain:
                     start_row_group=start_rg,
                     min_quality_score=0.45,
                     min_language_score=0.85,
-                ),
+                )
+                ext_it = iter_processed_corpus_pairs(
+                    self.base_dir,
+                    continuation_ratio=0.35,
+                    min_chars=32,
+                    max_chars=230,
+                )
+                for pq_pair in pq_it:
+                    yield pq_pair
+                    try:
+                        yield next(ext_it)
+                    except StopIteration:
+                        pass
+
+            res = self.language_cortex.train_parquet_polish_stream(
+                pair_iterable_factory=_combined_corpus_pairs,
                 max_steps=steps,
                 batch_size=bs,
                 lr=lr,
@@ -3145,6 +3500,7 @@ class SleepingBrain:
         parquet_ran = False
         bielik_dial_done = False
         bielik_reas_done = False
+        wiki_facts_fetched_in_run = False
         bielik_dial_enabled = norm["bielik_dialogues"]["enabled"] and norm["bielik_dialogues"]["num_dialogues"] > 0
         bielik_reas_enabled = norm["bielik_reasoning"]["enabled"] and norm["bielik_reasoning"]["num_samples"] > 0
         dialogue_enabled = norm["dialogue_train"]["enabled"]
@@ -3351,6 +3707,24 @@ class SleepingBrain:
                     elif s_key == "dialogue_train":
                         self._restore_brain_to_device()
                         dt_cfg = norm["dialogue_train"]
+                        kn_cfg_pre = norm["knowledge"]
+                        if (
+                            kn_cfg_pre["enabled"]
+                            and kn_cfg_pre.get("fetch_wiki_featured", 0) > 0
+                            and not wiki_facts_fetched_in_run
+                            and not self._study_stop_event.is_set()
+                        ):
+                            _sync_stage(idx, 2.0, summary=f"Pobieram fakty Wiki ({kn_cfg_pre['fetch_wiki_featured']})...")
+                            try:
+                                fetch_curated_polish_facts(
+                                    self.state_dir,
+                                    target_count=kn_cfg_pre["fetch_wiki_featured"],
+                                    stop_event=self._study_stop_event,
+                                )
+                            except Exception:
+                                pass
+                            wiki_facts_fetched_in_run = True
+
                         all_teacher_pairs = load_teacher_dialogues(self.state_dir)
                         all_reasoning_pairs = [
                             (r["q"], r["a"])
@@ -3358,6 +3732,20 @@ class SleepingBrain:
                             if not is_ai_corporate_reply(r["a"])
                         ]
                         combined_pairs = all_teacher_pairs + all_reasoning_pairs
+                        if dt_cfg.get("include_fact_qa", True):
+                            fact_cap = 40 if int(dt_cfg["epochs"]) <= 5 else 1400
+                            combined_pairs.extend(
+                                build_fact_training_pairs(
+                                    self.state_dir,
+                                    include_offline=True,
+                                    include_grounded_memory=True,
+                                    include_multiturn=True,
+                                    max_pairs=fact_cap,
+                                )
+                            )
+                        if dt_cfg.get("include_polish_corpora", True):
+                            qa_cap = 40 if int(dt_cfg["epochs"]) <= 5 else 800
+                            combined_pairs.extend(load_corpus_qa_pairs(self.base_dir, max_pairs=qa_cap))
                         eff_freeze = (
                             bool(dt_cfg["freeze_wernicke"])
                             if dt_cfg["freeze_wernicke"] is not None
@@ -3418,6 +3806,7 @@ class SleepingBrain:
                             freeze_wernicke=eff_freeze,
                             train_recalled_columns=dt_cfg["train_recalled_columns"],
                             parquet_replay_pairs=pq_replay,
+                            use_verbatim_prompt=dt_cfg.get("use_verbatim_prompt", True),
                         )
                         self.language_cortex.ensure_familiarity_bank(force_rebuild=True)
                         stage_results["dialogue_train"] = res_dt
@@ -3442,6 +3831,32 @@ class SleepingBrain:
                             added_total += added_course
                             parts_note.append(f"Kurs pojęć +{added_course}")
                             _sync_stage(idx, 45.0, summary=" · ".join(parts_note))
+
+                        if kn_cfg.get("fetch_wiki_featured", 0) > 0 and not wiki_facts_fetched_in_run and not self._study_stop_event.is_set():
+                            try:
+                                w_res = fetch_curated_polish_facts(
+                                    self.state_dir,
+                                    target_count=kn_cfg["fetch_wiki_featured"],
+                                    stop_event=self._study_stop_event,
+                                )
+                                parts_note.append(f"Wiki +{int(w_res.get('added', 0))}")
+                            except Exception:
+                                pass
+                            wiki_facts_fetched_in_run = True
+                            _sync_stage(idx, 52.0, summary=" · ".join(parts_note))
+
+                        if kn_cfg.get("include_curated_facts", True) and not self._study_stop_event.is_set():
+                            added_cur = self._ingest_curated_fact_engrams()
+                            added_total += added_cur
+                            parts_note.append(f"Fakty +{added_cur}")
+                            _sync_stage(idx, 62.0, summary=" · ".join(parts_note))
+
+                        if kn_cfg.get("include_polish_corpora", True) and not self._study_stop_event.is_set():
+                            added_corp = self._ingest_processed_corpus_facts()
+                            if added_corp > 0:
+                                added_total += added_corp
+                                parts_note.append(f"Korpusy PL +{added_corp}")
+                                _sync_stage(idx, 66.0, summary=" · ".join(parts_note))
 
                         if kn_cfg["include_bielik_facts"] and not self._study_stop_event.is_set():
                             t_pairs = load_teacher_dialogues(self.state_dir)
@@ -3762,6 +4177,41 @@ class SleepingBrain:
         recent_topic = self._extract_recent_topic() if is_followup else ""
         ctx_text = self._build_conversation_context_text(msg)
         has_recent_chat = bool(ctx_text)
+        pre_recalled_facts: list[str] = []
+        if not is_smalltalk and len(msg.strip()) >= 4:
+            try:
+                with self.lock:
+                    pre_rec = self.hippocampus.recall_all_banks(
+                        query_sdr=w_out.sdr[0],
+                        current_day=self.day,
+                        top_hippo=2,
+                        top_semantic=3,
+                        top_rem=1,
+                        min_sim=0.46,
+                    )
+                cand_snippets: list[tuple[float, str]] = []
+                for bank_k in ("semantic", "hippocampus", "rem"):
+                    b_dict = pre_rec.get(bank_k) or {}
+                    for sc, lbl in zip(b_dict.get("scores") or [], b_dict.get("labels") or []):
+                        s_lbl = re.sub(r"\s+", " ", str(lbl or "")).strip()
+                        if (
+                            len(s_lbl) >= 20
+                            and not s_lbl.startswith("__")
+                            and s_lbl.lower() != msg.strip().lower()
+                        ):
+                            cand_snippets.append((float(sc), s_lbl))
+                cand_snippets.sort(key=lambda item: item[0], reverse=True)
+                seen_sn: set[str] = set()
+                for _sc, sn in cand_snippets:
+                    sk = sn[:60].lower()
+                    if sk not in seen_sn:
+                        seen_sn.add(sk)
+                        pre_recalled_facts.append(sn[:180])
+                    if len(pre_recalled_facts) >= 2:
+                        break
+            except Exception:
+                pre_recalled_facts = []
+        verbatim_prompt = self._build_verbatim_broca_prompt(msg, recalled_facts=pre_recalled_facts)
         can_auto_web = (
             self.auto_web
             and q_fam < 0.78
@@ -3813,6 +4263,10 @@ class SleepingBrain:
                         with self.lock:
                             engram_bank = self.hippocampus.get_hopfield_bank()
                         w_out, q_fam, _ = self.language_cortex.perceive_for_chat(msg)
+                        if lead not in pre_recalled_facts:
+                            pre_recalled_facts.insert(0, lead[:180])
+                            pre_recalled_facts = pre_recalled_facts[:2]
+                            verbatim_prompt = self._build_verbatim_broca_prompt(msg, recalled_facts=pre_recalled_facts)
                         auto_web_note = (
                             f"Auto-sieć sprawdziła „{best_doc.title}”, zakodowała do SDR i zaktualizowała Z* (loss={new_loss:.2f})"
                         )
@@ -3942,6 +4396,7 @@ class SleepingBrain:
                 living_telemetry=lb_tel,
                 working_memory_slots=wm_slots if (wm_slots is not None and q_fam < 0.85) else None,
                 context_user_message=ctx_text if (ctx_text and q_fam < 0.82) else None,
+                verbatim_prompt=verbatim_prompt,
             )
             w_out = delib["w_out"]
             thought = delib["thought"]
@@ -3991,6 +4446,7 @@ class SleepingBrain:
                         stream_iter = iter([draft])
                 else:
                     ctx_cols = thought.context_columns if thought.context_columns is not None else thought.columns_star
+                    vp_fallback = verbatim_prompt if self.language_cortex.broca_module.supports_verbatim_prompt else None
                     stream_iter = self.language_cortex.broca_module.generate_stream(
                         memory_columns=ctx_cols,
                         max_new_bytes=self.cfg.broca_max_new_bytes,
@@ -3998,6 +4454,7 @@ class SleepingBrain:
                         top_p=self.cfg.broca_top_p,
                         repetition_penalty=self.cfg.broca_repetition_penalty,
                         memory_mask=thought.context_mask,
+                        prompt_text=vp_fallback,
                     )
 
         with self.lock:
@@ -5014,6 +5471,7 @@ class SleepingBrain:
                     "saved_dialogues": count_teacher_dialogues(self.state_dir),
                     "saved_reasoning": count_reasoning_dialogues(self.state_dir),
                 },
+                "fact_knowledge_count": count_fact_knowledge_records(self.state_dir, include_offline=True),
                 "self_correction_enabled": self.cfg.self_correction_enabled,
                 "study": {
                     **dict(self.study_state),
@@ -5054,6 +5512,8 @@ class SleepingBrain:
                     "attractor_steps": self.cortex.last_attractor_steps,
                     "fluency": lc_fluency,
                     "trained_steps": self.language_cortex.broca_module.trained_steps,
+                    "broca_verbatim_ready": self.language_cortex.broca_module.supports_verbatim_prompt,
+                    "broca_verbatim_steps": self.language_cortex.broca_module.verbatim_prompt_steps,
                     "last_loss": lc_loss,
                     "core_knowledge_summary": self.language_cortex.core_knowledge_summary,
                 },
@@ -5084,12 +5544,16 @@ class SleepingBrain:
                 "sleep_history": self.sleep_history[-15:],
                 "event_log": self.event_log[-35:],
                 "dmn_thoughts": self.dmn_thoughts[-25:],
+                "dmn_active": bool(self._dmn_running.is_set()),
+                "dmn_total_thoughts": len(self.dmn_thoughts),
+                "dmn_always_think": bool(getattr(self.cfg, "dmn_always_think", True)),
                 "dmn_status": {
                     "enabled": bool(getattr(self.cfg, "dmn_enabled", True)),
+                    "always_think": bool(getattr(self.cfg, "dmn_always_think", True)),
                     "thinking_now": self._dmn_running.is_set(),
                     "idle_seconds": round(max(0.0, time.monotonic() - self._last_user_activity_ts), 1),
-                    "idle_delay_sec": float(getattr(self.cfg, "idle_think_delay_sec", 25.0)),
-                    "interval_sec": float(getattr(self.cfg, "dmn_think_interval_sec", 25.0)),
+                    "idle_delay_sec": float(getattr(self.cfg, "idle_think_delay_sec", 15.0)),
+                    "interval_sec": float(getattr(self.cfg, "dmn_think_interval_sec", 12.0)),
                     "semantic_count": len(self.hippocampus.semantic),
                     "total_thoughts": len(self.dmn_thoughts),
                 },

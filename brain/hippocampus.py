@@ -133,6 +133,17 @@ class TensorEngramBank:
     def is_pair_explored(self, id_a: str, id_c: str) -> bool:
         return self._canonical_pair(id_a, id_c) in self.explored_pairs
 
+    def evict_oldest_explored_pairs(self, frac: float = 0.25) -> int:
+        """Evict the oldest `frac` (default 25%) entries from `explored_pairs` LRU."""
+        if not self.explored_pairs:
+            return 0
+        n_evict = max(1, int(len(self.explored_pairs) * max(0.0, min(1.0, float(frac)))))
+        evicted = 0
+        for _ in range(min(n_evict, len(self.explored_pairs))):
+            self.explored_pairs.popitem(last=False)
+            evicted += 1
+        return evicted
+
     def __len__(self) -> int:
         return int(self.engrams.shape[0])
 
@@ -676,6 +687,164 @@ class Hippocampus:
         }
 
     @torch.no_grad()
+    def _sample_combined_2hop_bridge(
+        self,
+        banks: list[TensorEngramBank],
+        min_hop_sim: float,
+        max_direct_sim: float,
+        max_attempts: int,
+        recent_days_window: int,
+        current_day: int | None,
+        mark_explored: bool,
+    ) -> dict[str, Any] | None:
+        non_empty = [b for b in banks if len(b) > 0]
+        total_n = sum(len(b) for b in non_empty)
+        if total_n < 3:
+            return None
+
+        sdr_chunks: list[torch.Tensor] = []
+        day_chunks: list[torch.Tensor] = []
+        imp_chunks: list[torch.Tensor] = []
+        meta_all: list[EngramMeta] = []
+        for b in non_empty:
+            s = b.engrams.dequant_all(out_dtype=torch.float32)
+            s = F.normalize(s, dim=-1, eps=1e-6)
+            sdr_chunks.append(s)
+            day_chunks.append(b.days_created.to(device=s.device))
+            imp_chunks.append(b.importances.to(device=s.device))
+            meta_all.extend(b.meta)
+
+        e_mat = torch.cat(sdr_chunks, dim=0)
+        days_all = torch.cat(day_chunks, dim=0)
+        imp_all = torch.cat(imp_chunks, dim=0)
+        n = int(e_mat.shape[0])
+        if n > 4096:
+            keep_idx = torch.topk(imp_all, k=4096, largest=True).indices
+            e_mat = e_mat.index_select(0, keep_idx)
+            days_all = days_all.index_select(0, keep_idx)
+            imp_all = imp_all.index_select(0, keep_idx)
+            keep_list = keep_idx.cpu().tolist()
+            meta_all = [meta_all[i] for i in keep_list]
+            n = len(meta_all)
+
+        weights = imp_all.clamp(min=0.5).float().clone()
+        if current_day is not None and recent_days_window > 0:
+            recent_mask = days_all >= (int(current_day) - int(recent_days_window))
+            if recent_mask.any() and random.random() < 0.55:
+                weights = torch.where(recent_mask, weights * 2.0, weights)
+        k_starts = min(max(1, int(max_attempts)), n)
+        start_indices = torch.multinomial(weights, num_samples=k_starts, replacement=False).cpu().tolist()
+
+        def _pack_node(idx: int) -> dict[str, Any]:
+            m = meta_all[idx]
+            return {
+                "index": int(idx),
+                "id": m.id,
+                "sdr": e_mat[idx].to(dtype=torch.bfloat16).detach().clone(),
+                "day": int(days_all[idx].item()),
+                "importance": float(imp_all[idx].item()),
+                "topic": m.topic,
+                "category": m.category,
+                "preview_label": m.preview_label,
+            }
+
+        def _build_res(idx_a: int, idx_b: int, idx_c: int, sim_ab: float, sim_bc: float, sim_ac: float) -> dict[str, Any]:
+            if mark_explored:
+                self.semantic.mark_pair_explored(meta_all[idx_a].id, meta_all[idx_c].id)
+            node_a = _pack_node(idx_a)
+            node_b = _pack_node(idx_b)
+            node_c = _pack_node(idx_c)
+            ctx_a = (meta_all[idx_a].topic or meta_all[idx_a].category or "").strip().lower()
+            ctx_c = (meta_all[idx_c].topic or meta_all[idx_c].category or "").strip().lower()
+            return {
+                "a": node_a,
+                "b": node_b,
+                "c": node_c,
+                "sim_ab": round(sim_ab, 4),
+                "sim_bc": round(sim_bc, 4),
+                "sim_ac": round(sim_ac, 4),
+                "cross_day": bool(node_a["day"] != node_c["day"]),
+                "cross_context": bool(ctx_a != ctx_c),
+            }
+
+        # Stage A: try relaxed thresholds across combined banks
+        for idx_a in start_indices:
+            sim_a = e_mat @ e_mat[idx_a]
+            sim_a[idx_a] = -1.0
+            b_cand_idx = torch.nonzero(sim_a >= float(min_hop_sim), as_tuple=False).squeeze(-1)
+            if b_cand_idx.numel() == 0:
+                continue
+            b_sims = sim_a.index_select(0, b_cand_idx)
+            kb = min(8, int(b_cand_idx.numel()))
+            top_b_rel = torch.topk(b_sims, k=kb, largest=True, sorted=True).indices
+            b_indices = b_cand_idx.index_select(0, top_b_rel).cpu().tolist()
+            day_a = int(days_all[idx_a].item())
+            meta_a = meta_all[idx_a]
+            ctx_a = (meta_a.topic or meta_a.category or "").strip().lower()
+            diff_day_vec = (days_all != day_a).float()
+
+            for idx_b in b_indices:
+                sim_b = e_mat @ e_mat[idx_b]
+                c_mask = (sim_b >= float(min_hop_sim)) & (sim_a <= float(max_direct_sim))
+                c_mask[idx_a] = False
+                c_mask[idx_b] = False
+                c_cand_idx = torch.nonzero(c_mask, as_tuple=False).squeeze(-1)
+                if c_cand_idx.numel() == 0:
+                    continue
+                c_sim_b = sim_b.index_select(0, c_cand_idx)
+                c_sim_a = sim_a.index_select(0, c_cand_idx)
+                c_diff_d = diff_day_vec.index_select(0, c_cand_idx)
+                c_scores = c_sim_b + 0.35 * c_diff_d + 0.15 * (1.0 - c_sim_a.clamp(min=0.0))
+                kc = min(24, int(c_cand_idx.numel()))
+                top_c_rel = torch.topk(c_scores, k=kc, largest=True, sorted=True).indices
+                c_indices = c_cand_idx.index_select(0, top_c_rel).cpu().tolist()
+                c_score_vals = c_scores.index_select(0, top_c_rel).cpu().tolist()
+                ranked_c: list[tuple[float, int]] = []
+                for idx_c, sc in zip(c_indices, c_score_vals):
+                    meta_c = meta_all[idx_c]
+                    ctx_c = (meta_c.topic or meta_c.category or "").strip().lower()
+                    ctx_bonus = 0.20 if (ctx_a and ctx_c and ctx_a != ctx_c) else 0.0
+                    ranked_c.append((float(sc) + ctx_bonus, int(idx_c)))
+                ranked_c.sort(key=lambda item: item[0], reverse=True)
+                for _, idx_c in ranked_c:
+                    if self.semantic.is_pair_explored(meta_a.id, meta_all[idx_c].id):
+                        continue
+                    return _build_res(
+                        idx_a, idx_b, idx_c,
+                        float(sim_a[idx_b].item()), float(sim_b[idx_c].item()), float(sim_a[idx_c].item()),
+                    )
+
+        # Stage B: ultimate distant-pair + best-mediator fallback so DMN never starves when >= 3 engrams exist
+        best_ac_score = -1e9
+        best_pair: tuple[int, int] | None = None
+        for idx_a in start_indices:
+            sim_a = e_mat @ e_mat[idx_a]
+            imp_a = float(imp_all[idx_a].item())
+            pair_scores = (imp_a + imp_all) * 0.15 + (1.0 - sim_a.clamp(min=-1.0))
+            pair_scores[idx_a] = -1e9
+            top_c_idx = torch.topk(pair_scores, k=min(n - 1, 32), largest=True).indices.cpu().tolist()
+            for idx_c in top_c_idx:
+                if idx_c == idx_a or self.semantic.is_pair_explored(meta_all[idx_a].id, meta_all[idx_c].id):
+                    continue
+                sc = float(pair_scores[idx_c].item())
+                if sc > best_ac_score:
+                    best_ac_score = sc
+                    best_pair = (idx_a, idx_c)
+        if best_pair is None:
+            return None
+        idx_a, idx_c = best_pair
+        sim_a = e_mat @ e_mat[idx_a]
+        sim_c = e_mat @ e_mat[idx_c]
+        bridge_scores = sim_a + sim_c
+        bridge_scores[idx_a] = -1e9
+        bridge_scores[idx_c] = -1e9
+        idx_b = int(torch.argmax(bridge_scores).item())
+        return _build_res(
+            idx_a, idx_b, idx_c,
+            float(sim_a[idx_b].item()), float(sim_c[idx_b].item()), float(sim_a[idx_c].item()),
+        )
+
+    @torch.no_grad()
     def sample_2hop_bridge(
         self,
         min_hop_sim: float = 0.45,
@@ -684,9 +853,19 @@ class Hippocampus:
         recent_days_window: int = 3,
         current_day: int | None = None,
         mark_explored: bool = True,
+        include_short_term: bool = True,
+        relaxed_min_hop_sim: float = 0.22,
+        relaxed_max_direct_sim: float = 0.45,
+        allow_fallback: bool = True,
     ) -> dict[str, Any] | None:
-        """Discover a novel 2-hop conceptual bridge A -> B -> C on GPU over semantic memory."""
-        return self.semantic.sample_2hop_bridge(
+        """
+        Discover a novel 2-hop conceptual bridge A -> B -> C on GPU:
+          1. Strict search over `semantic`.
+          2. If `semantic` has < 3 engrams or strict search finds nothing (and `allow_fallback=True`),
+             combine `semantic` + `short_term` (+ `rem` if needed) with relaxed thresholds and an
+             ultimate distant-pair + best-mediator fallback. Evicts oldest 25% of `explored_pairs` if exhausted.
+        """
+        strict = self.semantic.sample_2hop_bridge(
             min_hop_sim=min_hop_sim,
             max_direct_sim=max_direct_sim,
             max_attempts=max_attempts,
@@ -694,6 +873,38 @@ class Hippocampus:
             current_day=current_day,
             mark_explored=mark_explored,
         )
+        if strict is not None or not allow_fallback:
+            return strict
+
+        banks: list[TensorEngramBank] = [self.semantic]
+        if include_short_term:
+            banks.append(self.short_term)
+        if sum(len(b) for b in banks) < 3 or len(self.rem) > 0:
+            banks.append(self.rem)
+        if sum(len(b) for b in banks) < 3:
+            return None
+
+        res = self._sample_combined_2hop_bridge(
+            banks=banks,
+            min_hop_sim=relaxed_min_hop_sim,
+            max_direct_sim=relaxed_max_direct_sim,
+            max_attempts=max_attempts,
+            recent_days_window=recent_days_window,
+            current_day=current_day,
+            mark_explored=mark_explored,
+        )
+        if res is None and len(self.semantic.explored_pairs) > 0:
+            self.semantic.evict_oldest_explored_pairs(0.25)
+            res = self._sample_combined_2hop_bridge(
+                banks=banks,
+                min_hop_sim=relaxed_min_hop_sim,
+                max_direct_sim=relaxed_max_direct_sim,
+                max_attempts=max_attempts,
+                recent_days_window=recent_days_window,
+                current_day=current_day,
+                mark_explored=mark_explored,
+            )
+        return res
 
     @torch.no_grad()
     def record_engrams_batch(

@@ -103,7 +103,7 @@ class TestDMN2HopConceptGraph(unittest.TestCase):
         seen_pairs: set[tuple[str, str]] = set()
         found_cross_day = False
         for _ in range(10):
-            br = hippo.sample_2hop_bridge(min_hop_sim=0.45, max_direct_sim=0.25, current_day=5)
+            br = hippo.sample_2hop_bridge(min_hop_sim=0.45, max_direct_sim=0.25, current_day=5, allow_fallback=False)
             if br is None:
                 break
             id_a, id_b, id_c = br["a"]["id"], br["b"]["id"], br["c"]["id"]
@@ -119,7 +119,7 @@ class TestDMN2HopConceptGraph(unittest.TestCase):
 
         self.assertGreaterEqual(len(seen_pairs), 2)
         self.assertTrue(found_cross_day, "Expected at least one cross-day bridge")
-        self.assertIsNone(hippo.sample_2hop_bridge(min_hop_sim=0.45, max_direct_sim=0.25, current_day=5))
+        self.assertIsNone(hippo.sample_2hop_bridge(min_hop_sim=0.45, max_direct_sim=0.25, current_day=5, allow_fallback=False))
         self.assertEqual(len(hippo.semantic.explored_pairs), len(seen_pairs))
 
     def test_02_synthesize_2hop_quality_gate_rejects_bad_and_accepts_good(self) -> None:

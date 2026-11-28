@@ -96,8 +96,9 @@ class _CachedPEERFunction(torch.autograd.Function):
                     cache_u,
                     cache_v,
                 )
-            ctx.save_for_backward(x_flat.detach(), weights.detach(), expert_ids, pre_act)
+            ctx.save_for_backward(x_flat.detach(), weights.detach(), expert_ids, slot_ids, pre_act)
             ctx.peer = peer_module
+            ctx.cache_epoch = int(peer_module._cache_epoch)
             ctx.training = bool(training)
             ctx.used_cuda_ext = True
             return out.to(dtype=x_flat.dtype)
@@ -119,8 +120,9 @@ class _CachedPEERFunction(torch.autograd.Function):
                 aw = (act * weights[s:e].detach().float()).to(dtype=cache_dtype)
                 out[s:e] = torch.bmm(aw.unsqueeze(1), v_sel).squeeze(1)
 
-        ctx.save_for_backward(x_flat.detach(), weights.detach(), expert_ids)
+        ctx.save_for_backward(x_flat.detach(), weights.detach(), expert_ids, slot_ids)
         ctx.peer = peer_module
+        ctx.cache_epoch = int(peer_module._cache_epoch)
         ctx.training = bool(training)
         ctx.used_cuda_ext = False
         return out.to(dtype=x_flat.dtype)
@@ -129,9 +131,12 @@ class _CachedPEERFunction(torch.autograd.Function):
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
         peer: PEERMicroExpertFFN = ctx.peer
         if getattr(ctx, "used_cuda_ext", False) and HAS_CUDA_EXT and peer.cache_u.is_cuda:
-            x_flat, weights, expert_ids, pre_act = ctx.saved_tensors
+            x_flat, weights, expert_ids, saved_slots, pre_act = ctx.saved_tensors
             if x_flat.is_cuda:
-                slot_ids = peer._ensure_experts_cached(expert_ids, count_stats=False)
+                if getattr(ctx, "cache_epoch", -1) == int(peer._cache_epoch):
+                    slot_ids = saved_slots
+                else:
+                    slot_ids = peer._ensure_experts_cached(expert_ids, count_stats=False)
                 lr = float(peer.peer_lr)
                 wd = float(peer.weight_decay)
                 do_update = bool(ctx.training and lr > 0.0 and x_flat.shape[0] > 0)
@@ -159,14 +164,17 @@ class _CachedPEERFunction(torch.autograd.Function):
                     None,
                 )
 
-        x_flat, weights, expert_ids = ctx.saved_tensors[:3]
+        x_flat, weights, expert_ids, saved_slots = ctx.saved_tensors[:4]
         n_tokens, d = x_flat.shape
         k_tot = expert_ids.shape[1]
         device = x_flat.device
         cache_dtype = peer.cache_dtype
 
-        # Re-resolve slots (100% cache hit in normal batches; safe reload if forward chunked > C)
-        slot_ids = peer._ensure_experts_cached(expert_ids, count_stats=False)
+        # Reuse forward slot_ids when cache_epoch is unchanged (zero torch.unique + CPU sync!)
+        if getattr(ctx, "cache_epoch", -1) == int(peer._cache_epoch):
+            slot_ids = saved_slots
+        else:
+            slot_ids = peer._ensure_experts_cached(expert_ids, count_stats=False)
         uniq_slots, inv = torch.unique(slot_ids.reshape(-1), return_inverse=True)
 
         grad_x = torch.empty((n_tokens, d), device=device, dtype=torch.float32)
@@ -329,6 +337,7 @@ class PEERMicroExpertFFN(nn.Module):
         self._init_cache(device=torch.device("cpu"))
 
         self._step_counter: int = 0
+        self._cache_epoch: int = 0
         self.cache_hits: int = 0
         self.cache_misses: int = 0
         self._use_cuda_ext: bool = bool(HAS_CUDA_EXT)
@@ -459,7 +468,7 @@ class PEERMicroExpertFFN(nn.Module):
     def flush_dirty_to_ram(self) -> int:
         if self._use_cuda_ext and HAS_CUDA_EXT and self.cache_u.is_cuda:
             stg_uq, stg_us, stg_vq, stg_vs = self._ensure_staging_buffers()
-            return int(
+            n_flushed = int(
                 peer_flush_dirty_cpp(
                     self.cache_u,
                     self.cache_v,
@@ -476,6 +485,9 @@ class PEERMicroExpertFFN(nn.Module):
                     self._next_seed(),
                 )
             )
+            if n_flushed > 0:
+                self._cache_epoch += 1
+            return n_flushed
         dirty_slots = (self.slot_dirty & (self.slot_to_expert >= 0)).nonzero(as_tuple=False).squeeze(-1)
         n_flushed = int(dirty_slots.numel())
         if n_flushed == 0:
@@ -483,6 +495,7 @@ class PEERMicroExpertFFN(nn.Module):
         expert_ids = self.slot_to_expert.index_select(0, dirty_slots).long()
         self._write_back_slots_to_ram(dirty_slots, expert_ids)
         self.slot_dirty.index_fill_(0, dirty_slots, False)
+        self._cache_epoch += 1
         return n_flushed
 
     @torch.no_grad()
@@ -517,6 +530,7 @@ class PEERMicroExpertFFN(nn.Module):
         self.slot_last_step.fill_(-1)
         self.slot_dirty.zero_()
         self._step_counter = 0
+        self._cache_epoch += 1
         return True
 
     @torch.no_grad()
@@ -558,6 +572,8 @@ class PEERMicroExpertFFN(nn.Module):
                 self._next_seed(),
             )
             self._step_counter = int(new_step)
+            if int(n_miss) > 0:
+                self._cache_epoch += 1
             if count_stats:
                 self.cache_hits += int(n_hits)
                 self.cache_misses += int(n_miss)
@@ -616,6 +632,8 @@ class PEERMicroExpertFFN(nn.Module):
             self.slot_to_expert.index_copy_(0, victim_slots, miss_experts.to(dtype=torch.int32))
             self.expert_to_slot.index_copy_(0, miss_experts, victim_slots.to(dtype=torch.int32))
 
+        if n_miss > 0:
+            self._cache_epoch += 1
         self._step_counter += 1
         active_slots = self.expert_to_slot.index_select(0, uniq_ids).long()
         self.slot_last_step.index_fill_(0, active_slots, self._step_counter)

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <tuple>
 
 void launch_peer_quantize_evict_cuda(
@@ -42,6 +43,27 @@ void launch_peer_dequant_scatter_cuda(
 namespace {
 
 constexpr int64_t kPinStep = (int64_t(1) << 62);
+
+std::mutex g_stage_evt_mu;
+cudaEvent_t g_stage_event = nullptr;
+bool g_stage_event_pending = false;
+
+void sync_stage_event() {
+    std::lock_guard<std::mutex> lock(g_stage_evt_mu);
+    if (g_stage_event != nullptr && g_stage_event_pending) {
+        C10_CUDA_CHECK(cudaEventSynchronize(g_stage_event));
+        g_stage_event_pending = false;
+    }
+}
+
+void record_stage_event(cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(g_stage_evt_mu);
+    if (g_stage_event == nullptr) {
+        C10_CUDA_CHECK(cudaEventCreateWithFlags(&g_stage_event, cudaEventDisableTiming));
+    }
+    C10_CUDA_CHECK(cudaEventRecord(g_stage_event, stream));
+    g_stage_event_pending = true;
+}
 
 void copy_rows_from_ram(
     const int64_t* exp_ids,
@@ -137,6 +159,8 @@ void flush_slots_to_ram_impl(
 
     auto dirty_exp_cpu = dirty_experts.to(torch::kInt64).cpu().contiguous();
 
+    sync_stage_event();
+
     torch::Tensor stg_uq = (n_dirty <= stage_u_q.size(0)) ? stage_u_q.slice(0, 0, n_dirty) : torch::empty({n_dirty, dim}, torch::kInt8);
     torch::Tensor stg_us = (n_dirty <= stage_u_scale.size(0)) ? stage_u_scale.slice(0, 0, n_dirty) : torch::empty({n_dirty}, torch::kFloat16);
     torch::Tensor stg_vq = (n_dirty <= stage_v_q.size(0)) ? stage_v_q.slice(0, 0, n_dirty) : torch::empty({n_dirty, dim}, torch::kInt8);
@@ -231,6 +255,7 @@ std::tuple<torch::Tensor, int64_t, int64_t, int64_t> peer_cache_ensure_cpp(
         }
 
         auto miss_exp_cpu = miss_experts.to(torch::kInt64).cpu().contiguous();
+        sync_stage_event();
         torch::Tensor stg_uq = (n_miss <= stage_u_q.size(0)) ? stage_u_q.slice(0, 0, n_miss) : torch::empty({n_miss, dim}, torch::kInt8);
         torch::Tensor stg_us = (n_miss <= stage_u_scale.size(0)) ? stage_u_scale.slice(0, 0, n_miss) : torch::empty({n_miss}, torch::kFloat16);
         torch::Tensor stg_vq = (n_miss <= stage_v_q.size(0)) ? stage_v_q.slice(0, 0, n_miss) : torch::empty({n_miss, dim}, torch::kInt8);
@@ -263,6 +288,7 @@ std::tuple<torch::Tensor, int64_t, int64_t, int64_t> peer_cache_ensure_cpp(
         C10_CUDA_CHECK(cudaMemcpyAsync(u_s_gpu.data_ptr(), ss_u, static_cast<size_t>(n_miss) * sizeof(uint16_t), cudaMemcpyHostToDevice, stream));
         C10_CUDA_CHECK(cudaMemcpyAsync(v_q_gpu.data_ptr(), sq_v, static_cast<size_t>(n_miss * dim) * sizeof(int8_t), cudaMemcpyHostToDevice, stream));
         C10_CUDA_CHECK(cudaMemcpyAsync(v_s_gpu.data_ptr(), ss_v, static_cast<size_t>(n_miss) * sizeof(uint16_t), cudaMemcpyHostToDevice, stream));
+        record_stage_event(stream);
 
         launch_peer_dequant_scatter_cuda(
             u_q_gpu.data_ptr<int8_t>(),
@@ -279,7 +305,6 @@ std::tuple<torch::Tensor, int64_t, int64_t, int64_t> peer_cache_ensure_cpp(
             stream
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        C10_CUDA_CHECK(cudaStreamSynchronize(stream));
 
         slot_dirty.index_fill_(0, victim_slots, false);
         slot_to_expert.index_copy_(0, victim_slots, miss_experts.to(torch::kInt32));
